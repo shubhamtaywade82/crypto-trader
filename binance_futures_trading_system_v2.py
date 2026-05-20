@@ -20,7 +20,7 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta, date
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple, Literal
+from typing import Callable, Dict, List, Optional, Tuple, Literal
 from enum import Enum
 from pathlib import Path
 
@@ -140,6 +140,7 @@ class EnhancedPosition:
     partial_realized_pnl: float = 0.0
     status: Literal["OPEN", "CLOSED"] = "OPEN"
     close_time: Optional[int] = None
+    close_price: Optional[float] = None   # price at which position was closed
     close_reason: Optional[str] = None
 
     def update_pnl(self, mark_price: float):
@@ -181,6 +182,7 @@ class EnhancedPosition:
             "partial_realized_pnl": self.partial_realized_pnl,
             "status": self.status,
             "close_time": self.close_time,
+            "close_price": self.close_price,
             "close_reason": self.close_reason,
         }
 
@@ -631,6 +633,9 @@ class EnhancedFuturesWallet:
         self.realized_pnl_total = 0.0
         self.positions: Dict[str, EnhancedPosition] = {}
         self.position_history: List[dict] = []
+        # Optional callback to notify external observers when a position closes.
+        # Set by TradingEngine so RiskManager can update its consecutive-loss counter.
+        self.on_position_closed: Optional[Callable[[float], None]] = None
         self._load_state()
 
     @property
@@ -726,6 +731,11 @@ class EnhancedFuturesWallet:
             f"Close={close_price:.2f} | Realized={realized:.2f} | Reason={reason}"
         )
         self._save_state()
+
+        # Notify RiskManager so it can update the consecutive-loss counter
+        if self.on_position_closed is not None:
+            self.on_position_closed(realized)
+
         return pos
 
     def partial_close(self, symbol: str, close_price: float, pct: float, reason: str) -> float:
@@ -957,6 +967,8 @@ class TradingEngine:
             leverage=leverage,
             state_file=f"wallet_{self.symbol}_v2.json",
         )
+        # Wire up RiskManager so it tracks wins/losses from auto-close events
+        self.wallet.on_position_closed = self.risk_manager.record_close
 
     def run_once(self) -> dict:
         logger.info(f"--- Tick: {self.symbol} ---")

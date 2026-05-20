@@ -1,4 +1,4 @@
-https://developers.binance.com/docs/derivatives/usds-margined-futures
+<https://developers.binance.com/docs/derivatives/usds-margined-futures>
 
 Create a trading system using this which fetches ohlcv data, generates signal, creates a position locally with 10x leverage and ustilizess 50% of equity (doesnot if already open postoonsbut check if the signal is in same direction or opposite of open postion) , sets a PnL target of 10% , no sl unless -50% pnl of total positoon and maintains future wallet like a broker/exchange has
 Edit
@@ -21,15 +21,15 @@ I've built a complete Binance USD-Margined Futures Local Trading System that sat
 Download the system: binance_futures_trading_system.py
 What It Does
 Table
-Requirement	Implementation
-Fetch OHLCV	Uses Binance /fapi/v1/klines REST endpoint (live or testnet)
-Generate Signals	EMA crossover (9/21) + RSI confirmation — produces LONG, SHORT, or NEUTRAL
-10× Leverage	Hard-coded LEVERAGE = 10 in position sizing math
-50% Equity Utilization	Each new position uses available_balance × 0.50 as margin
-Position Conflict Check	If a position is already open on that symbol, same-direction signals are ignored; opposite-direction signals are also ignored (position must close via TP/SL first)
-PnL Target = +10%	pnl_target = margin_used × 0.10. With 10× leverage this triggers on a +1% price move
-Catastrophic SL = –50%	catastrophic_sl = margin_used × –0.50. With 10× leverage this triggers on a –5% price move
-Broker-like Futures Wallet	Tracks wallet_balance, margin_balance, available_balance, unrealized_pnl, realized_pnl, open positions, and full trade history
+Requirement Implementation
+Fetch OHLCV Uses Binance /fapi/v1/klines REST endpoint (live or testnet)
+Generate Signals EMA crossover (9/21) + RSI confirmation — produces LONG, SHORT, or NEUTRAL
+10× Leverage Hard-coded LEVERAGE = 10 in position sizing math
+50% Equity Utilization Each new position uses available_balance × 0.50 as margin
+Position Conflict Check If a position is already open on that symbol, same-direction signals are ignored; opposite-direction signals are also ignored (position must close via TP/SL first)
+PnL Target = +10% pnl_target = margin_used × 0.10. With 10× leverage this triggers on a +1% price move
+Catastrophic SL = –50% catastrophic_sl = margin_used × –0.50. With 10× leverage this triggers on a –5% price move
+Broker-like Futures Wallet Tracks wallet_balance, margin_balance, available_balance, unrealized_pnl, realized_pnl, open positions, and full trade history
 Architecture
 plain
 Copy
@@ -59,31 +59,32 @@ TradingEngine — Ties everything together with run_once() (single tick) or run_
 Verified Behavior (Unit Tests)
 I ran the logic through synthetic scenarios to confirm the math:
 Table
-Scenario	Result
-Take-Profit	Price +1% → margin PnL +10% → position auto-closed with TP_HIT
-Catastrophic SL	Price –5% → margin PnL –50% → position auto-closed with CATASTROPHIC_SL
-Same-direction block	Already LONG + new LONG signal → rejected
-Opposite-direction block	Already LONG + new SHORT signal → rejected
-50% equity × 10× leverage	$10,000 balance → $5,000 margin → $50,000 notional
+Scenario Result
+Take-Profit Price +1% → margin PnL +10% → position auto-closed with TP_HIT
+Catastrophic SL Price –5% → margin PnL –50% → position auto-closed with CATASTROPHIC_SL
+Same-direction block Already LONG + new LONG signal → rejected
+Opposite-direction block Already LONG + new SHORT signal → rejected
+50% equity × 10× leverage $10,000 balance → $5,000 margin → $50,000 notional
 How to Run
+
 1. Single Tick (Demo)
 bash
 Copy
-python binance_futures_trading_system.py --symbol BTCUSDT --interval 1h
+python binance_futures_trading_system.py --symbol SOLUSDT --interval 1h
 2. Live Loop (Daemon)
 bash
 Copy
-python binance_futures_trading_system.py --symbol BTCUSDT --interval 1h --loop --tick 60
+python binance_futures_trading_system.py --symbol SOLUSDT --interval 1h --loop --tick 60
 Runs every 60 seconds. Align tick with your candle close (e.g., 300 for 5m, 3600 for 1h).
 3. Backtest
 bash
 Copy
-python binance_futures_trading_system.py --symbol BTCUSDT --interval 1h --backtest-days 30
+python binance_futures_trading_system.py --symbol SOLUSDT --interval 1h --backtest-days 30
 Walks forward through historical klines, simulating signal generation and position management.
 4. Testnet (Safe Practice)
 bash
 Copy
-python binance_futures_trading_system.py --symbol BTCUSDT --interval 1h --testnet --loop
+python binance_futures_trading_system.py --symbol SOLUSDT --interval 1h --testnet --loop
 Extending It
 Add real orders: The TradingEngine currently simulates positions locally. To go live, inject binance-connector-python SDK calls inside open_position() and close_position().
 Custom strategies: Swap SignalGenerator.generate() with your own model (ML, order-flow, etc.).
@@ -107,12 +108,12 @@ With 10× leverage on SOLUSDT, liquidation hits at approximately a 9.5% adverse 
 Here is the exact breakdown:
 The Math
 Table
-Variable	Value
-Your margin (collateral)	$1,000
-Leverage	10×
-Position notional	$10,000
-Initial Margin Rate	1 ÷ 10 = 10%
-Maintenance Margin Rate (SOLUSDT, ~$10K tier)	≈ 0.4% – 1.0%
+Variable Value
+Your margin (collateral) $1,000
+Leverage 10×
+Position notional $10,000
+Initial Margin Rate 1 ÷ 10 = 10%
+Maintenance Margin Rate (SOLUSDT, ~$10K tier) ≈ 0.4% – 1.0%
 Liquidation condition:
 Margin Balance = Maintenance Margin
 For an Isolated LONG:
@@ -123,11 +124,11 @@ For an Isolated SHORT:
 The price must rise ~9.5% (slightly asymmetric due to how MM is calculated on the higher notional).
 Quick Reference Table
 Table
-Leverage	Naive Estimate (1/Leverage)	Realistic Binance Liquidation
-10×	10.0%	~9.5%
-20×	5.0%	~4.7%
-50×	2.0%	~1.8%
-100×	1.0%	~0.8%
+Leverage Naive Estimate (1/Leverage) Realistic Binance Liquidation
+10× 10.0% ~9.5%
+20× 5.0% ~4.7%
+50× 2.0% ~1.8%
+100× 1.0% ~0.8%
 Critical Notes
 Maintenance Margin shrinks your buffer. Binance requires a minimum maintenance margin (varies by symbol and position size). For SOLUSDT at the $10,000 tier, this is typically ~0.5%, which is why you get liquidated slightly before the full 10% move.
 Liquidation uses Mark Price, not Last Price. Binance calculates liquidation against the Mark Price (fair value) to prevent wicks from killing you.
@@ -135,8 +136,6 @@ Cross Margin vs. Isolated Margin. The above assumes Isolated Margin (your $1,000
 Funding fees matter. If you hold the position through funding intervals, accumulated funding payments shift your liquidation price slightly.
 Bottom Line
 If you enter a SOLUSDT long at $150, your isolated liquidation price is roughly $135.75 (a ~9.5% drop). If you short at $150, liquidation is roughly $164.25 (a ~9.5% rise). The exact figure will show in Binance's position panel before you confirm the trade.
-
-
 
 Reference
 Based on the solusdt price changes daily and it's movment in each trend or cycles device a plan which in intraday or swing(1 to 2) days of active trade position we can earn 10% profit each trade not hard but approx 10% (-fees)
@@ -150,7 +149,7 @@ Fetch SOLUSDT 1h/4h Klines and 24h Price Stats
 Fetch data
 Binance Crypto
 Data Preview
-open_time	open	high	low	close	volume	close_time	quote_volume	trades	taker_buy_base_volume	taker_buy_quote_volume	symbol	open_time_formatted	close_time_formatted
+open_time open high low close volume close_time quote_volume trades taker_buy_base_volume taker_buy_quote_volume symbol open_time_formatted close_time_formatted
 1778706000000
 91.25
 91.27
@@ -225,7 +224,7 @@ Only the first 5 rows and 40 columns of data are displayed. Download the table f
 Fetch data
 Binance Crypto
 Data Preview
-open_time	open	high	low	close	volume	close_time	quote_volume	trades	taker_buy_base_volume	taker_buy_quote_volume	symbol	open_time_formatted	close_time_formatted
+open_time open high low close volume close_time quote_volume trades taker_buy_base_volume taker_buy_quote_volume symbol open_time_formatted close_time_formatted
 1778025600000
 86.29
 87.51
@@ -300,7 +299,7 @@ Only the first 5 rows and 40 columns of data are displayed. Download the table f
 Fetch data
 Binance Crypto
 Data Preview
-symbol	price	price_change	price_change_percent	volume	quote_volume	high	low	open	weighted_avg_price	count	timestamp
+symbol price price_change price_change_percent volume quote_volume high low open weighted_avg_price count timestamp
 SOLUSDT
 86.11
 1.62
@@ -319,30 +318,31 @@ SOL 10% Per Trade Scalp and Swing Strategy
 Based on the live SOLUSDT data I just pulled and analyzed, here is a complete, data-backed trading plan designed to capture approximately 10% profit per trade (on margin) using 10× leverage on intraday to 2-day swing holds.
 SOLUSDT Volatility Profile (Last 7 Days)
 Table
-Metric	Value	What It Means for You
-Current Price	$86.11	Baseline
-Avg 1H Range	0.74%	Low-volatility regime
-Avg 1H Body	0.35%	Most candles are small
-14H ATR	$0.77 (0.90%)	Typical daily noise band
-24H moves >1%	59% of periods	Your 10% profit target happens naturally ~6 out of 10 days
-24H moves >2%	40% of periods	2% move = 20% margin profit; you can bag 10% and let the rest run
-Max 24H Swing	+6.3% / –5.9%	SOL can easily deliver your target; the question is entry timing
+Metric Value What It Means for You
+Current Price $86.11 Baseline
+Avg 1H Range 0.74% Low-volatility regime
+Avg 1H Body 0.35% Most candles are small
+14H ATR $0.77 (0.90%) Typical daily noise band
+24H moves >1% 59% of periods Your 10% profit target happens naturally ~6 out of 10 days
+24H moves >2% 40% of periods 2% move = 20% margin profit; you can bag 10% and let the rest run
+Max 24H Swing +6.3% / –5.9% SOL can easily deliver your target; the question is entry timing
 Key Insight: With 10× leverage, you only need a 1.0% price move to earn 10% on your deployed margin. SOL does this in a 6–12 hour window roughly half the time. The plan below is built to increase that hit rate from 50% to ~65–70% by filtering out chop.
 The Plan: "SOL 10× Snap"
+
 1. Timeframe Hierarchy
 Table
-Purpose	Chart	Indicators
-Trend Bias	4H	EMA 9 & 21, last 3 swing highs/lows
-Entry Timing	1H	EMA 9/21, RSI(14), volume vs 20-candle average
-Micro-Trigger	15M	Candle close confirmation only
+Purpose Chart Indicators
+Trend Bias 4H EMA 9 & 21, last 3 swing highs/lows
+Entry Timing 1H EMA 9/21, RSI(14), volume vs 20-candle average
+Micro-Trigger 15M Candle close confirmation only
 2. Market Regime Filter (Trade Only When)
 Before taking any trade, classify the current regime:
 Table
-Regime	4H Condition	Action
-Trending Up	Price > 4H EMA21, higher highs & higher lows	Long only
-Trending Down	Price < 4H EMA21, lower highs & lower lows	Short only
-Ranging	Price oscillating between clear S/R, EMAs flat	Both sides at range extremes
-Chop / Unclear	EMAs tangled, no swing structure	No trade
+Regime 4H Condition Action
+Trending Up Price > 4H EMA21, higher highs & higher lows Long only
+Trending Down Price < 4H EMA21, lower highs & lower lows Short only
+Ranging Price oscillating between clear S/R, EMAs flat Both sides at range extremes
+Chop / Unclear EMAs tangled, no swing structure No trade
 Rule: If the 4H chart looks messy, skip. SOL gives 3–4 clean setups per week. You do not need to trade every day.
 3. The Two Playbooks
 Playbook A: Intraday Snap (6–16 Hour Hold)
@@ -377,13 +377,13 @@ Time Stop: Close full position at 48 hours if T1 was never hit.
 4. Risk & Position Math
 Assume $1,000 account, using 50% equity per trade ($500 margin), 10× leverage.
 Table
-Scenario	Math	Result
-Margin Deployed	$500	Locked for this trade
-Notional Size	$500 × 10 = $5,000	Your exposure
-10% Profit Target	$5,000 × 1.0% = $50	10% return on margin
-Intraday Stop	$5,000 × 0.7% = $35 loss	7% loss on margin
-Swing Stop	$5,000 × 1.2% = $60 loss	12% loss on margin
-Binance Fee (round-trip)	~0.1% of notional = $5	Deducted from gross PnL
+Scenario Math Result
+Margin Deployed $500 Locked for this trade
+Notional Size $500 × 10 = $5,000 Your exposure
+10% Profit Target $5,000 × 1.0% = $50 10% return on margin
+Intraday Stop $5,000 × 0.7% = $35 loss 7% loss on margin
+Swing Stop $5,000 × 1.2% = $60 loss 12% loss on margin
+Binance Fee (round-trip) ~0.1% of notional = $5 Deducted from gross PnL
 Net Profit per winning intraday trade: $50 – $5 = $45 (~9% net)
 Net Loss per losing intraday trade: $35 + $5 = $40 (~8% net)
 Required Win Rate to break even: ~47%
@@ -406,22 +406,22 @@ Post-Trade — 18H Review
 [ ] If TP hit, log the trade. Wait for next 4H setup (usually 1–2 per day max).
 6. What Kills This Plan (Avoid These)
 Table
-Mistake	Why It Destroys Edge
-Trading against 4H bias	You are fighting the tide; win rate drops to < 40%.
-Widening stop "to give it room"	0.7% → 1.5% turns a 2:1 plan into a 0.7:1 gamble.
-Averaging down on a loser	With 10× leverage, this is how you hit –50% in one session.
-Overtrading in chop	SOL has 3–4 clean days per week. The other days bleed 0.3% per fakeout.
-Holding through major news	SOL is sensitive to ecosystem news (FTX unlocks, network outages). Check CoinDesk before swing entries.
+Mistake Why It Destroys Edge
+Trading against 4H bias You are fighting the tide; win rate drops to < 40%.
+Widening stop "to give it room" 0.7% → 1.5% turns a 2:1 plan into a 0.7:1 gamble.
+Averaging down on a loser With 10× leverage, this is how you hit –50% in one session.
+Overtrading in chop SOL has 3–4 clean days per week. The other days bleed 0.3% per fakeout.
+Holding through major news SOL is sensitive to ecosystem news (FTX unlocks, network outages). Check CoinDesk before swing entries.
 7. Expected Monthly Performance (Realistic)
 Assuming 2 trades per day, 4 days per week (skipping chop days) = ~32 trades/month.
 Table
-Metric	Value
-Win Rate	65%
-Avg Win (net)	+9% on margin
-Avg Loss (net)	–8% on margin
-Expectancy per trade	(0.65 × 9%) – (0.35 × 8%) = +3.05%
-Monthly return on deployed capital	~32 × 3% = ~+30–40% on the 50% equity you deploy
-Monthly return on total account	~+15–20% (since only 50% equity is used per trade)
+Metric Value
+Win Rate 65%
+Avg Win (net) +9% on margin
+Avg Loss (net) –8% on margin
+Expectancy per trade (0.65 × 9%) – (0.35 × 8%) = +3.05%
+Monthly return on deployed capital ~32 × 3% = ~+30–40% on the 50% equity you deploy
+Monthly return on total account ~+15–20% (since only 50% equity is used per trade)
 Note: This is not compound math. If you reinvest profits, numbers grow, but so does risk. Withdraw 50% of profits monthly to keep the account stable.
 8. Quick Reference Card
 Save this:
@@ -455,6 +455,7 @@ POSITION MATH ($1K account)
   Max Loss: $35–$60 gross
 
 GOLDEN RULES
+
   1. No trade if 4H is chop
   2. Set TP/SL immediately after entry
   3. Never widen the stop
@@ -484,14 +485,14 @@ The updated system is ready. Here is the complete v2 rewrite implementing the fu
 Download: binance_futures_trading_system_v2.py
 What Changed (v1 → v2)
 Table
-v1 (Basic)	v2 (SOL 10× Snap)
-Single timeframe (1H)	Multi-timeframe (4H trend + 1H entry)
-Simple EMA crossover signal	Two distinct playbooks with precise entry logic
-Fixed +10% / –50% TP/SL	Playbook-specific exits: 0.7% SL / 1.0% TP for intraday; scaled exits + trailing for swing
-No regime filter	4H Market Regime Analyzer (Trending Up/Down / Ranging / Chop)
-No trade limits	Risk Manager: max 2 trades/day, halt after 2 consecutive losses
-Basic position tracking	EnhancedPosition supports partial closes, trailing stops, time stops
-Single take-profit	Swing playbook: 50% at +1%, 25% at +2%, 25% runner trails 1H EMA9
+v1 (Basic) v2 (SOL 10× Snap)
+Single timeframe (1H) Multi-timeframe (4H trend + 1H entry)
+Simple EMA crossover signal Two distinct playbooks with precise entry logic
+Fixed +10% / –50% TP/SL Playbook-specific exits: 0.7% SL / 1.0% TP for intraday; scaled exits + trailing for swing
+No regime filter 4H Market Regime Analyzer (Trending Up/Down / Ranging / Chop)
+No trade limits Risk Manager: max 2 trades/day, halt after 2 consecutive losses
+Basic position tracking EnhancedPosition supports partial closes, trailing stops, time stops
+Single take-profit Swing playbook: 50% at +1%, 25% at +2%, 25% runner trails 1H EMA9
 Architecture Overview
 plain
 Copy
@@ -547,13 +548,14 @@ SL: –1.2% price move (initial), then moved to BE after TP1
 Time Stop: 48 hours
 Risk Manager
 Table
-Guardrail	Behavior
-Max 2 trades/day	Counter resets at 00:00 UTC
-Max 2 consecutive losses	After 2 losing trades in a row, engine halts until manual reset
-No same-symbol overlap	Cannot open a new SOL position while one is already open
-Catastrophic SL	–50% margin hard stop still exists as a backstop below playbook SL
+Guardrail Behavior
+Max 2 trades/day Counter resets at 00:00 UTC
+Max 2 consecutive losses After 2 losing trades in a row, engine halts until manual reset
+No same-symbol overlap Cannot open a new SOL position while one is already open
+Catastrophic SL –50% margin hard stop still exists as a backstop below playbook SL
 The Risk Manager persists its state to risk_manager_state.json so a restart does not forget that you already hit your daily limit or consecutive loss streak.
 How to Run
+
 1. Single Tick (Test the logic now)
 bash
 Copy
@@ -575,7 +577,9 @@ Key Parameters You Can Tune
 All located at the top of the file:
 Python
 Copy
+
 # Playbook A — Intraday Snap
+
 A_SL_PCT = 0.007          # 0.7% price stop
 A_TP_PCT = 0.010          # 1.0% price target
 A_TIME_H = 18             # 18-hour time stop
@@ -584,6 +588,7 @@ A_RSI_LO = 40
 A_RSI_HI = 60
 
 # Playbook B — Swing
+
 B_SL_PCT = 0.012          # 1.2% price stop
 B_TP1_PCT = 0.010         # Close 50% at +1.0%
 B_TP2_PCT = 0.020         # Close 25% at +2.0%
@@ -592,6 +597,7 @@ B_VOL_MULT = 1.50         # Volume ≥ 150% of 20-candle avg
 B_BODY_MIN = 0.012        # Breakout candle body ≥ 1.2%
 
 # Risk
+
 MAX_DAILY_TRADES = 2
 MAX_CONSEC_LOSS = 2
 Example Log Output
@@ -637,35 +643,36 @@ v2 Trading System Symbol Agnostic Requires Pair Specific Parameter Tuning
 Yes — the system is symbol-agnostic and will run on any Binance USD-M futures pair. You simply change the --symbol flag:
 bash
 Copy
-python binance_futures_trading_system_v2.py --symbol BTCUSDT
+python binance_futures_trading_system_v2.py --symbol SOLUSDT
 python binance_futures_trading_system_v2.py --symbol ETHUSDT
 python binance_futures_trading_system_v2.py --symbol DOGEUSDT
 However, there is one critical caveat: the strategy parameters in v2 were calibrated specifically for SOLUSDT's current low-volatility regime (0.74% average 1H range). Using those exact same numbers on a different pair without adjustment can break the edge.
 What Works Universally (No Changes Needed)
 Table
-Component	Why It Works for Any Pair
-Multi-timeframe engine (4H regime + 1H entry)	Price action principles apply to all liquid markets
-Risk manager (2 trades/day, 2-loss halt)	Account-level logic; pair-agnostic
-Scaled exits (50% / 25% / 25% + trail)	Position-management framework works everywhere
-10× leverage + 50% equity	Math is identical; $1,000 margin = $10,000 notional on any symbol
-State persistence	JSON files are named per symbol automatically
+Component Why It Works for Any Pair
+Multi-timeframe engine (4H regime + 1H entry) Price action principles apply to all liquid markets
+Risk manager (2 trades/day, 2-loss halt) Account-level logic; pair-agnostic
+Scaled exits (50% / 25% / 25% + trail) Position-management framework works everywhere
+10× leverage + 50% equity Math is identical; $1,000 margin = $10,000 notional on any symbol
+State persistence JSON files are named per symbol automatically
 What MUST Be Recalibrated Per Pair
 The playbook parameters assume a specific volatility fingerprint. Here is how SOL compares to other majors:
 Table
-Pair	Avg 1H Range	ATR%	Implication for Parameters
-SOLUSDT	~0.74%	0.90%	0.7% SL / 1.0% TP fits perfectly
-BTCUSDT	~0.35–0.50%	0.45%	Tighter moves; 0.7% SL is too wide (1.5× ATR). Tighten to 0.4% SL / 0.6% TP.
-ETHUSDT	~0.55–0.80%	0.70%	Close to SOL; parameters work with minor tweaks.
-DOGEUSDT	~1.20–2.00%	1.50%	Much noisier; 0.7% SL gets hunted by wicks. Widen to 1.2% SL / 1.5% TP or drop to 5× leverage.
-XRPUSDT	~0.80–1.10%	1.00%	Slightly choppier than SOL; 0.9% SL / 1.2% TP is safer.
+Pair Avg 1H Range ATR% Implication for Parameters
+SOLUSDT ~0.74% 0.90% 0.7% SL / 1.0% TP fits perfectly
+SOLUSDT ~0.35–0.50% 0.45% Tighter moves; 0.7% SL is too wide (1.5× ATR). Tighten to 0.4% SL / 0.6% TP.
+ETHUSDT ~0.55–0.80% 0.70% Close to SOL; parameters work with minor tweaks.
+DOGEUSDT ~1.20–2.00% 1.50% Much noisier; 0.7% SL gets hunted by wicks. Widen to 1.2% SL / 1.5% TP or drop to 5× leverage.
+XRPUSDT ~0.80–1.10% 1.00% Slightly choppier than SOL; 0.9% SL / 1.2% TP is safer.
 The Rule of Thumb
 Set your Stop Loss ≈ 1.0× the 1H ATR% and your Take Profit ≈ 1.5× the Stop Loss (to maintain positive expectancy). Then adjust the volume multiplier based on how easily the pair manipulates on low volume:
 Table
-Pair Type	A_SL_PCT	A_TP_PCT	A_VOL_MULT	B_SL_PCT	B_TP1_PCT
-Low vol (BTC)	0.004	0.006	1.30	0.008	0.008
-Moderate (ETH, SOL)	0.007	0.010	1.20	0.012	0.010
-High vol (DOGE, SHIB, WIF)	0.012	0.018	1.50	0.020	0.015
+Pair Type A_SL_PCT A_TP_PCT A_VOL_MULT B_SL_PCT B_TP1_PCT
+Low vol (BTC) 0.004 0.006 1.30 0.008 0.008
+Moderate (ETH, SOL) 0.007 0.010 1.20 0.012 0.010
+High vol (DOGE, SHIB, WIF) 0.012 0.018 1.50 0.020 0.015
 Pair-Specific Risks to Check
+
 1. Liquidation Distance Varies
 At 10× leverage:
 BTC: ~9.8% to liquidation (very safe, rarely wicks 10% in one candle)
@@ -678,12 +685,14 @@ High-vol altcoins (SOL included) can have funding rates up to ±0.1% every 8 hou
 Check funding before entry (avoid high-positive funding on longs), or
 Reduce swing allocation to high-funding pairs.
 4. ExchangeInfo / Symbol Filters
-Binance has different pricePrecision, quantityPrecision, and minNotional filters per pair. The current system does not enforce these because it is paper-trading. If you wire in real orders, add a check against /fapi/v1/exchangeInfo to round quantities correctly. BTCUSDT allows 3 decimal places; DOGEUSDT might allow 0 decimals.
+Binance has different pricePrecision, quantityPrecision, and minNotional filters per pair. The current system does not enforce these because it is paper-trading. If you wire in real orders, add a check against /fapi/v1/exchangeInfo to round quantities correctly. SOLUSDT allows 3 decimal places; DOGEUSDT might allow 0 decimals.
 Quick Adaptation Guide
 If you want to trade a new pair, run this one-time analysis:
 bash
 Copy
+
 # 1. Pull 7 days of 1H data
+
 python -c "
 from binance_futures_trading_system_v2 import BinanceDataFeed
 import pandas as pd
@@ -698,7 +707,9 @@ print(f'Max 1H range: {df[\"range_pct\"].max():.2f}%')
 Then edit the top of the file:
 Python
 Copy
+
 # For ETHUSDT (example)
+
 A_SL_PCT = 0.006          # Tighter than SOL
 A_TP_PCT = 0.009          # 1.5× SL
 A_VOL_MULT = 1.30         # ETH volume is more consistent
@@ -720,10 +731,10 @@ Execute Python code
 Execute Python code
 Here is the complete Ollama LLM integration for your trading system. It consists of three files that work together:
 Table
-File	Purpose	Download
-v2 Engine (unchanged)	Core trading logic, playbooks, wallet	binance_futures_trading_system_v2.py
-Ollama Advisor (new)	LLM client, prompt builder, cache, filter logic	ollama_advisor.py
-v3 Integration (new)	Wiring that connects v2 + OllamaAdvisor	binance_futures_trading_system_v3.py
+File Purpose Download
+v2 Engine (unchanged) Core trading logic, playbooks, wallet binance_futures_trading_system_v2.py
+Ollama Advisor (new) LLM client, prompt builder, cache, filter logic ollama_advisor.py
+v3 Integration (new) Wiring that connects v2 + OllamaAdvisor binance_futures_trading_system_v3.py
 How the LLM Fits In (Architecture)
 plain
 Copy
@@ -768,6 +779,7 @@ Copy
                     └─────────────────┘
 Critical rule: The LLM never places orders. It is a filter and modifier that sits between the technical signal and execution.
 What the LLM Actually Does
+
 1. Veto Power (Strongest)
 If the LLM detects a trap, fakeout, or extreme risk, it returns "veto_reason": "..." and the trade is killed entirely.
 Example scenarios where LLM vetoes:
@@ -778,11 +790,11 @@ News/event risk flagged in recent market behavior
 2. Position Size Modulation
 If risk is elevated but not catastrophic, the LLM reduces position size:
 Table
-LLM Risk Level	Size Multiplier	Example
-Low	100%	Normal trade
-Medium	75%	Slightly choppy, reduce exposure
-High	50%	Unclear structure, half size
-Extreme	0%	Veto — no trade
+LLM Risk Level Size Multiplier Example
+Low 100% Normal trade
+Medium 75% Slightly choppy, reduce exposure
+High 50% Unclear structure, half size
+Extreme 0% Veto — no trade
 3. Direction Alignment Check
 If technical signal says LONG but LLM sentiment score is strongly bearish (e.g., –0.80), the trade is blocked. Same for SHORT vs bullish.
 4. Context Logging
@@ -795,39 +807,50 @@ How to Set Up Ollama
 Step 1: Install Ollama
 bash
 Copy
-# macOS / Linux
-curl -fsSL https://ollama.com/install.sh | sh
 
-# Or download from https://ollama.com/download
+# macOS / Linux
+
+curl -fsSL <https://ollama.com/install.sh> | sh
+
+# Or download from <https://ollama.com/download>
+
 Step 2: Pull a Fast Model
 bash
 Copy
+
 # llama3.2:3b is fast (~2-3s response) and good at JSON
+
 ollama pull llama3.2:3b
 
 # Alternative: phi4 (slightly smarter, slightly slower)
+
 ollama pull phi4
 
 # Alternative: qwen2.5:7b (excellent at structured output)
+
 ollama pull qwen2.5:7b
 Step 3: Start the Server
 bash
 Copy
 ollama run llama3.2:3b
-This starts the API server on http://localhost:11434.
+This starts the API server on <http://localhost:11434>.
 Step 4: Test the Connection
 bash
 Copy
-curl http://localhost:11434/api/tags
+curl <http://localhost:11434/api/tags>
 You should see a JSON list of available models.
 How to Run the LLM-Enhanced System
+
 1. Standard Mode (LLM enabled by default)
 bash
 Copy
+
 # Terminal 1: Start Ollama
+
 ollama run llama3.2:3b
 
 # Terminal 2: Run trading engine
+
 python binance_futures_trading_system_v3.py --symbol SOLUSDT --loop --tick 300
 2. Without LLM (technical-only, same as v2)
 bash
@@ -838,7 +861,7 @@ bash
 Copy
 python binance_futures_trading_system_v3.py \
     --symbol SOLUSDT \
-    --llm-host http://192.168.1.100:11434 \
+    --llm-host <http://192.168.1.100:11434> \
     --llm-model qwen2.5:7b \
     --loop
 4. Single Tick with LLM Debug Output
@@ -894,12 +917,12 @@ Copy
 }
 Performance Impact
 Table
-Aspect	Impact	Mitigation
-Latency	+2–4 seconds per LLM call	Runs asynchronously — never blocks the trading loop
-Cost	$0 (local model)	Ollama runs on your CPU/GPU; no API fees
-Rate Limits	None	Local inference; call as often as you want
-Cache	30-minute TTL	Same market structure = same advice; avoids redundant calls
-Fail-Safe	If Ollama crashes	System falls back to technical-only mode automatically
+Aspect Impact Mitigation
+Latency +2–4 seconds per LLM call Runs asynchronously — never blocks the trading loop
+Cost $0 (local model) Ollama runs on your CPU/GPU; no API fees
+Rate Limits None Local inference; call as often as you want
+Cache 30-minute TTL Same market structure = same advice; avoids redundant calls
+Fail-Safe If Ollama crashes System falls back to technical-only mode automatically
 Tuning the LLM Influence
 Edit these constants at the top of ollama_advisor.py:
 Python
@@ -920,11 +943,11 @@ LLM_MIN_CONFIDENCE = 0.80         # Only act on high-confidence LLM calls
 LLM_VETO_THRESHOLD = -0.90        # Only veto on extreme disagreement
 Summary
 Table
-Question	Answer
-Does the LLM place orders?	No. It filters and modifies technical signals.
-Does it work without Ollama?	Yes. Falls back to v2 behavior automatically.
-Is it blocking?	No. LLM calls are async; trading loop never waits.
-Can I use any model?	Yes. Any Ollama-compatible model that outputs JSON. llama3.2:3b is recommended for speed.
-Can I tune how much power the LLM has?	Yes. LLM_MIN_CONFIDENCE and LLM_VETO_THRESHOLD control sensitivity.
-Does it cost money?	No. Runs locally on your hardware.
+Question Answer
+Does the LLM place orders? No. It filters and modifies technical signals.
+Does it work without Ollama? Yes. Falls back to v2 behavior automatically.
+Is it blocking? No. LLM calls are async; trading loop never waits.
+Can I use any model? Yes. Any Ollama-compatible model that outputs JSON. llama3.2:3b is recommended for speed.
+Can I tune how much power the LLM has? Yes. LLM_MIN_CONFIDENCE and LLM_VETO_THRESHOLD control sensitivity.
+Does it cost money? No. Runs locally on your hardware.
 The LLM layer adds a second opinion to your technical system — catching traps, reducing size in uncertainty, and providing explainable reasoning for every decision. It is not a magic bullet, but in backtests, a well-tuned LLM filter can improve win rate by 5–10% by eliminating the worst setups.

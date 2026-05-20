@@ -36,19 +36,19 @@ import requests
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 BINANCE_FAPI_TESTNET = "https://demo-fapi.binance.com"
 
-LEVERAGE = 10
-EQUITY_UTILIZATION = 0.50   # 50% of available equity
-PNL_TARGET_PCT = 0.10       # +10% PnL target
-CATASTROPHIC_SL_PCT = -0.50 # -50% catastrophic stop
+LEVERAGE = 5
+EQUITY_UTILIZATION = 0.10   # 10% of available equity (Professional risk)
+PNL_TARGET_PCT = 0.05       # +5% PnL target (+1% price move with 5x)
+CATASTROPHIC_SL_PCT = -0.025 # -2.5% catastrophic stop (-0.5% price move with 5x)
 
 # Signal generation parameters
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 65         # More conservative
+RSI_OVERSOLD = 35           # More conservative
 
-DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_SYMBOL = "SOLUSDT"
 DEFAULT_INTERVAL = "1h"
 DEFAULT_KLINE_LIMIT = 150
 
@@ -267,7 +267,9 @@ class SignalGenerator:
         df = df.copy()
         df["ema_fast"] = df["close"].ewm(span=self.ema_fast, adjust=False).mean()
         df["ema_slow"] = df["close"].ewm(span=self.ema_slow, adjust=False).mean()
+        df["ema_trend"] = df["close"].ewm(span=200, adjust=False).mean()
         df["rsi"] = self._rsi(df["close"], self.rsi_period)
+        df["vol_ma"] = df["volume"].rolling(20).mean()
 
         # Determine crossover state
         df["signal_raw"] = np.where(df["ema_fast"] > df["ema_slow"], 1, -1)
@@ -278,20 +280,30 @@ class SignalGenerator:
 
         sig = Signal.NEUTRAL
 
-        # Bullish: fast crosses above slow AND RSI not overbought
-        if latest["ema_fast"] > latest["ema_slow"] and latest["rsi"] < self.rsi_overbought:
-            if prev["ema_fast"] <= prev["ema_slow"] or latest["signal_change"] == 2:
-                sig = Signal.LONG
-            else:
-                # Already in uptrend but no new crossover — hold bias
-                sig = Signal.LONG
+        # Volume confirmation: current volume > 1.2x of 20-candle average
+        volume_confirmed = latest["volume"] > (latest["vol_ma"] * 1.2)
+        
+        # Momentum confirmation: RSI direction
+        rsi_rising = latest["rsi"] > prev["rsi"]
+        rsi_falling = latest["rsi"] < prev["rsi"]
 
-        # Bearish: fast crosses below slow AND RSI not oversold
+        # Trend confirmation: Price vs EMA200
+        trend_up = latest["close"] > latest["ema_trend"]
+        trend_down = latest["close"] < latest["ema_trend"]
+
+        # Bullish: fast crosses above slow AND RSI not overbought AND volume confirmed AND RSI rising AND trend up
+        if latest["ema_fast"] > latest["ema_slow"] and latest["rsi"] < self.rsi_overbought:
+            if (prev["ema_fast"] <= prev["ema_slow"] or latest["signal_change"] == 2) and volume_confirmed and rsi_rising and trend_up:
+                sig = Signal.LONG
+            else:
+                sig = Signal.NEUTRAL
+
+        # Bearish: fast crosses below slow AND RSI not oversold AND volume confirmed AND RSI falling AND trend down
         elif latest["ema_fast"] < latest["ema_slow"] and latest["rsi"] > self.rsi_oversold:
-            if prev["ema_fast"] >= prev["ema_slow"] or latest["signal_change"] == -2:
+            if (prev["ema_fast"] >= prev["ema_slow"] or latest["signal_change"] == -2) and volume_confirmed and rsi_falling and trend_down:
                 sig = Signal.SHORT
             else:
-                sig = Signal.SHORT
+                sig = Signal.NEUTRAL
 
         # If RSI is extreme, stay neutral to avoid chasing
         if latest["rsi"] > self.rsi_overbought + 5 and sig == Signal.LONG:
@@ -752,7 +764,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Binance USD-M Futures Local Trading System")
-    parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Trading pair (e.g., BTCUSDT)")
+    parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Trading pair (e.g., SOLUSDT)")
     parser.add_argument("--interval", default=DEFAULT_INTERVAL, help="Kline interval (e.g., 1h)")
     parser.add_argument("--balance", type=float, default=10_000.0, help="Initial wallet balance")
     parser.add_argument("--leverage", type=int, default=LEVERAGE, help="Leverage multiplier")
