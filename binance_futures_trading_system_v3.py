@@ -99,7 +99,7 @@ class TradingEngineV3(TradingEngineV2):
             self.advisor = OllamaAdvisor(
                 host=llm_host,
                 model=llm_model,
-                timeout=15,
+                timeout=320,
                 cache_ttl=1800,
                 min_confidence=0.65,
                 veto_threshold=-0.70,
