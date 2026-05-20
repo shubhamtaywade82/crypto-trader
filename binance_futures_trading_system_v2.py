@@ -18,6 +18,7 @@ import os
 import json
 import time
 import logging
+import curses
 from datetime import datetime, timezone, timedelta, date
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Dict, List, Optional, Tuple, Literal
@@ -1030,18 +1031,71 @@ class TradingEngine:
         return summary
 
     def run_loop(self, interval_seconds: int = 300, max_iterations: int = None):
-        """Run loop. Default 5-min ticks (align with 1H close for best results)."""
-        iteration = 0
-        try:
+        """Run loop using a curses TUI dashboard."""
+        def main_tui(stdscr):
+            curses.curs_set(0)
+            stdscr.nodelay(True)
+            iteration = 0
+            
             while True:
+                # Run engine logic
                 self.run_once()
-                self.wallet.print_summary()
+                s = self.wallet.get_summary()
+                
+                # Draw
+                stdscr.clear()
+                height, width = stdscr.getmaxyx()
+                
+                # Header
+                stdscr.addstr(0, 0, f"=== SOL 10x SNAP v2 DASHBOARD | {self.symbol} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===", curses.A_BOLD | curses.A_REVERSE)
+                
+                # Wallet Info
+                stdscr.addstr(2, 0, f"Wallet Balance    : {s['wallet_balance']:.4f} USDT", curses.A_BOLD)
+                stdscr.addstr(3, 0, f"Realized PnL      : {s['realized_pnl']:.4f} USDT")
+                stdscr.addstr(4, 0, f"Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT")
+                stdscr.addstr(5, 0, f"Margin Balance    : {s['margin_balance']:.4f} USDT")
+                stdscr.addstr(6, 0, f"Available         : {s['available']:.4f} USDT")
+                
+                # Risk & Regime (Logic for v2)
+                can_trade, risk_reason = self.risk_manager.can_trade()
+                regime_color = curses.A_NORMAL
+                stdscr.addstr(8, 0, f"Risk Status: {'ALLOW' if can_trade else 'HALTED'} | Reason: {risk_reason}")
+                
+                # Positions
+                stdscr.addstr(10, 0, f"Open Positions: {s['open_count']}", curses.A_UNDERLINE)
+                row = 11
+                for p in s["open_positions"]:
+                    margin_pnl_pct = (p['unrealized_pnl'] / p['margin_used'] * 100) if p['margin_used'] > 0 else 0
+                    stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({margin_pnl_pct:.2f}%) | Playbook: {p['playbook']}")
+                    row += 1
+                
+                # Footer
+                stdscr.addstr(height-2, 0, f"Next update in {interval_seconds}s | Iteration: {iteration} | Press 'q' to quit")
+                stdscr.refresh()
+                
                 iteration += 1
                 if max_iterations and iteration >= max_iterations:
                     break
-                time.sleep(interval_seconds)
+                    
+                # Responsive sleep
+                start_wait = time.time()
+                while time.time() - start_wait < interval_seconds:
+                    try:
+                        key = stdscr.getch()
+                        if key == ord('q'):
+                            return
+                    except:
+                        pass
+                    time.sleep(0.1)
+
+        try:
+            curses.wrapper(main_tui)
         except KeyboardInterrupt:
             logger.info("Engine stopped by user")
+        except Exception as e:
+            logger.error(f"TUI Error: {e}")
+            self.run_once()
+            self.wallet.print_summary()
 
     def backtest(self, days: int = 14) -> pd.DataFrame:
         """

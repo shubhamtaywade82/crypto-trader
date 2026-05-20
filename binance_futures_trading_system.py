@@ -19,6 +19,7 @@ import time
 import hashlib
 import hmac
 import logging
+import curses
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple, Literal
@@ -673,19 +674,70 @@ class TradingEngine:
 
     def run_loop(self, interval_seconds: int = 60, max_iterations: int = None):
         """
-        Run the engine in a loop. For live use, align with candle close times.
+        Run the engine in a loop using a curses TUI dashboard.
         """
-        iteration = 0
-        try:
+        def main_tui(stdscr):
+            curses.curs_set(0)  # Hide cursor
+            stdscr.nodelay(True)  # Non-blocking input
+            iteration = 0
+            
             while True:
+                # Run logic
                 self.run_once()
-                self.wallet.print_summary()
+                summary = self.wallet.get_portfolio_summary()
+                
+                # Clear and Draw
+                stdscr.clear()
+                height, width = stdscr.getmaxyx()
+                
+                # Header
+                stdscr.addstr(0, 0, f"=== BINANCE FUTURES TUI DASHBOARD | {self.symbol} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===", curses.A_BOLD | curses.A_REVERSE)
+                
+                # Wallet Info
+                stdscr.addstr(2, 0, f"Wallet Balance    : {summary['wallet_balance']:.4f} USDT", curses.A_BOLD)
+                stdscr.addstr(3, 0, f"Realized PnL      : {summary['realized_pnl_total']:.4f} USDT")
+                stdscr.addstr(4, 0, f"Unrealized PnL    : {summary['unrealized_pnl_total']:.4f} USDT")
+                stdscr.addstr(5, 0, f"Margin Balance    : {summary['margin_balance']:.4f} USDT")
+                stdscr.addstr(6, 0, f"Available Balance : {summary['available_balance']:.4f} USDT")
+                
+                # Positions
+                stdscr.addstr(8, 0, f"Open Positions: {len(summary['open_positions'])}", curses.A_UNDERLINE)
+                row = 9
+                for p in summary['open_positions']:
+                    color = curses.A_NORMAL
+                    if p['unrealized_pnl'] > 0:
+                        color = curses.A_BOLD 
+                    stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({p['unrealized_pnl_pct']:.2f}%)", color)
+                    row += 1
+                
+                # Log-like footer
+                stdscr.addstr(height-2, 0, f"Next update in {interval_seconds}s | Iteration: {iteration} | Press 'q' to quit")
+                stdscr.refresh()
+                
                 iteration += 1
                 if max_iterations and iteration >= max_iterations:
                     break
-                time.sleep(interval_seconds)
+                
+                # Wait with responsiveness to 'q'
+                start_wait = time.time()
+                while time.time() - start_wait < interval_seconds:
+                    try:
+                        key = stdscr.getch()
+                        if key == ord('q'):
+                            return
+                    except:
+                        pass
+                    time.sleep(0.1)
+
+        try:
+            curses.wrapper(main_tui)
         except KeyboardInterrupt:
             logger.info("Engine stopped by user")
+        except Exception as e:
+            logger.error(f"TUI Error: {e}")
+            # Fallback to simple print if TUI fails
+            self.run_once()
+            self.wallet.print_summary()
 
     def backtest(
         self,
