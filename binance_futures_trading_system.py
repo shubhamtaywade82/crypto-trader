@@ -19,14 +19,17 @@ import time
 import hashlib
 import hmac
 import logging
-import curses
+# curses removed – using plain terminal output
+import threading
+import websocket
+import ssl
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple, Literal
 from enum import Enum
+import pandas as pd
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
 import requests
 
@@ -600,6 +603,87 @@ class FuturesWallet:
 
 
 # ---------------------------------------------------------------------------
+# CoinDCX WebSocket Feed (Alternative for LTP)
+# ---------------------------------------------------------------------------
+
+class CoinDCXWSFeed:
+    """Real-time LTP feed via CoinDCX Futures WebSocket (Socket.io v2)."""
+    def __init__(self, symbol: str):
+        # Map Binance SOLUSDT to CoinDCX B-SOL_USDT
+        base = symbol.replace("USDT", "")
+        self.coindcx_symbol = f"B-{base}_USDT"
+        self.last_price = 0.0
+        self.running = False
+        self.status = "DISCONNECTED"
+        self.error_log = ""
+        self._thread = None
+        
+        # Socket.io v2 endpoint
+        self.ws_url = "wss://stream.coindcx.com/socket.io/?EIO=3&transport=websocket"
+
+    def _on_message(self, ws, message):
+        try:
+            # Socket.io protocol: 42["event", data]
+            if isinstance(message, str) and message.startswith("42"):
+                payload = json.loads(message[2:])
+                event_name = payload[0]
+                data = payload[1]
+                
+                # Check for trade or price-change events
+                if event_name in ["new-trade", "price-change"]:
+                    if "p" in data:
+                        self.last_price = float(data["p"])
+                        self.status = "CONNECTED"
+            
+            elif isinstance(message, str) and message.startswith("0"):
+                ws.send("40")  # Handshake response
+            
+            elif isinstance(message, str) and message.startswith("40"):
+                # Join channel after namespace opened
+                join_msg = f'42["join", {{"channelName": "{self.coindcx_symbol}@trades-futures"}}]'
+                ws.send(join_msg)
+                self.status = "JOINING..."
+        except Exception as e:
+            self.error_log = f"ParseErr: {str(e)[:15]}"
+
+    def _on_error(self, ws, error):
+        self.error_log = f"DCXErr: {str(error)[:20]}"
+        self.status = "ERROR"
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.status = "CLOSED"
+
+    def _on_open(self, ws):
+        self.status = "OPENED"
+        self.error_log = "Handshaking..."
+
+    def _run(self):
+        while self.running:
+            try:
+                self.status = "CONNECTING..."
+                ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                    on_open=self._on_open
+                )
+                ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE}, ping_interval=25, ping_timeout=10)
+            except Exception as e:
+                self.error_log = f"RunErr: {str(e)[:15]}"
+            time.sleep(5)
+
+    def start(self):
+        self.running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+        self.status = "STOPPED"
+
+
+# ---------------------------------------------------------------------------
 # Trading Engine
 # ---------------------------------------------------------------------------
 
@@ -621,6 +705,8 @@ class TradingEngine:
         self.data_feed = BinanceDataFeed(
             base_url=BINANCE_FAPI_TESTNET if testnet else BINANCE_FAPI_BASE
         )
+        # Switch to CoinDCX for real-time LTP updates
+        self.ws_feed = CoinDCXWSFeed(self.symbol)
         self.signal_gen = SignalGenerator()
         self.wallet = FuturesWallet(
             initial_balance=initial_balance,
@@ -628,7 +714,7 @@ class TradingEngine:
             state_file=f"wallet_{self.symbol}_{self.interval}.json",
         )
 
-    def run_once(self) -> dict:
+    def run_once(self, mark_price: float = None) -> dict:
         """
         Single iteration:
         1. Fetch latest klines
@@ -637,21 +723,18 @@ class TradingEngine:
         4. Open new position if signal and no conflict
         5. Return summary
         """
-        logger.info(f"--- Tick: {self.symbol} {self.interval} ---")
-
         # 1. Fetch data
         try:
             df = self.data_feed.get_klines(self.symbol, self.interval, limit=DEFAULT_KLINE_LIMIT)
-            mark_price = self.data_feed.get_mark_price(self.symbol)
+            if mark_price is None:
+                mark_price = self.data_feed.get_mark_price(self.symbol)
         except Exception as e:
             logger.error(f"Data fetch failed: {e}")
             return self.wallet.get_portfolio_summary()
 
         # 2. Generate signal
         signal, df = self.signal_gen.generate(df)
-        latest_close = float(df["close"].iloc[-1])
-        logger.info(f"Signal: {signal.name} | Close: {latest_close:.2f} | Mark: {mark_price:.2f}")
-
+        
         # 3. Update open positions
         self.wallet.update_positions({self.symbol: mark_price})
 
@@ -665,79 +748,59 @@ class TradingEngine:
                     entry_price=mark_price,
                     mark_price=mark_price,
                 )
-            else:
-                logger.info(f"No new position: {reason}")
 
         # 5. Summary
         summary = self.wallet.get_portfolio_summary()
         return summary
 
     def run_loop(self, interval_seconds: int = 60, max_iterations: int = None):
-        """
-        Run the engine in a loop using a curses TUI dashboard.
-        """
-        def main_tui(stdscr):
-            curses.curs_set(0)  # Hide cursor
-            stdscr.nodelay(True)  # Non-blocking input
-            iteration = 0
-            
-            while True:
-                # Run logic
-                self.run_once()
-                summary = self.wallet.get_portfolio_summary()
-                
-                # Clear and Draw
-                stdscr.clear()
-                height, width = stdscr.getmaxyx()
-                
-                # Header
-                stdscr.addstr(0, 0, f"=== BINANCE FUTURES TUI DASHBOARD | {self.symbol} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===", curses.A_BOLD | curses.A_REVERSE)
-                
-                # Wallet Info
-                stdscr.addstr(2, 0, f"Wallet Balance    : {summary['wallet_balance']:.4f} USDT", curses.A_BOLD)
-                stdscr.addstr(3, 0, f"Realized PnL      : {summary['realized_pnl_total']:.4f} USDT")
-                stdscr.addstr(4, 0, f"Unrealized PnL    : {summary['unrealized_pnl_total']:.4f} USDT")
-                stdscr.addstr(5, 0, f"Margin Balance    : {summary['margin_balance']:.4f} USDT")
-                stdscr.addstr(6, 0, f"Available Balance : {summary['available_balance']:.4f} USDT")
-                
-                # Positions
-                stdscr.addstr(8, 0, f"Open Positions: {len(summary['open_positions'])}", curses.A_UNDERLINE)
-                row = 9
-                for p in summary['open_positions']:
-                    color = curses.A_NORMAL
-                    if p['unrealized_pnl'] > 0:
-                        color = curses.A_BOLD 
-                    stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({p['unrealized_pnl_pct']:.2f}%)", color)
-                    row += 1
-                
-                # Log-like footer
-                stdscr.addstr(height-2, 0, f"Next update in {interval_seconds}s | Iteration: {iteration} | Press 'q' to quit")
-                stdscr.refresh()
-                
-                iteration += 1
-                if max_iterations and iteration >= max_iterations:
-                    break
-                
-                # Wait with responsiveness to 'q'
-                start_wait = time.time()
-                while time.time() - start_wait < interval_seconds:
-                    try:
-                        key = stdscr.getch()
-                        if key == ord('q'):
-                            return
-                    except:
-                        pass
-                    time.sleep(0.1)
-
+        """Run the main loop and render a simple stdout dashboard."""
+        self.ws_feed.start()
+        iteration = 0
+        start_time = time.time()
         try:
-            curses.wrapper(main_tui)
+            while True:
+                now = time.time()
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+                # Run strategy on tick interval
+                if now - start_time >= interval_seconds:
+                    mark_price = self.ws_feed.last_price if self.ws_feed.last_price > 0 else None
+                    self.run_once(mark_price=mark_price)
+                    start_time = now
+                    iteration += 1
+                # Update unrealized PnL with latest price
+                current_price = self.ws_feed.last_price
+                if current_price > 0:
+                    self.wallet.update_positions({self.symbol: current_price})
+                summary = self.wallet.get_portfolio_summary()
+                # Display dashboard
+                os.system('clear')
+                header = f"=== {self.symbol} LTP: {current_price:.4f} | {datetime.now().strftime('%H:%M:%S')} ===" if current_price > 0 else f"=== {self.symbol} | WS {self.ws_feed.status} {self.ws_feed.error_log} ==="
+                print(header)
+                print("=" * len(header))
+                print(f"Wallet Balance    : {summary['wallet_balance']:.4f} USDT")
+                print(f"Realized PnL      : {summary['realized_pnl_total']:.4f} USDT")
+                pnl = summary['unrealized_pnl_total']
+                color = ''
+                if pnl > 0:
+                    color = '\x1b[32m'
+                elif pnl < 0:
+                    color = '\x1b[31m'
+                reset = '\x1b[0m'
+                print(f"Unrealized PnL    : {color}{pnl:.4f}{reset} USDT")
+                print(f"Margin Balance    : {summary['margin_balance']:.4f} USDT")
+                print(f"Available Balance : {summary['available_balance']:.4f} USDT")
+                if summary['open_positions']:
+                    print("Open Positions:")
+                    for p in summary['open_positions']:
+                        print(f"  - {p['symbol']} {p['side']} | Entry={p['entry_price']:.2f} | U‑PnL={p['unrealized_pnl']:.2f}")
+                time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Engine stopped by user")
-        except Exception as e:
-            logger.error(f"TUI Error: {e}")
-            # Fallback to simple print if TUI fails
-            self.run_once()
-            self.wallet.print_summary()
+        finally:
+            self.ws_feed.stop()
+            # Legacy curses UI removed - using simple stdout dashboard
 
     def backtest(
         self,
@@ -745,8 +808,7 @@ class TradingEngine:
         interval: str = "1h",
         plot: bool = False,
     ) -> pd.DataFrame:
-        """
-        Run a simple backtest over historical klines.
+        """Run a simple backtest over historical klines.
         Walk-forward: at each candle close, generate signal, update positions,
         and open/close accordingly.
         """

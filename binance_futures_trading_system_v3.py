@@ -114,7 +114,7 @@ class TradingEngineV3(TradingEngineV2):
                 logger.warning("[LLM] Ollama not available. Starting in technical-only mode.")
                 logger.warning("[LLM] To enable: run 'ollama run llama3.2:3b' in another terminal")
 
-    def run_once(self) -> dict:
+    def run_once(self, mark_price: float = None) -> dict:
         """
         Enhanced tick with LLM layer:
         1. Fetch data (same as v2)
@@ -124,13 +124,12 @@ class TradingEngineV3(TradingEngineV2):
         5. Evaluate entry with LLM filter (modified)
         6. Return summary
         """
-        logger.info(f"--- Tick: {self.symbol} (v3 LLM-Enhanced) ---")
-
         # 1. Fetch data
         try:
             df_4h = self.data_feed.get_klines(self.symbol, TF_4H, limit=LIMIT_4H)
             df_1h = self.data_feed.get_klines(self.symbol, TF_1H, limit=LIMIT_1H)
-            mark_price = self.data_feed.get_mark_price(self.symbol)
+            if mark_price is None:
+                mark_price = self.data_feed.get_mark_price(self.symbol)
         except Exception as e:
             logger.error(f"Data fetch failed: {e}")
             return self.wallet.get_summary()
@@ -251,78 +250,96 @@ class TradingEngineV3(TradingEngineV2):
             logger.info(f"[LLM CALLBACK] Advice received: {advice.bias.value} (conf={advice.confidence:.2f})")
         else:
             logger.debug("[LLM CALLBACK] No advice received (parse failure or timeout)")
-def run_loop(self, interval_seconds: int = 300, max_iterations: int = None):
-    """Run loop using a curses TUI dashboard."""
-    def main_tui(stdscr):
-        curses.curs_set(0)
-        stdscr.nodelay(True)
-        iteration = 0
+    def run_loop(self, interval_seconds: int = 300, max_iterations: int = None):
+        """Run loop using a curses TUI dashboard with real-time WS updates."""
+        self.ws_feed.start()
+        
+        def main_tui(stdscr):
+            curses.curs_set(0)
+            stdscr.nodelay(True)
+            iteration = 0
+            last_tick_time = 0
+            
+            while True:
+                now = time.time()
+                
+                # Run strategy logic only on tick interval
+                if now - last_tick_time >= interval_seconds:
+                    mark_price = self.ws_feed.last_price if self.ws_feed.last_price > 0 else None
+                    self.run_once(mark_price=mark_price)
+                    last_tick_time = now
+                    iteration += 1
 
-        while True:
-            # Run engine logic
-            self.run_once()
-            s = self.wallet.get_summary()
+                # Update Unrealized PnL in real-time between ticks
+                current_price = self.ws_feed.last_price
+                if current_price > 0:
+                    self.wallet.update_positions({self.symbol: current_price}, {})
+                
+                s = self.wallet.get_summary()
+                
+                # Draw
+                stdscr.clear()
+                height, width = stdscr.getmaxyx()
+                
+                # Header with LTP
+                price_str = f"{current_price:.4f}" if current_price > 0 else f"{self.ws_feed.status} {self.ws_feed.error_log}"
+                header = f"=== {self.symbol} LTP: {price_str} | {datetime.now().strftime('%H:%M:%S')} ==="
+                stdscr.addstr(0, 0, header.ljust(width), curses.A_BOLD | curses.A_REVERSE)
 
-            # Draw
-            stdscr.clear()
-            height, width = stdscr.getmaxyx()
-
-            # Header
-            stdscr.addstr(0, 0, f"=== SOL 10x SNAP v3 (AI) DASHBOARD | {self.symbol} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===", curses.A_BOLD | curses.A_REVERSE)
-
-            # Wallet Info
-            stdscr.addstr(2, 0, f"Wallet Balance    : {s['wallet_balance']:.4f} USDT", curses.A_BOLD)
-            stdscr.addstr(3, 0, f"Realized PnL      : {s['realized_pnl']:.4f} USDT")
-            stdscr.addstr(4, 0, f"Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT")
-            stdscr.addstr(5, 0, f"Margin Balance    : {s['margin_balance']:.4f} USDT")
-            stdscr.addstr(6, 0, f"Available         : {s['available']:.4f} USDT")
-
-            # AI Advice (v3 specific)
-            advice = getattr(self, "latest_advice", None)
-            if advice:
-                sentiment = advice.get("sentiment_score", 0)
-                veto = advice.get("veto_reason")
-                stdscr.addstr(8, 0, "AI Advisor Status:", curses.A_UNDERLINE)
-                stdscr.addstr(9, 2, f"Sentiment: {sentiment:+.2f} | Confidence: {advice.get('confidence', 0):.2f}")
-                stdscr.addstr(10, 2, f"Veto: {veto if veto else 'None'}")
-                if advice.get("key_factors"):
-                    stdscr.addstr(11, 2, f"Key Factors: {', '.join(advice['key_factors'][:3])}")
-
-            # Positions
-            stdscr.addstr(13, 0, f"Open Positions: {s['open_count']}", curses.A_UNDERLINE)
-            row = 14
-            for p in s["open_positions"]:
-                margin_pnl_pct = (p['unrealized_pnl'] / p['margin_used'] * 100) if p['margin_used'] > 0 else 0
-                stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({margin_pnl_pct:.2f}%)")
-                row += 1
-
-            # Footer
-            stdscr.addstr(height-2, 0, f"Next update in {interval_seconds}s | Iteration: {iteration} | Press 'q' to quit")
-            stdscr.refresh()
-
-            iteration += 1
-            if max_iterations and iteration >= max_iterations:
-                break
-
-            # Responsive sleep
-            start_wait = time.time()
-            while time.time() - start_wait < interval_seconds:
+                # Wallet Info
+                stdscr.addstr(2, 0, f"Wallet Balance    : {s['wallet_balance']:.4f} USDT", curses.A_BOLD)
+                stdscr.addstr(3, 0, f"Realized PnL      : {s['realized_pnl']:.4f} USDT")
+                stdscr.addstr(4, 0, f"Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT", curses.A_GREEN if s['unrealized_pnl'] > 0 else curses.A_RED if s['unrealized_pnl'] < 0 else curses.A_NORMAL)
+                stdscr.addstr(5, 0, f"Margin Balance    : {s['margin_balance']:.4f} USDT")
+                stdscr.addstr(6, 0, f"Available         : {s['available']:.4f} USDT")
+                
+                # AI Advice (v3 specific)
+                advice_obj = getattr(self, "latest_advice", None)
+                if advice_obj:
+                    # latest_advice is an LLMAdvice dataclass in v3
+                    sentiment = advice_obj.sentiment_score
+                    veto = advice_obj.veto_reason
+                    stdscr.addstr(9, 0, "AI Advisor Status:", curses.A_UNDERLINE)
+                    stdscr.addstr(10, 2, f"Sentiment: {sentiment:+.2f} | Confidence: {advice_obj.confidence:.2f}")
+                    stdscr.addstr(11, 2, f"Veto: {veto if veto else 'None'}")
+                    if advice_obj.key_factors:
+                        stdscr.addstr(12, 2, f"Key Factors: {', '.join(advice_obj.key_factors[:3])}")
+                
+                # Positions
+                stdscr.addstr(14, 0, f"Open Positions: {s['open_count']}", curses.A_UNDERLINE)
+                row = 15
+                for p in s["open_positions"]:
+                    margin_pnl_pct = (p['unrealized_pnl'] / p['margin_used'] * 100) if p['margin_used'] > 0 else 0
+                    stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({margin_pnl_pct:.2f}%)")
+                    row += 1
+                
+                # Footer
+                time_to_next = max(0, int(interval_seconds - (now - last_tick_time)))
+                stdscr.addstr(height-2, 0, f"Next strategy tick in {time_to_next}s | Iteration: {iteration} | Press 'q' to quit")
+                stdscr.refresh()
+                
+                if max_iterations and iteration >= max_iterations:
+                    break
+                    
+                # Responsive sleep
                 try:
                     key = stdscr.getch()
                     if key == ord('q'):
                         return
                 except:
                     pass
-                time.sleep(0.1)
+                time.sleep(0.2)
 
-    try:
-        curses.wrapper(main_tui)
-    except KeyboardInterrupt:
-        logger.info("Engine stopped by user")
-    except Exception as e:
-        logger.error(f"TUI Error: {e}")
-        self.run_once()
-        self.wallet.print_summary()
+        try:
+            curses.wrapper(main_tui)
+        except KeyboardInterrupt:
+            logger.info("Engine stopped by user")
+        except Exception as e:
+            logger.error(f"TUI Error: {e}")
+            self.run_once()
+            self.wallet.print_summary()
+        finally:
+            self.ws_feed.stop()
 
 # ---------------------------------------------------------------------------
 # CLI
