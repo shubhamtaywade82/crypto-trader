@@ -18,6 +18,9 @@ import os
 import json
 import time
 import logging
+import curses
+import threading
+import websocket
 from datetime import datetime, timezone, timedelta, date
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Dict, List, Optional, Tuple, Literal
@@ -959,6 +962,72 @@ class EnhancedFuturesWallet:
 
 
 # ---------------------------------------------------------------------------
+# WebSocket Feed
+# ---------------------------------------------------------------------------
+
+class BinanceWSFeed:
+    """Real-time WebSocket feed for Last Traded Price (LTP)."""
+    def __init__(self, symbol: str, testnet: bool = False):
+        self.symbol = symbol.lower()
+        self.testnet = testnet
+        self.last_price = 0.0
+        self.running = False
+        self.status = "DISCONNECTED"
+        self.error_log = ""
+        self._thread = None
+        
+        if testnet:
+            self.ws_url = f"wss://stream.binancefuture.com/market/ws/{self.symbol}@markPrice@1s"
+        else:
+            self.ws_url = f"wss://fstream.binance.com/market/ws/{self.symbol}@markPrice@1s"
+
+    def _on_message(self, ws, message):
+        self.status = "CONNECTED"
+        try:
+            data = json.loads(message)
+            if "data" in data: data = data["data"]
+            if "p" in data: self.last_price = float(data["p"])
+            elif "c" in data: self.last_price = float(data["c"])
+        except Exception as e:
+            self.status = f"ERROR: {str(e)[:15]}"
+
+    def _on_error(self, ws, error):
+        self.error_log = f"WSErr: {str(error)[:20]}"
+        self.status = "ERROR"
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.status = "CLOSED"
+
+    def _on_open(self, ws):
+        self.status = "OPENED"
+
+    def _run(self):
+        while self.running:
+            try:
+                self.status = "CONNECTING..."
+                ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                    on_open=self._on_open
+                )
+                ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE}, ping_interval=20, ping_timeout=10)
+            except:
+                pass
+            time.sleep(5)
+
+    def start(self):
+        self.running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+        self.status = "STOPPED"
+
+
+# ---------------------------------------------------------------------------
 # Trading Engine
 # ---------------------------------------------------------------------------
 
@@ -974,6 +1043,7 @@ class TradingEngine:
         self.data_feed = BinanceDataFeed(
             base_url=BINANCE_FAPI_TESTNET if testnet else BINANCE_FAPI_BASE
         )
+        self.ws_feed = BinanceWSFeed(self.symbol, testnet=testnet)
         self.regime_analyzer = MarketRegimeAnalyzer()
         self.playbook_a = PlaybookA_IntradaySnap()
         self.playbook_b = PlaybookB_Swing()
@@ -986,26 +1056,22 @@ class TradingEngine:
         # Wire up RiskManager so it tracks wins/losses from auto-close events
         self.wallet.on_position_closed = self.risk_manager.record_close
 
-    def run_once(self) -> dict:
-        logger.info(f"--- Tick: {self.symbol} ---")
-
+    def run_once(self, mark_price: float = None) -> dict:
         # 1. Fetch multi-timeframe data
         try:
             df_4h = self.data_feed.get_klines(self.symbol, TF_4H, limit=LIMIT_4H)
             df_1h = self.data_feed.get_klines(self.symbol, TF_1H, limit=LIMIT_1H)
-            mark_price = self.data_feed.get_mark_price(self.symbol)
+            if mark_price is None:
+                mark_price = self.data_feed.get_mark_price(self.symbol)
         except Exception as e:
             logger.error(f"Data fetch failed: {e}")
             return self.wallet.get_summary()
 
         # 2. Analyze 4H regime
         regime, df_4h = self.regime_analyzer.analyze(df_4h)
-        logger.info(f"4H Regime: {regime.value}")
 
         # 3. Risk check
         can_trade, risk_reason = self.risk_manager.can_trade()
-        if not can_trade:
-            logger.info(f"[RISK BLOCK] {risk_reason}")
 
         # 4. Prepare indicators for trailing stops
         df_1h["ema9"] = compute_ema(df_1h, B_TRAIL_EMA)
@@ -1027,14 +1093,10 @@ class TradingEngine:
 
             # Try Playbook A first (higher frequency, tighter risk)
             setup = self.playbook_a.evaluate(df_1h, regime)
-            if setup:
-                logger.info(f"[PLAYBOOK A] Signal detected: {setup['side'].value} | {setup['reason']}")
 
             # If no Playbook A, try Playbook B (lower frequency, higher reward)
             if not setup:
                 setup = self.playbook_b.evaluate(df_1h, df_4h, regime)
-                if setup:
-                    logger.info(f"[PLAYBOOK B] Signal detected: {setup['side'].value} | {setup['reason']}")
 
             if setup:
                 pos = self.wallet.open_position(self.symbol, setup, mark_price)
@@ -1046,18 +1108,90 @@ class TradingEngine:
         return summary
 
     def run_loop(self, interval_seconds: int = 300, max_iterations: int = None):
-        """Run loop. Default 5-min ticks (align with 1H close for best results)."""
-        iteration = 0
-        try:
+        """Run loop using a curses TUI dashboard with real-time WS updates."""
+        self.ws_feed.start()
+        
+        def main_tui(stdscr):
+            curses.curs_set(0)
+            stdscr.nodelay(True)
+            iteration = 0
+            last_tick_time = 0
+            
             while True:
-                self.run_once()
-                self.wallet.print_summary()
-                iteration += 1
+                now = time.time()
+                
+                # Run strategy logic only on tick interval
+                if now - last_tick_time >= interval_seconds:
+                    mark_price = self.ws_feed.last_price if self.ws_feed.last_price > 0 else None
+                    self.run_once(mark_price=mark_price)
+                    last_tick_time = now
+                    iteration += 1
+
+                # Update Unrealized PnL in real-time between ticks
+                current_price = self.ws_feed.last_price
+                if current_price > 0:
+                    # For v2, we need EMA9 for trailing stop updates if trailing is active
+                    # but for high-frequency TUI updates, we'll just update the price
+                    # trailing stop checks will still mostly happen on the execution tick
+                    self.wallet.update_positions({self.symbol: current_price}, {})
+                
+                s = self.wallet.get_summary()
+                
+                # Draw
+                stdscr.clear()
+                height, width = stdscr.getmaxyx()
+                
+                # Header with LTP
+                price_str = f"{current_price:.4f}" if current_price > 0 else self.ws_feed.status
+                header = f"=== {self.symbol} LTP: {price_str} | {datetime.now().strftime('%H:%M:%S')} ==="
+                stdscr.addstr(0, 0, header.ljust(width), curses.A_BOLD | curses.A_REVERSE)
+                
+                # Wallet Info
+                stdscr.addstr(2, 0, f"Wallet Balance    : {s['wallet_balance']:.4f} USDT", curses.A_BOLD)
+                stdscr.addstr(3, 0, f"Realized PnL      : {s['realized_pnl']:.4f} USDT")
+                stdscr.addstr(4, 0, f"Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT", curses.A_GREEN if s['unrealized_pnl'] > 0 else curses.A_RED if s['unrealized_pnl'] < 0 else curses.A_NORMAL)
+                stdscr.addstr(5, 0, f"Margin Balance    : {s['margin_balance']:.4f} USDT")
+                stdscr.addstr(6, 0, f"Available         : {s['available']:.4f} USDT")
+                
+                # Risk & Regime
+                can_trade, risk_reason = self.risk_manager.can_trade()
+                stdscr.addstr(9, 0, f"Risk Status: {'ALLOW' if can_trade else 'HALTED'} | Reason: {risk_reason}")
+                
+                # Positions
+                stdscr.addstr(11, 0, f"Open Positions: {s['open_count']}", curses.A_UNDERLINE)
+                row = 12
+                for p in s["open_positions"]:
+                    margin_pnl_pct = (p['unrealized_pnl'] / p['margin_used'] * 100) if p['margin_used'] > 0 else 0
+                    stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({margin_pnl_pct:.2f}%) | Playbook: {p['playbook']}")
+                    row += 1
+                
+                # Footer
+                time_to_next = max(0, int(interval_seconds - (now - last_tick_time)))
+                stdscr.addstr(height-2, 0, f"Next strategy tick in {time_to_next}s | Iteration: {iteration} | Press 'q' to quit")
+                stdscr.refresh()
+                
                 if max_iterations and iteration >= max_iterations:
                     break
-                time.sleep(interval_seconds)
+                    
+                # Responsive sleep
+                try:
+                    key = stdscr.getch()
+                    if key == ord('q'):
+                        return
+                except:
+                    pass
+                time.sleep(0.2)
+
+        try:
+            curses.wrapper(main_tui)
         except KeyboardInterrupt:
             logger.info("Engine stopped by user")
+        except Exception as e:
+            logger.error(f"TUI Error: {e}")
+            self.run_once()
+            self.wallet.print_summary()
+        finally:
+            self.ws_feed.stop()
 
     def backtest(self, days: int = 14) -> pd.DataFrame:
         """
