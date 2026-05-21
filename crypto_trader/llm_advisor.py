@@ -324,11 +324,13 @@ class OllamaAdvisor:
         timeout: int = OLLAMA_TIMEOUT,
         cache_ttl: int = CACHE_TTL,
         max_failures: int = 5,
+        log_llm: bool = False,
     ):
         self.client = OllamaClient(host=host, model=model, timeout=timeout)
         self.parser = LLMResponseParser()
         self.cache = LLMCache(ttl=cache_ttl)
         self.circuit_breaker = LLMCircuitBreaker(max_failures=max_failures)
+        self.log_llm = log_llm or os.getenv("LOG_LLM", "false").lower() in ("true", "1", "yes")
         self._last_advice: Optional[LLMAdvice] = None
         self._lock = threading.Lock()
 
@@ -359,9 +361,14 @@ class OllamaAdvisor:
         if not force_refresh:
             cached = self.cache.get(symbol, prompt)
             if cached:
+                if self.log_llm:
+                    logger.info(f"[LLM Cache Hit] Reused cached advice for {symbol}")
                 with self._lock:
                     self._last_advice = cached
                 return cached
+
+        if self.log_llm:
+            logger.info(f"[LLM Prompt] Sent to model '{self.client.model}':\n{prompt}\n" + "="*50)
 
         start = time.perf_counter()
         raw = self.client.generate(prompt)
@@ -371,6 +378,12 @@ class OllamaAdvisor:
             self.circuit_breaker.record_failure()
             with self._lock:
                 return self._last_advice
+
+        if self.log_llm:
+            resp_str = str(raw)
+            if resp_str and len(resp_str) > 1000:
+                resp_str = resp_str[:1000] + "... (truncated)"
+            logger.info(f"[LLM Response] Received raw output:\n{resp_str}\n" + "="*50)
 
         advice = self.parser.parse(raw, symbol)
         if advice is None:

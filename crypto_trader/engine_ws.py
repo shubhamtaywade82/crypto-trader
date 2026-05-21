@@ -54,13 +54,20 @@ class WebSocketTradingEngine:
         llm_host: str = "http://localhost:11434",
         llm_model: str = "qwen3.5:4b",
         log_responses: bool = False,
+        log_rest: bool = False,
+        log_ws: bool = False,
+        log_llm: bool = False,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
 
+        rest_logged = log_responses or log_rest
+        ws_logged = log_responses or log_ws
+        llm_logged = log_responses or log_llm
+
         # REST client (for historical data, funding, OI)
         base_url = "https://demo-fapi.binance.com" if testnet else "https://fapi.binance.com"
-        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=log_responses)
+        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=rest_logged)
 
         # WebSocket client (for real-time LTP, mark price, bid/ask)
         self.ws_feed = BinanceWebSocketFeed(
@@ -69,7 +76,7 @@ class WebSocketTradingEngine:
             on_mark_price=self._on_mark_price,
             on_kline=self._on_kline,
             on_book_ticker=self._on_book_ticker,
-            log_responses=log_responses,
+            log_responses=ws_logged,
         )
 
         # Wallet & Risk
@@ -92,7 +99,7 @@ class WebSocketTradingEngine:
         self.advisor = None
         self._llm_thread = None
         if use_llm:
-            self.advisor = OllamaAdvisor(host=llm_host, model=llm_model)
+            self.advisor = OllamaAdvisor(host=llm_host, model=llm_model, log_llm=llm_logged)
             if self.advisor.is_ready():
                 logger.info(f"[LLM] Connected to {llm_model}")
             else:
@@ -384,7 +391,10 @@ def main():
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--llm-host", default="http://localhost:11434")
     parser.add_argument("--llm-model", default="qwen3.5:4b")
-    parser.add_argument("--log-responses", action="store_true", help="Log Binance API and WebSocket request/response JSON")
+    parser.add_argument("--log-responses", action="store_true", help="Log all REST API, WS, and LLM JSON outputs (master toggle)")
+    parser.add_argument("--log-rest", action="store_true", help="Log Binance REST API request/response JSON")
+    parser.add_argument("--log-ws", action="store_true", help="Log Binance WebSocket message JSON")
+    parser.add_argument("--log-llm", action="store_true", help="Log Ollama LLM prompt and response JSON")
     parser.add_argument("--tick", type=int, default=300, help="Signal tick interval (seconds)")
     parser.add_argument("--backtest-days", type=int, default=None)
     args = parser.parse_args()
@@ -404,6 +414,9 @@ def main():
         llm_host=args.llm_host,
         llm_model=args.llm_model,
         log_responses=args.log_responses,
+        log_rest=args.log_rest,
+        log_ws=args.log_ws,
+        log_llm=args.log_llm,
     )
 
     if args.backtest_days:

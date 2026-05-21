@@ -46,13 +46,20 @@ class TradingEngine:
         llm_host: str = "http://localhost:11434",
         llm_model: str = "qwen3.5:4b",
         log_responses: bool = False,
+        log_rest: bool = False,
+        log_ws: bool = False,
+        log_llm: bool = False,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
 
+        rest_logged = log_responses or log_rest
+        ws_logged = log_responses or log_ws
+        llm_logged = log_responses or log_llm
+
         # Modules
         base_url = "https://demo-fapi.binance.com" if testnet else "https://fapi.binance.com"
-        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=log_responses)
+        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=rest_logged)
         self.wallet = EnhancedFuturesWallet(
             symbol=self.symbol,
             initial_balance=initial_balance,
@@ -70,7 +77,7 @@ class TradingEngine:
         self.advisor = None
         self._llm_thread = None
         if use_llm:
-            self.advisor = OllamaAdvisor(host=llm_host, model=llm_model)
+            self.advisor = OllamaAdvisor(host=llm_host, model=llm_model, log_llm=llm_logged)
             if self.advisor.is_ready():
                 logger.info(f"[LLM] Connected to {llm_model}")
             else:
@@ -229,7 +236,10 @@ def main():
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--llm-host", default="http://localhost:11434")
     parser.add_argument("--llm-model", default="qwen3.5:4b")
-    parser.add_argument("--log-responses", action="store_true", help="Log Binance API request/response JSON")
+    parser.add_argument("--log-responses", action="store_true", help="Log all REST API, WS, and LLM JSON outputs (master toggle)")
+    parser.add_argument("--log-rest", action="store_true", help="Log Binance REST API request/response JSON")
+    parser.add_argument("--log-ws", action="store_true", help="Log Binance WebSocket message JSON")
+    parser.add_argument("--log-llm", action="store_true", help="Log Ollama LLM prompt and response JSON")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--tick", type=int, default=300)
     args = parser.parse_args()
@@ -250,6 +260,9 @@ def main():
         llm_host=args.llm_host,
         llm_model=args.llm_model,
         log_responses=args.log_responses,
+        log_rest=args.log_rest,
+        log_ws=args.log_ws,
+        log_llm=args.log_llm,
     )
 
     if args.loop:
