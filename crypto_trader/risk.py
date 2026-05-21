@@ -24,19 +24,25 @@ class RiskManager:
         self,
         max_daily_trades: int = 2,
         max_consecutive_losses: int = 2,
+        max_drawdown_pct: float = 0.20,
+        cooldown_after_loss_minutes: int = 30,
     ):
         self.max_daily = max_daily_trades
         self.max_consecutive = max_consecutive_losses
+        self.max_drawdown_pct = max_drawdown_pct
+        self.cooldown_after_loss_seconds = cooldown_after_loss_minutes * 60
         self.daily_count = 0
         self.last_trade_date: Optional[date] = None
         self.consecutive_losses = 0
+        self.last_loss_time: Optional[float] = None
+        self.peak_balance: Optional[float] = None
         self.state_file = DATA_DIR / "risk_state.json"
         self._load_state()
 
     def _today(self) -> date:
         return datetime.now(timezone.utc).date()
 
-    def can_trade(self) -> Tuple[bool, str]:
+    def can_trade(self, current_balance: Optional[float] = None) -> Tuple[bool, str]:
         today = self._today()
         if self.last_trade_date != today:
             self.daily_count = 0
@@ -46,6 +52,15 @@ class RiskManager:
             return False, f"Daily trade limit reached ({self.max_daily})"
         if self.consecutive_losses >= self.max_consecutive:
             return False, f"Consecutive loss halt ({self.max_consecutive}) — manual reset required"
+        if self.last_loss_time:
+            elapsed = time.time() - self.last_loss_time
+            if elapsed < self.cooldown_after_loss_seconds:
+                remaining = int((self.cooldown_after_loss_seconds - elapsed) // 60) + 1
+                return False, f"Cooldown after loss active ({remaining}m remaining)"
+        if current_balance is not None and self.peak_balance and self.peak_balance > 0:
+            dd = (self.peak_balance - current_balance) / self.peak_balance
+            if dd >= self.max_drawdown_pct:
+                return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
         return True, "OK"
 
     def record_open(self):
@@ -63,8 +78,16 @@ class RiskManager:
             logger.info(f"[RISK] Win recorded. Consecutive losses reset to 0.")
         else:
             self.consecutive_losses += 1
+            self.last_loss_time = time.time()
             logger.warning(f"[RISK] Loss recorded. Consecutive losses: {self.consecutive_losses}/{self.max_consecutive}")
         self._save_state()
+
+    def update_peak_balance(self, current_balance: float):
+        if current_balance <= 0:
+            return
+        if self.peak_balance is None or current_balance > self.peak_balance:
+            self.peak_balance = current_balance
+            self._save_state()
 
     def reset_consecutive_losses(self):
         """Manual reset after reviewing strategy."""
@@ -77,6 +100,8 @@ class RiskManager:
             "daily_count": self.daily_count,
             "last_trade_date": self.last_trade_date.isoformat() if self.last_trade_date else None,
             "consecutive_losses": self.consecutive_losses,
+            "last_loss_time": self.last_loss_time,
+            "peak_balance": self.peak_balance,
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f)
@@ -91,6 +116,8 @@ class RiskManager:
             d = state.get("last_trade_date")
             self.last_trade_date = date.fromisoformat(d) if d else None
             self.consecutive_losses = state.get("consecutive_losses", 0)
+            self.last_loss_time = state.get("last_loss_time")
+            self.peak_balance = state.get("peak_balance")
         except Exception as e:
             logger.warning(f"RiskManager load failed: {e}")
 
