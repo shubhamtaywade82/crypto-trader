@@ -324,3 +324,12 @@ This software is for **educational and paper-trading purposes only**.
 - 10× leverage is extremely aggressive.
 - Always test on testnet or in simulation before deploying real capital.
 - The authors are not responsible for any financial losses.
+
+
+### v4 WebSocket hybrid engine
+
+```bash
+python3 -m crypto_trader.engine_ws --symbol SOLUSDT --loop --tick 300
+python3 -m crypto_trader.engine_ws --symbol SOLUSDT --no-llm --loop
+python3 -m crypto_trader.engine_ws --symbol SOLUSDT --testnet --loop
+```
