@@ -1,57 +1,185 @@
-from __future__ import annotations
-import logging, time
-import json
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+"""
+crypto_trader.data_feed — Binance USD-M Futures Market Data Client
+=====================================================================
+Fetches OHLCV, mark price, funding rate, and open interest.
+Handles rate limits, IP bans, and retries with exponential backoff.
+"""
 
-logger = logging.getLogger(__name__)
+import time
+import logging
+from typing import Optional
 
-@dataclass
+import requests
+import pandas as pd
+
+logger = logging.getLogger("crypto_trader.data_feed")
+
+BINANCE_FAPI_BASE = "https://fapi.binance.com"
+BINANCE_FAPI_TESTNET = "https://demo-fapi.binance.com"
+
+
 class BinanceDataFeed:
-    base_url: str = "https://fapi.binance.com"
-    timeout: int = 15
+    """Production-grade Binance Futures REST client."""
 
-    def __post_init__(self):
-        self.base_url = self.base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str = BINANCE_FAPI_BASE,
+        max_retries: int = 3,
+        backoff_base: float = 2.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "crypto-trader/4.0",
+        })
 
-    def _get(self, endpoint: str, params: dict | None = None):
-        query = f"?{urlencode(params)}" if params else ""
-        url = f"{self.base_url}/fapi/{endpoint}{query}"
-        try:
-            req = Request(url, headers={"Accept": "application/json", "User-Agent": "crypto-trader-v4/1.0"})
-            with urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except HTTPError as e:
-            sc = e.code
-            if sc == 418:
-                logger.critical("Binance IP banned (418). Sleeping 120s")
-                time.sleep(120)
-            elif sc == 429:
-                logger.warning("Binance rate limited (429). Sleeping 60s")
-                time.sleep(60)
-            raise
+    def _request(self, method: str, endpoint: str, params: dict = None) -> dict:
+        """Make a request with retry logic and rate-limit handling.
+        For Binance Futures API, the endpoint path differs:
+        - Endpoints starting with "v1/" are under the standard '/fapi' namespace.
+        - Endpoints starting with "futures/" already include the full path and should not be prefixed.
+        """
+        if endpoint.startswith("v1/"):
+            # Classic Binance Futures endpoints (e.g., klines, mark price)
+            url = f"{self.base_url}/fapi/{endpoint}"
+        else:
+            # Full path endpoints such as 'futures/data/...'
+            url = f"{self.base_url}/{endpoint}"
+        last_exception = None
 
-    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 150) -> list[dict]:
-        data = self._get("v1/klines", {"symbol": symbol.upper(), "interval": interval, "limit": limit})
-        rows: list[dict] = []
-        for r in data:
-            rows.append({
-                "open_time": datetime.fromtimestamp(r[0] / 1000, tz=timezone.utc),
-                "open": float(r[1]),
-                "high": float(r[2]),
-                "low": float(r[3]),
-                "close": float(r[4]),
-                "volume": float(r[5]),
-                "close_time": datetime.fromtimestamp(r[6] / 1000, tz=timezone.utc),
-                "quote_volume": float(r[7]),
-                "trades": int(r[8]),
-                "taker_buy_base": float(r[9]),
-                "taker_buy_quote": float(r[10]),
-            })
-        return rows
+        for attempt in range(self.max_retries):
+            try:
+                if method == "GET":
+                    resp = self.session.get(url, params=params, timeout=15)
+                else:
+                    resp = self.session.request(method, url, params=params, timeout=15)
+
+                # Handle IP ban (418)
+                if resp.status_code == 418:
+                    sleep_sec = 120 * (attempt + 1)
+                    logger.critical(f"IP BANNED by Binance. Sleeping {sleep_sec}s...")
+                    time.sleep(sleep_sec)
+                    continue
+
+                # Handle rate limit (429)
+                if resp.status_code == 429:
+                    sleep_sec = 60 * (attempt + 1)
+                    logger.warning(f"Rate limited. Backing off {sleep_sec}s...")
+                    time.sleep(sleep_sec)
+                    continue
+
+                resp.raise_for_status()
+                return resp.json()
+
+            except requests.Timeout:
+                sleep_sec = self.backoff_base ** attempt
+                logger.warning(f"Request timeout (attempt {attempt+1}). Retrying in {sleep_sec}s...")
+                time.sleep(sleep_sec)
+                last_exception = requests.Timeout
+
+            except requests.HTTPError as e:
+                if e.response.status_code in (418, 429):
+                    continue  # Already handled above
+                logger.error(f"HTTP error: {e}")
+                raise
+
+            except Exception as e:
+                logger.error(f"Request failed: {e}")
+                last_exception = e
+                time.sleep(self.backoff_base ** attempt)
+
+        raise last_exception if last_exception else RuntimeError("Max retries exceeded")
+
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 150,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Fetch klines and return a clean DataFrame."""
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": limit,
+        }
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+
+        data = self._request("GET", "v1/klines", params)
+        if not data:
+            raise ValueError("No kline data returned")
+
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore",
+        ])
+        numeric_cols = ["open", "high", "low", "close", "volume",
+                        "quote_volume", "taker_buy_base", "taker_buy_quote"]
+        df[numeric_cols] = df[numeric_cols].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df
 
     def get_mark_price(self, symbol: str) -> float:
-        return float(self._get("v1/premiumIndex", {"symbol": symbol.upper()})["markPrice"])
+        """Get current mark price."""
+        data = self._request("GET", "v1/premiumIndex", {"symbol": symbol.upper()})
+        return float(data["markPrice"])
+
+    def get_funding_rate(self, symbol: str) -> float:
+        """Get current funding rate."""
+        data = self._request("GET", "v1/fundingRate", {
+            "symbol": symbol.upper(),
+            "limit": 1,
+        })
+        return float(data[0]["fundingRate"]) if data else 0.0
+
+    def get_open_interest(self, symbol: str) -> dict:
+        """Get open interest stats."""
+        data = self._request("GET", "v1/openInterest", {"symbol": symbol.upper()})
+        return {
+            "open_interest": float(data["openInterest"]),
+            "timestamp": data["time"],
+        }
+
+    def get_taker_ratio(self, symbol: str, period: str = "1h") -> float:
+        """Get taker buy/sell volume ratio. >1 means more buyers."""
+        # This endpoint is NOT under /fapi/, it's under /futures/data/
+        url = f"{self.base_url}/futures/data/takerlongshortRatio"
+        params = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": 1,
+        }
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                logger.warning("Empty response for taker ratio; defaulting to 1.0")
+                return 1.0
+            # The API returns 'buySellRatio'
+            return float(data[0].get("buySellRatio", 1.0))
+        except Exception as e:
+            logger.error(f"Failed to fetch or parse taker ratio: {e}")
+            return 1.0
+
+    def get_liquidation_orders(self, symbol: str, limit: int = 100) -> pd.DataFrame:
+        """Get recent liquidation orders."""
+        data = self._request("GET", "v1/forceOrders", {
+            "symbol": symbol.upper(),
+            "limit": limit,
+        })
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        df["price"] = df["price"].astype(float)
+        df["qty"] = df["qty"].astype(float)
+        return df

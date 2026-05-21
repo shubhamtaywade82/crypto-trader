@@ -85,7 +85,7 @@ class TradingEngineV3(TradingEngineV2):
         testnet: bool = False,
         use_llm: bool = True,
         llm_host: str = "http://localhost:11434",
-        llm_model: str = "llama3.2:3b",
+        llm_model: str = "qwen3.5:4b",
     ):
         super().__init__(symbol=symbol, initial_balance=initial_balance,
                         leverage=leverage, testnet=testnet)
@@ -108,7 +108,7 @@ class TradingEngineV3(TradingEngineV2):
                 logger.info(f"[LLM] Connected to Ollama ({llm_model})")
             else:
                 logger.warning("[LLM] Ollama not available. Starting in technical-only mode.")
-                logger.warning("[LLM] To enable: run 'ollama run llama3.2:3b' in another terminal")
+                logger.warning("[LLM] To enable: run 'ollama run qwen3.5:4b' in another terminal")
 
     def run_once(self) -> dict:
         """
@@ -276,7 +276,7 @@ if __name__ == "__main__":
     parser.add_argument("--testnet", action="store_true", help="Use testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable Ollama LLM layer")
     parser.add_argument("--llm-host", default="http://localhost:11434", help="Ollama host URL")
-    parser.add_argument("--llm-model", default="llama3.2:3b", help="Ollama model name")
+    parser.add_argument("--llm-model", default="qwen3.5:4b", help="Ollama model name")
     parser.add_argument("--loop", action="store_true", help="Live loop")
     parser.add_argument("--tick", type=int, default=300, help="Loop interval (seconds)")
     args = parser.parse_args()

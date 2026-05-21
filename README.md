@@ -43,8 +43,8 @@ curl -s http://localhost:11434/api/tags
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull llama3.2:3b
-ollama run llama3.2:3b   # starts the API server on :11434
+ollama pull qwen3.5:4b
+ollama run qwen3.5:4b   # starts the API server on :11434
 ```
 
 ---
@@ -88,7 +88,7 @@ LLM Advice:
 
 ```
 Ollama available: False
-Ollama not running. Start it with: ollama run llama3.2:3b
+Ollama not running. Start it with: ollama run qwen3.5:4b
 ```
 
 ### Environment variable overrides
@@ -98,20 +98,20 @@ You can point the advisor at a different host or model without editing the file:
 ```bash
 OLLAMA_HOST=http://192.168.1.100:11434 python3 ollama_advisor.py   # remote server
 OLLAMA_MODEL=qwen3.5:4b              python3 ollama_advisor.py   # better reasoning
-OLLAMA_TIMEOUT=120                   python3 ollama_advisor.py   # slower hardware
+OLLAMA_TIMEOUT=320                   python3 ollama_advisor.py   # slower hardware
 ```
 
 > **Default timeout is 90 s** — covers the ~37 s cold-start of `qwen3.5:4b` plus full-prompt inference (~20 s).
-> Subsequent warm calls take ~15 s. `llama3.2:3b` is faster (~2 s warm) but produces shallower analysis.
+> Subsequent warm calls take ~15 s. `qwen3.5:4b` is faster (~2 s warm) but produces shallower analysis.
 
 ### Available models on this server
 
 | Model | Size | Cold start | Warm call | Quality | Notes |
 |-------|------|-----------|-----------|---------|-------|
 | `qwen3.5:4b` ⭐ | 3.4 GB | ~37s | ~15s | ★★★★★ | **Recommended** — cites actual price levels |
-| `llama3.2:3b` | 2.0 GB | ~34s | ~2s | ★★★☆☆ | Default fallback — fast but shallow analysis |
-| `qwen3:8b` | 5.2 GB | ~55s | ~25s | ★★★★★ | Best quality, use `OLLAMA_TIMEOUT=120` |
-| `llama3.1:8b` | 4.9 GB | ~50s | ~20s | ★★★★☆ | Good alternative to qwen3:8b |
+| `qwen3.5:4b` | 2.0 GB | ~34s | ~2s | ★★★☆☆ | Default fallback — fast but shallow analysis |
+| `qwen3.5:4b` | 5.2 GB | ~55s | ~25s | ★★★★★ | Best quality, use `OLLAMA_TIMEOUT=120` |
+| `llama3.1:8b` | 4.9 GB | ~50s | ~20s | ★★★★☆ | Good alternative to qwen3.5:4b |
 | `qwen2.5:0.5b` | 0.4 GB | ~5s | <1s | ★★☆☆☆ | Fastest, weakest JSON reliability |
 
 ---
@@ -165,7 +165,7 @@ Ollama **must be running** before launching v3.
 # Verify Ollama is up first:
 curl -s http://localhost:11434/api/tags | python3 -m json.tool
 
-# Single tick with LLM (default: llama3.2:3b at localhost:11434)
+# Single tick with LLM (default: qwen3.5:4b at localhost:11434)
 python3 binance_futures_trading_system_v3.py --symbol SOLUSDT
 
 # Live loop with LLM
@@ -204,6 +204,7 @@ python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --loop --tick 5
 ### Binance WebSocket data you can use for realtime entries/exits
 
 For USDⓈ-M futures, useful public streams include:
+
 - `@bookTicker`: best bid/ask updates (good for LTP proxy + spread checks)
 - `@markPrice`: mark price and funding-related timing context
 - `@aggTrade` / `@trade`: trade flow and micro momentum
@@ -229,7 +230,7 @@ All key parameters sit at the top of each script file:
 | `B_SL_PCT` | `0.012` | Playbook B stop-loss (1.2% price move) |
 | `MAX_DAILY_TRADES` | `2` | Max trades per UTC day |
 | `MAX_CONSEC_LOSS` | `2` | Halt after N consecutive losses |
-| `OLLAMA_MODEL` | `llama3.2:3b` | LLM model (`qwen3.5:4b` recommended) |
+| `OLLAMA_MODEL` | `qwen3.5:4b` | LLM model (`qwen3.5:4b` recommended) |
 | `OLLAMA_TIMEOUT` | `90` | LLM request timeout in seconds |
 | `CACHE_TTL_SECONDS` | `1800` | LLM cache duration (30 min) |
 | `LLM_MIN_CONFIDENCE` | `0.65` | Ignore LLM if confidence is below this |
@@ -250,7 +251,7 @@ For other pairs, adjust `A_SL_PCT` and `A_TP_PCT` based on the pair's ATR:
 
 ## 💾 State Persistence
 
-v2/v3 now save state under `~/.crypto_trader/` (not the current working directory).  
+v2/v3 now save state under `~/.crypto_trader/` (not the current working directory).
 The v4 package uses the same base directory and adds a journal subfolder.
 
 | File | Contents |
@@ -324,7 +325,6 @@ This software is for **educational and paper-trading purposes only**.
 - 10× leverage is extremely aggressive.
 - Always test on testnet or in simulation before deploying real capital.
 - The authors are not responsible for any financial losses.
-
 
 ### v4 WebSocket hybrid engine
 

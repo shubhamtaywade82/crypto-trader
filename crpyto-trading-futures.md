@@ -818,9 +818,9 @@ Step 2: Pull a Fast Model
 bash
 Copy
 
-# llama3.2:3b is fast (~2-3s response) and good at JSON
+# qwen3.5:4b is fast (~2-3s response) and good at JSON
 
-ollama pull llama3.2:3b
+ollama pull qwen3.5:4b
 
 # Alternative: phi4 (slightly smarter, slightly slower)
 
@@ -832,7 +832,7 @@ ollama pull qwen2.5:7b
 Step 3: Start the Server
 bash
 Copy
-ollama run llama3.2:3b
+ollama run qwen3.5:4b
 This starts the API server on <http://localhost:11434>.
 Step 4: Test the Connection
 bash
@@ -847,7 +847,7 @@ Copy
 
 # Terminal 1: Start Ollama
 
-ollama run llama3.2:3b
+ollama run qwen3.5:4b
 
 # Terminal 2: Run trading engine
 
@@ -927,7 +927,7 @@ Tuning the LLM Influence
 Edit these constants at the top of ollama_advisor.py:
 Python
 Copy
-OLLAMA_MODEL = "llama3.2:3b"      # Speed vs intelligence tradeoff
+OLLAMA_MODEL = "qwen3.5:4b"      # Speed vs intelligence tradeoff
 CACHE_TTL_SECONDS = 1800          # How long advice stays valid (30 min)
 LLM_MIN_CONFIDENCE = 0.65         # Ignore LLM if confidence below this
 LLM_VETO_THRESHOLD = -0.70        # Block trade if sentiment opposes signal this strongly
@@ -947,7 +947,7 @@ Question Answer
 Does the LLM place orders? No. It filters and modifies technical signals.
 Does it work without Ollama? Yes. Falls back to v2 behavior automatically.
 Is it blocking? No. LLM calls are async; trading loop never waits.
-Can I use any model? Yes. Any Ollama-compatible model that outputs JSON. llama3.2:3b is recommended for speed.
+Can I use any model? Yes. Any Ollama-compatible model that outputs JSON. qwen3.5:4b is recommended for speed.
 Can I tune how much power the LLM has? Yes. LLM_MIN_CONFIDENCE and LLM_VETO_THRESHOLD control sensitivity.
 Does it cost money? No. Runs locally on your hardware.
 The LLM layer adds a second opinion to your technical system — catching traps, reducing size in uncertainty, and providing explainable reasoning for every decision. It is not a magic bullet, but in backtests, a well-tuned LLM filter can improve win rate by 5–10% by eliminating the worst setups.
