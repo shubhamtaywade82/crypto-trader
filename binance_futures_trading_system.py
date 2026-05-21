@@ -167,6 +167,15 @@ class BinanceDataFeed:
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 418:
+                logger.critical("Binance IP ban (418) detected. Sleeping 120s before retry.")
+                time.sleep(120)
+            elif status == 429:
+                logger.warning("Binance rate limit (429) detected. Sleeping 60s before retry.")
+                time.sleep(60)
+            raise
         except requests.RequestException as e:
             logger.error(f"Request failed: {e}")
             raise

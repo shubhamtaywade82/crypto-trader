@@ -1,3 +1,6 @@
 .antigravitycli/**
 llm_cache/**
+.env
+__pycache__/**
+crypto_trader/__pycache__/**
 ./wallet_**.json

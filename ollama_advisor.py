@@ -39,8 +39,8 @@ logger = logging.getLogger("OllamaAdvisor")
 # ---------------------------------------------------------------------------
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")  # Fast, good at JSON
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "90"))   # Seconds — covers cold-start (~34s) + full prompt inference
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")  # Fast, good at JSON
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "320"))   # Seconds — covers cold-start (~34s) + full prompt inference
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "1024"))
 
 # Cache settings
@@ -251,7 +251,10 @@ class OllamaClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("response", "").strip()
+            response_text = data.get("response", "").strip()
+            if not response_text and "thinking" in data:
+                response_text = data["thinking"].strip()
+            return response_text
         except requests.Timeout:
             logger.warning("Ollama request timed out")
             return None
@@ -636,4 +639,4 @@ if __name__ == "__main__":
             print("\nLLM Advice:")
             print(json.dumps(advice.to_dict(), indent=2))
     else:
-        print("\nOllama not running. Start it with: ollama run llama3.2:3b")
+        print("\nOllama not running. Start it with: ollama run qwen3.5:4b")

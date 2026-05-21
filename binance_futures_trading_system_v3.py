@@ -51,7 +51,7 @@ from binance_futures_trading_system_v2 import (
 )
 
 # Import LLM advisor
-from ollama_advisor import (
+from crypto_trader.llm_advisor import (
     OllamaAdvisor,
     LLMAdvice,
     LLMBias,
@@ -65,6 +65,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("TradingEngineV3")
 
+
+TF_15M, TF_5M = "15m", "5m"
+LIMIT_15M, LIMIT_5M = 150, 150
 
 # ---------------------------------------------------------------------------
 # Trading Engine v3 (LLM-Enhanced)
@@ -89,7 +92,7 @@ class TradingEngineV3(TradingEngineV2):
         testnet: bool = False,
         use_llm: bool = True,
         llm_host: str = "http://localhost:11434",
-        llm_model: str = "llama3.2:3b",
+        llm_model: str = "qwen3.5:4b",
     ):
         super().__init__(symbol=symbol, initial_balance=initial_balance,
                         leverage=leverage, testnet=testnet)
@@ -103,7 +106,7 @@ class TradingEngineV3(TradingEngineV2):
             self.advisor = OllamaAdvisor(
                 host=llm_host,
                 model=llm_model,
-                timeout=320,
+                timeout=30,
                 cache_ttl=1800,
                 min_confidence=0.65,
                 veto_threshold=-0.70,
@@ -112,7 +115,7 @@ class TradingEngineV3(TradingEngineV2):
                 logger.info(f"[LLM] Connected to Ollama ({llm_model})")
             else:
                 logger.warning("[LLM] Ollama not available. Starting in technical-only mode.")
-                logger.warning("[LLM] To enable: run 'ollama run llama3.2:3b' in another terminal")
+                logger.warning("[LLM] To enable: run 'ollama run qwen3.5:4b' in another terminal")
 
     def run_once(self, mark_price: float = None) -> dict:
         """
@@ -128,8 +131,12 @@ class TradingEngineV3(TradingEngineV2):
         try:
             df_4h = self.data_feed.get_klines(self.symbol, TF_4H, limit=LIMIT_4H)
             df_1h = self.data_feed.get_klines(self.symbol, TF_1H, limit=LIMIT_1H)
-            if mark_price is None:
-                mark_price = self.data_feed.get_mark_price(self.symbol)
+            df_15m = self.data_feed.get_klines(self.symbol, "15m", limit=150)
+            df_5m = self.data_feed.get_klines(self.symbol, "5m", limit=150)
+            mark_price = self.data_feed.get_mark_price(self.symbol)
+            funding_rate = getattr(self.data_feed, "get_funding_rate", lambda s: 0.0)(self.symbol)
+            oi_data = getattr(self.data_feed, "get_open_interest", lambda s: 0.0)(self.symbol)
+            taker_ratio = getattr(self.data_feed, "get_taker_ratio", lambda s: 1.0)(self.symbol)
         except Exception as e:
             logger.error(f"Data fetch failed: {e}")
             return self.wallet.get_summary()
@@ -146,14 +153,23 @@ class TradingEngineV3(TradingEngineV2):
             # If previous thread still running, skip this tick's LLM call
             # and use whatever advice we have
             if self._llm_thread is None or not self._llm_thread.is_alive():
+                # Define local vars for LLM call if not present
+                regime_score = 0.5 # Neutral
+                oi_delta = 0.0
+
                 self._llm_thread = self.advisor.get_advice_async(
                     symbol=self.symbol,
+                    df_5m=df_5m,
+                    df_15m=df_15m,
                     df_1h=df_1h,
                     df_4h=df_4h,
                     regime=regime.value,
+                    regime_score=regime_score,
                     mark_price=mark_price,
+                    funding_rate=funding_rate,
+                    oi_delta=oi_delta,
+                    taker_ratio=taker_ratio,
                     open_positions=open_positions,
-                    callback=self._on_llm_advice,
                 )
 
         # 4. Risk check
@@ -253,16 +269,16 @@ class TradingEngineV3(TradingEngineV2):
     def run_loop(self, interval_seconds: int = 300, max_iterations: int = None):
         """Run loop using a curses TUI dashboard with real-time WS updates."""
         self.ws_feed.start()
-        
+
         def main_tui(stdscr):
             curses.curs_set(0)
             stdscr.nodelay(True)
             iteration = 0
             last_tick_time = 0
-            
+
             while True:
                 now = time.time()
-                
+
                 # Run strategy logic only on tick interval
                 if now - last_tick_time >= interval_seconds:
                     mark_price = self.ws_feed.last_price if self.ws_feed.last_price > 0 else None
@@ -274,13 +290,13 @@ class TradingEngineV3(TradingEngineV2):
                 current_price = self.ws_feed.last_price
                 if current_price > 0:
                     self.wallet.update_positions({self.symbol: current_price}, {})
-                
+
                 s = self.wallet.get_summary()
-                
+
                 # Draw
                 stdscr.clear()
                 height, width = stdscr.getmaxyx()
-                
+
                 # Header with LTP
                 price_str = f"{current_price:.4f}" if current_price > 0 else f"{self.ws_feed.status} {self.ws_feed.error_log}"
                 header = f"=== {self.symbol} LTP: {price_str} | {datetime.now().strftime('%H:%M:%S')} ==="
@@ -292,7 +308,7 @@ class TradingEngineV3(TradingEngineV2):
                 stdscr.addstr(4, 0, f"Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT", curses.A_GREEN if s['unrealized_pnl'] > 0 else curses.A_RED if s['unrealized_pnl'] < 0 else curses.A_NORMAL)
                 stdscr.addstr(5, 0, f"Margin Balance    : {s['margin_balance']:.4f} USDT")
                 stdscr.addstr(6, 0, f"Available         : {s['available']:.4f} USDT")
-                
+
                 # AI Advice (v3 specific)
                 advice_obj = getattr(self, "latest_advice", None)
                 if advice_obj:
@@ -304,7 +320,7 @@ class TradingEngineV3(TradingEngineV2):
                     stdscr.addstr(11, 2, f"Veto: {veto if veto else 'None'}")
                     if advice_obj.key_factors:
                         stdscr.addstr(12, 2, f"Key Factors: {', '.join(advice_obj.key_factors[:3])}")
-                
+
                 # Positions
                 stdscr.addstr(14, 0, f"Open Positions: {s['open_count']}", curses.A_UNDERLINE)
                 row = 15
@@ -312,15 +328,15 @@ class TradingEngineV3(TradingEngineV2):
                     margin_pnl_pct = (p['unrealized_pnl'] / p['margin_used'] * 100) if p['margin_used'] > 0 else 0
                     stdscr.addstr(row, 2, f"• {p['symbol']} {p['side']} | Entry: {p['entry_price']:.2f} | PnL: {p['unrealized_pnl']:.2f} ({margin_pnl_pct:.2f}%)")
                     row += 1
-                
+
                 # Footer
                 time_to_next = max(0, int(interval_seconds - (now - last_tick_time)))
                 stdscr.addstr(height-2, 0, f"Next strategy tick in {time_to_next}s | Iteration: {iteration} | Press 'q' to quit")
                 stdscr.refresh()
-                
+
                 if max_iterations and iteration >= max_iterations:
                     break
-                    
+
                 # Responsive sleep
                 try:
                     key = stdscr.getch()
@@ -355,7 +371,7 @@ if __name__ == "__main__":
     parser.add_argument("--testnet", action="store_true", help="Use testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable Ollama LLM layer")
     parser.add_argument("--llm-host", default="http://localhost:11434", help="Ollama host URL")
-    parser.add_argument("--llm-model", default="llama3.2:3b", help="Ollama model name")
+    parser.add_argument("--llm-model", default="qwen3.5:4b", help="Ollama model name")
     parser.add_argument("--loop", action="store_true", help="Live loop")
     parser.add_argument("--tick", type=int, default=300, help="Loop interval (seconds)")
     args = parser.parse_args()
