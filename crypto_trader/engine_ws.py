@@ -68,16 +68,24 @@ class TradingEngineWS(TradingEngine):
         px = prices[-1]
         sl = pos.entry_price * (0.993 if pos.side.name == "LONG" else 1.007)
         tp = pos.entry_price * (1.01 if pos.side.name == "LONG" else 0.99)
+        exit_reason = None
         if pos.side.name == "LONG":
             if len(prices) == 5 and all(p <= sl for p in prices):
-                self.wallet.close_position(px); self.risk.record_close(px - pos.entry_price)
+                exit_reason = "stop_loss"
             elif px >= tp:
-                self.wallet.close_position(px); self.risk.record_close(px - pos.entry_price)
+                exit_reason = "take_profit"
         else:
             if len(prices) == 5 and all(p >= sl for p in prices):
-                self.wallet.close_position(px); self.risk.record_close(pos.entry_price - px)
+                exit_reason = "stop_loss"
             elif px <= tp:
-                self.wallet.close_position(px); self.risk.record_close(pos.entry_price - px)
+                exit_reason = "take_profit"
+        if exit_reason:
+            realized_pnl = self.wallet.close_position(px)
+            self.risk.record_close(realized_pnl)
+            logger.info(
+                "[%s] position closed reason=%s price=%.4f pnl=%.4f",
+                self.symbol, exit_reason, px, realized_pnl,
+            )
 
     def run_once(self):
         self._signal_tick()

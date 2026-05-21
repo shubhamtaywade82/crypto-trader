@@ -28,6 +28,7 @@ class RiskManager:
         self.consec_losses = 0
         self.last_day = None
         self.state_file = DATA_DIR / "risk_state.json"
+        self._load()
 
     def _day(self):
         return datetime.now(timezone.utc).date().isoformat()
@@ -47,4 +48,20 @@ class RiskManager:
         self.save()
 
     def save(self):
-        self.state_file.write_text(json.dumps(self.__dict__))
+        self.state_file.write_text(json.dumps({
+            "daily_count": self.daily_count,
+            "consec_losses": self.consec_losses,
+            "last_day": self.last_day,
+        }))
+
+    def _load(self):
+        if not self.state_file.exists():
+            return
+        try:
+            d = json.loads(self.state_file.read_text())
+            self.daily_count = d.get("daily_count", 0)
+            self.consec_losses = d.get("consec_losses", 0)
+            self.last_day = d.get("last_day")
+        except Exception:
+            pass  # corrupt file — start fresh
+

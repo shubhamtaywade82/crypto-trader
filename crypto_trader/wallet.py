@@ -40,6 +40,7 @@ class Wallet:
         use_margin = custom_margin if custom_margin is not None else margin
         qty = (use_margin * self.leverage) / entry
         self.position = Position(self.symbol, side, entry, qty, self.leverage, int(time.time()*1000), qty)
+        self._save()
 
     def partial_close(self, price: float, pct: float):
         if not self.position: return 0.0
@@ -49,6 +50,7 @@ class Wallet:
         self.position.partial_realized_pnl += pnl
         self.position.remaining_quantity -= qty
         self.balance += pnl
+        self._save()
         return pnl
 
     def close_position(self, price: float):
@@ -61,10 +63,36 @@ class Wallet:
         return realized
 
     def _save(self):
-        payload = {"balance": self.balance, "position": asdict(self.position) if self.position else None}
-        self.state_file.write_text(json.dumps(payload))
+        pos_data = None
+        if self.position:
+            pos_data = {
+                "symbol": self.position.symbol,
+                "side": self.position.side.value,
+                "entry_price": self.position.entry_price,
+                "quantity": self.position.quantity,
+                "leverage": self.position.leverage,
+                "open_time": self.position.open_time,
+                "remaining_quantity": self.position.remaining_quantity,
+                "partial_realized_pnl": self.position.partial_realized_pnl,
+                "unrealized_pnl": self.position.unrealized_pnl,
+            }
+        self.state_file.write_text(json.dumps({"balance": self.balance, "position": pos_data}))
 
     def _load(self):
-        if not self.state_file.exists(): return
+        if not self.state_file.exists():
+            return
         d = json.loads(self.state_file.read_text())
         self.balance = d.get("balance", self.balance)
+        pos_data = d.get("position")
+        if pos_data:
+            self.position = Position(
+                symbol=pos_data["symbol"],
+                side=PositionSide(pos_data["side"]),
+                entry_price=pos_data["entry_price"],
+                quantity=pos_data["quantity"],
+                leverage=pos_data["leverage"],
+                open_time=pos_data["open_time"],
+                remaining_quantity=pos_data["remaining_quantity"],
+                partial_realized_pnl=pos_data.get("partial_realized_pnl", 0.0),
+                unrealized_pnl=pos_data.get("unrealized_pnl", 0.0),
+            )
