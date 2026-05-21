@@ -78,9 +78,28 @@ class TradingEngine:
         self.advisor = None
         self._llm_thread = None
         if use_llm:
-            resolved_host = llm_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
-            resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
-            self.advisor = OllamaAdvisor(host=resolved_host, model=resolved_model, log_llm=llm_logged)
+            use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
+            
+            if use_cloud:
+                resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
+                resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
+                resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
+                logger.info(f"[LLM] Mode: CLOUD (Target: {resolved_host})")
+            else:
+                resolved_host = llm_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+                resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+                resolved_key = os.getenv("OLLAMA_API_KEY", "")
+                logger.info("[LLM] Mode: LOCAL")
+
+            use_openai = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
+            
+            self.advisor = OllamaAdvisor(
+                host=resolved_host,
+                model=resolved_model,
+                api_key=resolved_key,
+                use_openai=use_openai,
+                log_llm=llm_logged
+            )
             if self.advisor.is_ready():
                 logger.info(f"[LLM] Connected to {resolved_model}")
             else:

@@ -17,6 +17,7 @@ import time
 import logging
 import hashlib
 import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -36,6 +37,17 @@ DATA_DIR.mkdir(exist_ok=True)
 # ── Configuration ──
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+
+# ── Cloud vs Local Toggle ──
+USE_CLOUD_LLM = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
+
+# Separate Cloud Config to allow easy switching
+CLOUD_OLLAMA_HOST = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
+CLOUD_OLLAMA_MODEL = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
+CLOUD_OLLAMA_API_KEY = os.getenv("CLOUD_OLLAMA_API_KEY", "")
+
+USE_OPENAI_FORMAT = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "320"))
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "512"))
 CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "1800"))
@@ -238,15 +250,43 @@ def build_prompt(
 
     return f"""Analyze {symbol} and return ONLY JSON.
 
-Price: {mark_price:.2f} | 24h: {change_24h:+.2f}% | Regime: {regime} (score={regime_score:.2f})
-Funding: {funding_rate:+.4f}% | OI Delta 24h: {oi_delta:+.1f}% | Taker Buy Ratio: {taker_ratio:.2f}
+    Price: {mark_price:.2f} | 24h: {change_24h:+.2f}% | Regime: {regime} (score={regime_score:.2f})
+    Funding: {funding_rate:+.4f}% | OI Delta 24h: {oi_delta:+.1f}% | Taker Buy Ratio: {taker_ratio:.2f}
 
-{structure_text}
+    {structure_text}
 
-Positions: {pos_ctx}
+    Positions: {pos_ctx}
 
-Return ONLY JSON."""
+    Return ONLY JSON."""
 
+
+class LLMJournal:
+    """Appends all LLM interactions to a daily log file for analysis and optimization."""
+
+    def __init__(self):
+        self.dir = DATA_DIR / "llm_logs"
+        self.dir.mkdir(exist_ok=True)
+        self._lock = threading.Lock()
+
+    def log(self, symbol: str, prompt: str, response: str, advice: Optional[LLMAdvice]):
+        """Write interaction to daily .jsonl file."""
+        with self._lock:
+            try:
+                date_str = datetime.now().strftime("%Y-%m-%d")
+                path = self.dir / f"llm_{date_str}.jsonl"
+
+                entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "symbol": symbol,
+                    "prompt": prompt,
+                    "raw_response": response,
+                    "parsed_advice": advice.to_dict() if advice else None
+                }
+
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+            except Exception as e:
+                logger.warning(f"[LLM Journal] Failed to log interaction: {e}")
 
 
 class LLMCache:
@@ -306,22 +346,47 @@ class LLMCache:
             json.dump(data, f, indent=2)
 
 
+_OLLAMA_GLOBAL_LOCK = threading.Lock()
+
 class OllamaClient:
-    def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL,
-                 timeout: int = OLLAMA_TIMEOUT, max_tokens: int = OLLAMA_MAX_TOKENS):
+    def __init__(
+        self,
+        host: str = OLLAMA_HOST,
+        model: str = OLLAMA_MODEL,
+        api_key: str = OLLAMA_API_KEY,
+        use_openai: bool = USE_OPENAI_FORMAT,
+        timeout: int = OLLAMA_TIMEOUT,
+        max_tokens: int = OLLAMA_MAX_TOKENS
+    ):
         self.host = host.rstrip("/")
         self.model = model
+        self.api_key = api_key
+        self.use_openai = use_openai
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.session = requests.Session()
+        
+        if self.api_key:
+            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
 
     def is_available(self) -> bool:
+        # For cloud hosts (ollama.com or OpenAI-compatible), we prioritize the API key presence
+        is_cloud = "ollama.com" in self.host or self.use_openai
+        if is_cloud:
+            return self.api_key != ""
+            
         try:
+            # Local Ollama check
             return self.session.get(f"{self.host}/api/tags", timeout=5).status_code == 200
         except Exception:
-            return False
+            return self.api_key != "" # Fallback for remote native Ollama with auth
 
     def generate(self, prompt: str, temperature: float = 0.3) -> Optional[str]:
+        if self.use_openai:
+            return self._generate_openai(prompt, temperature)
+        return self._generate_ollama(prompt, temperature)
+
+    def _generate_ollama(self, prompt: str, temperature: float = 0.3) -> Optional[str]:
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -330,19 +395,40 @@ class OllamaClient:
             "think": False,
             "options": {"temperature": temperature, "num_predict": self.max_tokens},
         }
+        with _OLLAMA_GLOBAL_LOCK:
+            try:
+                resp = self.session.post(f"{self.host}/api/generate", json=payload, timeout=self.timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                response_text = data.get("response", "").strip()
+                if not response_text and "thinking" in data:
+                    response_text = data["thinking"].strip()
+                return response_text
+            except requests.Timeout:
+                logger.warning("Ollama request timed out")
+                return None
+            except Exception as e:
+                logger.warning(f"Ollama request failed: {e}")
+                return None
+
+    def _generate_openai(self, prompt: str, temperature: float = 0.3) -> Optional[str]:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+        }
         try:
-            resp = self.session.post(f"{self.host}/api/generate", json=payload, timeout=self.timeout)
+            resp = self.session.post(f"{self.host}/v1/chat/completions", json=payload, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
-            response_text = data.get("response", "").strip()
-            if not response_text and "thinking" in data:
-                response_text = data["thinking"].strip()
-            return response_text
-        except requests.Timeout:
-            logger.warning("Ollama request timed out")
-            return None
+            return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            logger.warning(f"Ollama request failed: {e}")
+            logger.warning(f"Cloud LLM request failed: {e}")
             return None
 
 
@@ -401,14 +487,23 @@ class OllamaAdvisor:
         self,
         host: str = OLLAMA_HOST,
         model: str = OLLAMA_MODEL,
+        api_key: str = OLLAMA_API_KEY,
+        use_openai: bool = USE_OPENAI_FORMAT,
         timeout: int = OLLAMA_TIMEOUT,
         cache_ttl: int = CACHE_TTL,
         max_failures: int = 5,
         log_llm: bool = False,
     ):
-        self.client = OllamaClient(host=host, model=model, timeout=timeout)
+        self.client = OllamaClient(
+            host=host,
+            model=model,
+            api_key=api_key,
+            use_openai=use_openai,
+            timeout=timeout
+        )
         self.parser = LLMResponseParser()
         self.cache = LLMCache(ttl=cache_ttl)
+        self.journal = LLMJournal()
         self.circuit_breaker = LLMCircuitBreaker(max_failures=max_failures)
         self.log_llm = log_llm or os.getenv("LOG_LLM", "false").lower() in ("true", "1", "yes")
         self._last_advice: Optional[LLMAdvice] = None
@@ -476,6 +571,7 @@ class OllamaAdvisor:
         advice.latency_ms = latency_ms
         self.circuit_breaker.record_success()
         self.cache.set(symbol, prompt, advice)
+        self.journal.log(symbol, prompt, raw, advice)
 
         with self._lock:
             self._last_advice = advice
