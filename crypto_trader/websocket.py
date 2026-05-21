@@ -30,8 +30,8 @@ import websocket
 
 logger = logging.getLogger("crypto_trader.websocket")
 
-BINANCE_WS_BASE = "wss://fstream.binance.com/ws"
-BINANCE_WS_TESTNET = "wss://stream.binancefuture.com/ws"
+BINANCE_WS_BASE = "wss://fstream.binance.com"
+BINANCE_WS_TESTNET = "wss://stream.binancefuture.com"
 
 
 @dataclass
@@ -55,7 +55,12 @@ class WSMarketData:
     kline_1h: Optional[dict] = None
     kline_4h: Optional[dict] = None
     last_update_ms: int = 0
-    is_alive: bool = False
+    is_connected: bool = False
+
+    # Track freshness of individual price sources (in local time ms)
+    last_price_time_ms: int = 0
+    book_ticker_time_ms: int = 0
+    mark_price_time_ms: int = 0
 
 
 class BinanceWebSocketFeed:
@@ -125,11 +130,28 @@ class BinanceWebSocketFeed:
             return self.data
 
     def get_ltp(self) -> float:
-        """Get Last Traded Price (from aggTrade or bookTicker)."""
+        """Get Last Traded Price (from aggTrade, bookTicker mid, or markPrice) using freshness logic."""
         with self._lock:
-            # Prefer last trade price, fallback to mark price
+            now_ms = int(time.time() * 1000)
+            
+            # 1. Prefer last trade price (aggTrade) if it's fresh (within last 10 seconds)
+            if self.data.last_price > 0 and (now_ms - self.data.last_price_time_ms) < 10000:
+                return self.data.last_price
+                
+            # 2. Fallback to mid price from book ticker if it's fresh (within last 10 seconds)
+            mid = self.get_mid_price()
+            if mid > 0 and (now_ms - self.data.book_ticker_time_ms) < 10000:
+                return mid
+                
+            # 3. Fallback to mark price if it's fresh (within last 10 seconds)
+            if self.data.mark_price > 0 and (now_ms - self.data.mark_price_time_ms) < 10000:
+                return self.data.mark_price
+                
+            # 4. Ultimate fallback: return whichever is non-zero, starting with last_price, then mid, then mark_price
             if self.data.last_price > 0:
                 return self.data.last_price
+            if mid > 0:
+                return mid
             return self.data.mark_price
 
     def get_spread(self) -> float:
@@ -147,9 +169,19 @@ class BinanceWebSocketFeed:
             return self.data.mark_price
 
     def is_connected(self) -> bool:
-        """Check if WebSocket is alive and receiving data."""
+        """Check if WebSocket is connected AND receiving data recently."""
         with self._lock:
-            return self.data.is_alive and (time.time() * 1000 - self.data.last_update_ms) < 10000
+            if not self.data.is_connected:
+                return False
+            
+            # If we just connected in the last 20 seconds, we're "connected" even if no data yet
+            now_ms = int(time.time() * 1000)
+            if (now_ms - self.data.last_update_ms) > 1000000000: # Initial state (0)
+                 # Grace period of 20 seconds after opening the connection
+                 return True 
+
+            # Otherwise, must have received a message in the last 20 seconds
+            return (now_ms - self.data.last_update_ms) < 20000
 
     # ── Internal ──
 
@@ -158,11 +190,11 @@ class BinanceWebSocketFeed:
         while self._running:
             try:
                 self._connect()
-                self._reconnect_attempts = 0
+                # Do not reset reconnect_attempts here; wait until first data is received successfully in _on_message.
                 # Block until connection closes
                 self.ws.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=30,
+                    ping_timeout=15,
                 )
             except Exception as e:
                 logger.error(f"[WS] Connection error: {e}")
@@ -180,8 +212,9 @@ class BinanceWebSocketFeed:
         """Establish WebSocket connection and subscribe to streams."""
         base = BINANCE_WS_TESTNET if self.testnet else BINANCE_WS_BASE
         # Combined stream: /stream?streams=topic1/topic2/...
+        # Simplified stream list to ensure maximum compatibility
         streams = "/".join([
-            f"{self.symbol}@markPrice@1s",
+            f"{self.symbol}@markPrice",
             f"{self.symbol}@kline_1h",
             f"{self.symbol}@kline_4h",
             f"{self.symbol}@bookTicker",
@@ -199,17 +232,22 @@ class BinanceWebSocketFeed:
             on_ping=self._on_ping,
             on_pong=self._on_pong,
         )
-        logger.info(f"[WS] Connecting to {url[:60]}...")
+        logger.info(f"[WS] Connecting to {url}")
 
     def _on_open(self, ws):
         logger.info(f"[WS] Connected to {self.symbol}")
         with self._lock:
-            self.data.is_alive = True
+            self.data.is_connected = True
 
     def _on_close(self, ws, close_status_code, close_msg):
         logger.warning(f"[WS] Closed: {close_status_code} {close_msg}")
         with self._lock:
-            self.data.is_alive = False
+            self.data.is_connected = False
+            self.data.last_price = 0.0 # Reset to force refresh
+            self.data.mark_price = 0.0
+            self.data.last_price_time_ms = 0
+            self.data.book_ticker_time_ms = 0
+            self.data.mark_price_time_ms = 0
 
     def _on_error(self, ws, error):
         logger.error(f"[WS] Error: {error}")
@@ -236,6 +274,12 @@ class BinanceWebSocketFeed:
                 data = payload
 
             with self._lock:
+                if self.data.last_update_ms == 0:
+                    msg = f"[WS] >>> FIRST DATA RECEIVED FOR {self.symbol.upper()} <<<"
+                    print(msg) # Explicit print to bypass logging propagation issues
+                    logger.info(msg)
+                    # Reset reconnection attempts only when we successfully receive the first live message
+                    self._reconnect_attempts = 0
                 self.data.last_update_ms = int(time.time() * 1000)
                 self._route_message(stream, data)
 
@@ -244,26 +288,36 @@ class BinanceWebSocketFeed:
 
     def _route_message(self, stream: str, data: dict):
         """Route message to appropriate handler based on stream type."""
-        event = data.get("e", "")
+        event = data.get("e", "").lower()
+        stream_lower = stream.lower()
 
-        if event == "markPriceUpdate" or "markPrice" in stream:
+        # Debug: log every event type once
+        if not hasattr(self, "_seen_events"): self._seen_events = set()
+        if event not in self._seen_events:
+            logger.info(f"[WS] New event type seen for {self.symbol}: {event} (Stream: {stream})")
+            self._seen_events.add(event)
+
+        if event == "markpriceupdate" or "markprice" in stream_lower:
             self._handle_mark_price(data)
-        elif event == "kline" or "kline" in stream:
+        elif event == "kline" or "kline" in stream_lower:
             self._handle_kline(data)
-        elif event == "bookTicker" or "bookTicker" in stream:
+        elif event == "bookticker" or "bookticker" in stream_lower:
             self._handle_book_ticker(data)
-        elif event == "aggTrade" or "aggTrade" in stream:
+        elif event == "aggtrade" or "aggtrade" in stream_lower:
             self._handle_agg_trade(data)
-        elif event == "24hrTicker" or "ticker" in stream:
+        elif event == "24hrticker" or "ticker" in stream_lower:
             self._handle_ticker(data)
 
     def _handle_mark_price(self, data: dict):
-        self.data.mark_price = float(data.get("p", 0))
-        self.data.index_price = float(data.get("i", 0))
-        self.data.funding_rate = float(data.get("r", 0))
-        self.data.next_funding_time = int(data.get("T", 0))
-        if self.on_mark_price:
-            self.on_mark_price(self.data.mark_price, self.data.funding_rate)
+        price = float(data.get("p", 0))
+        if price > 0:
+            self.data.mark_price = price
+            self.data.index_price = float(data.get("i", 0))
+            self.data.funding_rate = float(data.get("r", 0))
+            self.data.next_funding_time = int(data.get("T", 0))
+            self.data.mark_price_time_ms = int(time.time() * 1000)
+            if self.on_mark_price:
+                self.on_mark_price(self.data.mark_price, self.data.funding_rate)
 
     def _handle_kline(self, data: dict):
         k = data.get("k", {})
@@ -291,12 +345,27 @@ class BinanceWebSocketFeed:
         self.data.best_bid_qty = float(data.get("B", 0))
         self.data.best_ask = float(data.get("a", 0))
         self.data.best_ask_qty = float(data.get("A", 0))
+        self.data.book_ticker_time_ms = int(time.time() * 1000)
+        
+        # If we don't have a last_price or mark_price yet, initialize them from the book ticker mid-price
+        if self.data.best_bid > 0 and self.data.best_ask > 0:
+            mid = (self.data.best_bid + self.data.best_ask) / 2.0
+            if self.data.last_price == 0.0:
+                self.data.last_price = mid
+                self.data.last_price_time_ms = self.data.book_ticker_time_ms
+            if self.data.mark_price == 0.0:
+                self.data.mark_price = mid
+                self.data.mark_price_time_ms = self.data.book_ticker_time_ms
+
         if self.on_book_ticker:
             self.on_book_ticker(self.data.best_bid, self.data.best_ask)
 
     def _handle_agg_trade(self, data: dict):
-        self.data.last_price = float(data.get("p", 0))
-        self.data.last_qty = float(data.get("q", 0))
+        price = float(data.get("p", 0))
+        if price > 0:
+            self.data.last_price = price
+            self.data.last_qty = float(data.get("q", 0))
+            self.data.last_price_time_ms = int(time.time() * 1000)
 
     def _handle_ticker(self, data: dict):
         self.data.volume_24h = float(data.get("v", 0))
@@ -324,10 +393,12 @@ class WebSocketPositionManager:
     ):
         self.ws = ws_feed
         self.wallet = wallet
+        self.symbol = self.ws.symbol.upper()
         self.check_interval_ms = check_interval_ms
         self.wick_buffer = deque(maxlen=wick_buffer_size)
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._last_log_time = 0
 
     def start(self):
         """Start high-frequency position monitoring."""
@@ -348,14 +419,20 @@ class WebSocketPositionManager:
         """Main loop: check positions against real-time LTP."""
         while self._running:
             try:
-                data = self.ws.get_data()
-                if not data.is_alive:
+                # Must be connected AND have received at least one price update
+                if not self.ws.is_connected():
                     time.sleep(1)
                     continue
 
                 # Use LTP (last traded price) for execution
+                data = self.ws.get_data()
                 ltp = self.ws.get_ltp()
                 mid = self.ws.get_mid_price()
+
+                if ltp <= 0:
+                    # Still waiting for the first message on a new connection
+                    time.sleep(0.5)
+                    continue
 
                 # Add to wick buffer
                 self.wick_buffer.append({
@@ -365,8 +442,15 @@ class WebSocketPositionManager:
                     "time": data.last_update_ms,
                 })
 
+                # Log heartbeat every 30 seconds to confirm loop is alive
+                now = time.time()
+                if not hasattr(self, "_last_heartbeat"): self._last_heartbeat = 0
+                if now - self._last_heartbeat >= 30:
+                    logger.debug(f"[WS-PM] Loop heartbeat for {self.symbol} | LTP: {ltp:.2f}")
+                    self._last_heartbeat = now
+
                 # Check positions
-                pos = self.wallet.get_open_position()
+                pos = self.wallet.get_open_position(self.symbol)
                 if pos:
                     self._check_exits(pos, data, ltp, mid)
 
@@ -384,14 +468,24 @@ class WebSocketPositionManager:
         price_for_sl_tp = mid  # Mid price = fairer execution
         price_for_trail = ltp  # LTP = faster reaction
 
-        # Update PnL
-        pos.update_pnl(data.mark_price)
+        # Update PnL using real-time LTP for higher reactivity
+        pos.update_pnl(ltp)
         pnl = pos.unrealized_pnl
+        
+        # Sync global wallet total on EACH tick
+        self.wallet._sync_unrealized_total()
+
+        # Log live PnL every 10 seconds
+        now = time.time()
+        if now - self._last_log_time >= 10:
+            pnl_pct = (pnl / pos.margin_used) * 100 if pos.margin_used > 0 else 0
+            logger.info(f"[LIVE] {pos.symbol} {pos.side.value} | PnL: {pnl:+.2f} USDT ({pnl_pct:+.2f}%) | Price: {ltp:.2f}")
+            self._last_log_time = now
 
         # 1. Catastrophic SL
         cat_sl = pos.margin_used * self.wallet.catastrophic_sl_pct
         if pnl <= cat_sl:
-            self.wallet.close_position(data.mark_price, f"CATASTROPHIC_SL ({pnl:.2f})")
+            self.wallet.close_position(self.symbol, data.mark_price, f"CATASTROPHIC_SL ({pnl:.2f})")
             return
 
         # 2. Playbook-specific exits
@@ -406,17 +500,17 @@ class WebSocketPositionManager:
         # Simple TP/SL using mid price
         if pos.side == PositionSide.LONG:
             if price >= pos.tp_levels[0]["price"]:
-                self.wallet.close_position(price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
+                self.wallet.close_position(self.symbol, price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
                 return
             if price <= pos.sl_price:
-                self.wallet.close_position(price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+                self.wallet.close_position(self.symbol, price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
                 return
         else:
             if price <= pos.tp_levels[0]["price"]:
-                self.wallet.close_position(price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
+                self.wallet.close_position(self.symbol, price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
                 return
             if price >= pos.sl_price:
-                self.wallet.close_position(price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+                self.wallet.close_position(self.symbol, price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
                 return
 
         # Time stop (using candle time from WS kline)
@@ -438,7 +532,7 @@ class WebSocketPositionManager:
 
             if hit:
                 tp["hit"] = True
-                self.wallet.partial_close(price_sl_tp, tp["pct"], f"{tp['label']} HIT")
+                self.wallet.partial_close(self.symbol, price_sl_tp, tp["pct"], f"{tp['label']} HIT")
                 if tp["label"] == "TP1":
                     pos.sl_price = pos.entry_price
                     logger.info(f"[SL ADJUSTED] {pos.symbol} → BREAKEVEN")
@@ -449,10 +543,10 @@ class WebSocketPositionManager:
 
         # SL check
         if pos.side == PositionSide.LONG and price_sl_tp <= pos.sl_price:
-            self.wallet.close_position(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            self.wallet.close_position(self.symbol, price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
         elif pos.side == PositionSide.SHORT and price_sl_tp >= pos.sl_price:
-            self.wallet.close_position(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            self.wallet.close_position(self.symbol, price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
 
         # Trailing stop using LTP (more reactive to momentum)
@@ -463,7 +557,7 @@ class WebSocketPositionManager:
                 pos._highest_since_tp2 = max(pos._highest_since_tp2, price_trail)
                 trail_price = pos._highest_since_tp2 * 0.995  # 0.5% trail
                 if price_trail < trail_price:
-                    self.wallet.close_position(price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
+                    self.wallet.close_position(self.symbol, price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
                     return
             else:
                 if not hasattr(pos, '_lowest_since_tp2'):
@@ -471,5 +565,5 @@ class WebSocketPositionManager:
                 pos._lowest_since_tp2 = min(pos._lowest_since_tp2, price_trail)
                 trail_price = pos._lowest_since_tp2 * 1.005
                 if price_trail > trail_price:
-                    self.wallet.close_position(price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
+                    self.wallet.close_position(self.symbol, price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
                     return

@@ -173,10 +173,10 @@ class TradingEngine:
         candle_close_time = int(df_1h["close_time"].iloc[-1].timestamp() * 1000)
 
         # 7. Update positions (using candle time, not wall clock)
-        self.wallet.update_positions(mark_price, candle_close_time, ema9_1h)
+        self.wallet.update_positions(self.symbol, mark_price, candle_close_time, ema9_1h)
 
         # 8. Evaluate entry
-        if not self.wallet.get_open_position() and can_trade:
+        if not self.wallet.get_open_position(self.symbol) and can_trade:
             setup = None
 
             # Try Playbook A
@@ -216,7 +216,7 @@ class TradingEngine:
                     adjusted_margin = base_margin * min(final_score / dynamic_threshold, 1.0)
 
                     trade_id = str(uuid.uuid4())[:8]
-                    pos = self.wallet.open_position(setup, mark_price, custom_margin=adjusted_margin)
+                    pos = self.wallet.open_position(self.symbol, setup, mark_price, custom_margin=adjusted_margin)
 
                     if pos:
                         self.risk_manager.record_open()

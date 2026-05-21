@@ -58,6 +58,7 @@ class WebSocketTradingEngine:
         log_rest: bool = False,
         log_ws: bool = False,
         log_llm: bool = False,
+        wallet = None,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
@@ -81,11 +82,14 @@ class WebSocketTradingEngine:
         )
 
         # Wallet & Risk
-        self.wallet = EnhancedFuturesWallet(
-            symbol=self.symbol,
-            initial_balance=initial_balance,
-            leverage=leverage,
-        )
+        if wallet:
+            self.wallet = wallet
+        else:
+            self.wallet = EnhancedFuturesWallet(
+                symbol=self.symbol,
+                initial_balance=initial_balance,
+                leverage=leverage,
+            )
         self.risk_manager = RiskManager()
         self.adaptive_threshold = AdaptiveThresholdManager(
             base_threshold=FINAL_SCORE_THRESHOLD,
@@ -227,7 +231,8 @@ class WebSocketTradingEngine:
 
         # 3. Start LLM async
         if self.use_llm and self.advisor:
-            open_positions = [p.to_dict() for p in self.wallet.positions.values() if p.status == "OPEN"]
+            pos = self.wallet.get_open_position(self.symbol)
+            open_positions = [pos.to_dict()] if pos else []
             if self._llm_thread is None or not self._llm_thread.is_alive():
                 self._llm_thread = self.advisor.get_advice_async(
                     symbol=self.symbol,
@@ -250,7 +255,7 @@ class WebSocketTradingEngine:
             logger.info(f"[RISK] {risk_reason}")
 
         # 5. Evaluate entry if no open position
-        if not self.wallet.get_open_position() and can_trade:
+        if not self.wallet.get_open_position(self.symbol) and can_trade:
             self._evaluate_entry(df_1h, df_4h, regime, regime_score, mark_price,
                                 funding_rate, oi_delta, taker_ratio)
 
@@ -352,7 +357,7 @@ class WebSocketTradingEngine:
         trade_id = str(uuid.uuid4())[:8]
 
         # Open position
-        pos = self.wallet.open_position(setup, entry_price, custom_margin=adjusted_margin)
+        pos = self.wallet.open_position(self.symbol, setup, entry_price, custom_margin=adjusted_margin)
 
         if pos:
             self.risk_manager.record_open()

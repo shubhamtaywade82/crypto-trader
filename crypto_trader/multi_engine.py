@@ -4,6 +4,7 @@ import threading
 from typing import List
 import logging
 from crypto_trader.engine_ws import WebSocketTradingEngine
+from crypto_trader.wallet import EnhancedFuturesWallet
 from crypto_trader.logger_config import configure_colored_logging
 
 configure_colored_logging()
@@ -41,11 +42,19 @@ def main():
     logger.info(f"Starting Multi-Engine for {len(symbols)} symbols: {', '.join(symbols)}")
     engines = []
     threads = []
+    
+    total_balance = 1000.0
+    # Create one shared wallet for all engines
+    global_wallet = EnhancedFuturesWallet(symbol="GLOBAL", initial_balance=total_balance, leverage=args.leverage)
+    
+    # Divide total balance equally among symbols to prevent overallocation
+    per_symbol_balance = total_balance / len(symbols)
 
     for sym in symbols:
         engine = WebSocketTradingEngine(
             symbol=sym,
-            initial_balance=1000.0,
+            wallet=global_wallet,
+            initial_balance=per_symbol_balance,
             leverage=args.leverage,
             testnet=args.testnet,
             use_llm=not args.no_llm,
