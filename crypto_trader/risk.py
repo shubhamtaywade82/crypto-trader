@@ -95,6 +95,69 @@ class RiskManager:
             logger.warning(f"RiskManager load failed: {e}")
 
 
+class AdaptiveThresholdManager:
+    """
+    Gradually lowers the entry threshold if no trades occur for a long time.
+    Ensures the system doesn't stay 'silent' indefinitely (e.g., aiming for 1 trade/day).
+    """
+
+    def __init__(
+        self,
+        base_threshold: float = 0.75,
+        min_threshold: float = 0.50,
+        decay_per_hour: float = 0.01,
+        target_trades_per_day: float = 1.0,
+    ):
+        self.base_threshold = base_threshold
+        self.min_threshold = min_threshold
+        self.decay_rate = decay_per_hour
+        self.target_interval = 24.0 / target_trades_per_day if target_trades_per_day > 0 else 24.0
+        
+        self.last_trade_time = time.time()
+        self.state_file = DATA_DIR / "adaptive_threshold.json"
+        self._load_state()
+
+    def get_threshold(self) -> float:
+        """Calculate current threshold based on time since last trade."""
+        hours_since = (time.time() - self.last_trade_time) / 3600.0
+        
+        # Start decaying only after we've passed the target interval
+        if hours_since <= self.target_interval:
+            return self.base_threshold
+        
+        excess_hours = hours_since - self.target_interval
+        decay = excess_hours * self.decay_rate
+        current = max(self.min_threshold, self.base_threshold - decay)
+        
+        if current < self.base_threshold:
+            logger.debug(f"[ADAPTIVE] Threshold decayed: {self.base_threshold:.2f} -> {current:.2f} ({hours_since:.1f}h since trade)")
+        
+        return round(current, 3)
+
+    def record_trade(self):
+        """Reset the clock and threshold."""
+        self.last_trade_time = time.time()
+        self._save_state()
+        logger.info(f"[ADAPTIVE] Trade recorded. Threshold reset to {self.base_threshold:.2f}")
+
+    def _save_state(self):
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump({"last_trade_time": self.last_trade_time}, f)
+        except Exception:
+            pass
+
+    def _load_state(self):
+        if not self.state_file.exists():
+            return
+        try:
+            with open(self.state_file, "r") as f:
+                data = json.load(f)
+            self.last_trade_time = data.get("last_trade_time", time.time())
+        except Exception:
+            pass
+
+
 class LLMCircuitBreaker:
     """Auto-disable LLM after repeated failures."""
 

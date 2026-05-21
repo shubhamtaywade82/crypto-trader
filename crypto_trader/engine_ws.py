@@ -24,7 +24,7 @@ import pandas as pd
 from .data_feed import BinanceDataFeed
 from .websocket import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
-from .risk import RiskManager
+from .risk import RiskManager, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB
 from .regime import MarketRegimeAnalyzer, compute_ema
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD
@@ -87,6 +87,12 @@ class WebSocketTradingEngine:
             leverage=leverage,
         )
         self.risk_manager = RiskManager()
+        self.adaptive_threshold = AdaptiveThresholdManager(
+            base_threshold=FINAL_SCORE_THRESHOLD,
+            min_threshold=0.50,
+            decay_per_hour=0.01,
+            target_trades_per_day=1.0
+        )
 
         # Strategy
         self.regime_analyzer = MarketRegimeAnalyzer()
@@ -283,19 +289,19 @@ class WebSocketTradingEngine:
             llm_weight = 0.0
             explanation = "LLM unavailable"
 
-        from .llm_advisor import FINAL_SCORE_THRESHOLD
-        if final_score < FINAL_SCORE_THRESHOLD:
-            logger.info(f"[BLOCKED] Final score {final_score:.2f} < {FINAL_SCORE_THRESHOLD}")
+        dynamic_threshold = self.adaptive_threshold.get_threshold()
+        if final_score < dynamic_threshold:
+            logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
             return
 
         # Execute entry using WebSocket LTP for precise price
         self._execute_entry(setup, final_score, llm_weight, explanation,
                            mark_price, funding_rate, oi_delta, taker_ratio,
-                           tech_score, regime, regime_score, advice)
+                           tech_score, regime, regime_score, advice, dynamic_threshold)
 
     def _execute_entry(self, setup, final_score, llm_weight, explanation,
                       mark_price, funding_rate, oi_delta, taker_ratio,
-                      tech_score, regime, regime_score, advice):
+                      tech_score, regime, regime_score, advice, dynamic_threshold):
         """Execute entry using real-time WebSocket prices."""
         # Get current LTP and spread from WebSocket
         ltp = self.ws_feed.get_ltp()
@@ -336,9 +342,8 @@ class WebSocketTradingEngine:
                     tp_level["price"] = entry_price * (1 - 0.010 if tp_level["label"] == "TP1" else 0.020)
 
         # Size based on final score
-        from .llm_advisor import FINAL_SCORE_THRESHOLD
         base_margin = self.wallet.available_balance * self.wallet.equity_utilization
-        adjusted_margin = base_margin * min(final_score / FINAL_SCORE_THRESHOLD, 1.0)
+        adjusted_margin = base_margin * min(final_score / dynamic_threshold, 1.0)
 
         trade_id = str(uuid.uuid4())[:8]
 
@@ -347,6 +352,7 @@ class WebSocketTradingEngine:
 
         if pos:
             self.risk_manager.record_open()
+            self.adaptive_threshold.record_trade()
 
             # Calculate slippage
             intended = setup["entry_price"]

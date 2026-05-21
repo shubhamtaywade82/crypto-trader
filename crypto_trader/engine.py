@@ -16,7 +16,7 @@ import pandas as pd
 
 from .data_feed import BinanceDataFeed
 from .wallet import EnhancedFuturesWallet, PositionSide
-from .risk import RiskManager, LLMCircuitBreaker
+from .risk import RiskManager, LLMCircuitBreaker, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB
 from .regime import MarketRegimeAnalyzer, compute_ema
 from .llm_advisor import OllamaAdvisor
@@ -69,6 +69,13 @@ class TradingEngine:
             catastrophic_sl_pct=CATASTROPHIC_SL_PCT,
         )
         self.risk_manager = RiskManager()
+        from .llm_advisor import FINAL_SCORE_THRESHOLD
+        self.adaptive_threshold = AdaptiveThresholdManager(
+            base_threshold=FINAL_SCORE_THRESHOLD,
+            min_threshold=0.50,
+            decay_per_hour=0.01,
+            target_trades_per_day=1.0
+        )
         self.regime_analyzer = MarketRegimeAnalyzer()
         self.playbook_a = PlaybookA()
         self.playbook_b = PlaybookB()
@@ -198,17 +205,18 @@ class TradingEngine:
                     explanation = "LLM unavailable"
 
                 # Execute if final score passes threshold
-                from .llm_advisor import FINAL_SCORE_THRESHOLD
-                if final_score >= FINAL_SCORE_THRESHOLD:
+                dynamic_threshold = self.adaptive_threshold.get_threshold()
+                if final_score >= dynamic_threshold:
                     # Adjust margin by final score (higher score = full size, lower = reduced)
                     base_margin = self.wallet.available_balance * self.wallet.equity_utilization
-                    adjusted_margin = base_margin * min(final_score / FINAL_SCORE_THRESHOLD, 1.0)
+                    adjusted_margin = base_margin * min(final_score / dynamic_threshold, 1.0)
 
                     trade_id = str(uuid.uuid4())[:8]
                     pos = self.wallet.open_position(setup, mark_price, custom_margin=adjusted_margin)
 
                     if pos:
                         self.risk_manager.record_open()
+                        self.adaptive_threshold.record_trade()
                         self.journal.log_open(
                             trade_id=trade_id,
                             symbol=self.symbol,
@@ -226,9 +234,9 @@ class TradingEngine:
                             oi_delta=oi_delta,
                             taker_ratio=taker_ratio,
                         )
-                        logger.info(f"[EXECUTED] Trade {trade_id} | margin={adjusted_margin:.2f} | score={final_score:.2f}")
+                        logger.info(f"[EXECUTED] Trade {trade_id} | margin={adjusted_margin:.2f} | score={final_score:.2f} (threshold={dynamic_threshold:.2f})")
                 else:
-                    logger.info(f"[BLOCKED] Final score {final_score:.2f} < {FINAL_SCORE_THRESHOLD}")
+                    logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
 
         # 10. Summary
         summary = self.wallet.get_summary()
