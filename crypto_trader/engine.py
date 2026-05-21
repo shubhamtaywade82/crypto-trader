@@ -30,8 +30,8 @@ LEVERAGE = 10
 EQUITY_UTILIZATION = 0.50
 CATASTROPHIC_SL_PCT = -0.50
 
-TF_4H, TF_1H = "4h", "1h"
-LIMIT_4H, LIMIT_1H = 200, 150
+TF_4H, TF_1H, TF_15M, TF_5M = "4h", "1h", "15m", "5m"
+LIMIT_4H, LIMIT_1H, LIMIT_15M, LIMIT_5M = 200, 150, 150, 150
 
 
 class TradingEngine:
@@ -94,6 +94,8 @@ class TradingEngine:
         try:
             df_4h = self.data_feed.get_klines(self.symbol, TF_4H, limit=LIMIT_4H)
             df_1h = self.data_feed.get_klines(self.symbol, TF_1H, limit=LIMIT_1H)
+            df_15m = self.data_feed.get_klines(self.symbol, TF_15M, limit=LIMIT_15M)
+            df_5m = self.data_feed.get_klines(self.symbol, TF_5M, limit=LIMIT_5M)
             mark_price = self.data_feed.get_mark_price(self.symbol)
             funding_rate = self.data_feed.get_funding_rate(self.symbol)
             oi_data = self.data_feed.get_open_interest(self.symbol)
@@ -118,6 +120,8 @@ class TradingEngine:
                     symbol=self.symbol,
                     df_1h=df_1h,
                     df_4h=df_4h,
+                    df_15m=df_15m,
+                    df_5m=df_5m,
                     regime=regime.value,
                     regime_score=regime_score,
                     mark_price=mark_price,

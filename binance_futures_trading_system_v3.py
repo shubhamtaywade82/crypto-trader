@@ -47,7 +47,7 @@ from binance_futures_trading_system_v2 import (
 )
 
 # Import LLM advisor
-from ollama_advisor import (
+from crypto_trader.llm_advisor import (
     OllamaAdvisor,
     LLMAdvice,
     LLMBias,
@@ -61,6 +61,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("TradingEngineV3")
 
+
+TF_15M, TF_5M = "15m", "5m"
+LIMIT_15M, LIMIT_5M = 150, 150
 
 # ---------------------------------------------------------------------------
 # Trading Engine v3 (LLM-Enhanced)
@@ -126,7 +129,12 @@ class TradingEngineV3(TradingEngineV2):
         try:
             df_4h = self.data_feed.get_klines(self.symbol, TF_4H, limit=LIMIT_4H)
             df_1h = self.data_feed.get_klines(self.symbol, TF_1H, limit=LIMIT_1H)
+            df_15m = self.data_feed.get_klines(self.symbol, "15m", limit=150)
+            df_5m = self.data_feed.get_klines(self.symbol, "5m", limit=150)
             mark_price = self.data_feed.get_mark_price(self.symbol)
+            funding_rate = getattr(self.data_feed, "get_funding_rate", lambda s: 0.0)(self.symbol)
+            oi_data = getattr(self.data_feed, "get_open_interest", lambda s: 0.0)(self.symbol)
+            taker_ratio = getattr(self.data_feed, "get_taker_ratio", lambda s: 1.0)(self.symbol)
         except Exception as e:
             logger.error(f"Data fetch failed: {e}")
             return self.wallet.get_summary()
@@ -143,14 +151,23 @@ class TradingEngineV3(TradingEngineV2):
             # If previous thread still running, skip this tick's LLM call
             # and use whatever advice we have
             if self._llm_thread is None or not self._llm_thread.is_alive():
+                # Define local vars for LLM call if not present
+                regime_score = 0.5 # Neutral
+                oi_delta = 0.0
+                
                 self._llm_thread = self.advisor.get_advice_async(
                     symbol=self.symbol,
+                    df_5m=df_5m,
+                    df_15m=df_15m,
                     df_1h=df_1h,
                     df_4h=df_4h,
                     regime=regime.value,
+                    regime_score=regime_score,
                     mark_price=mark_price,
+                    funding_rate=funding_rate,
+                    oi_delta=oi_delta,
+                    taker_ratio=taker_ratio,
                     open_positions=open_positions,
-                    callback=self._on_llm_advice,
                 )
 
         # 4. Risk check

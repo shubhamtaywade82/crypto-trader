@@ -26,6 +26,7 @@ import requests
 import pandas as pd
 
 from crypto_trader.risk import LLMCircuitBreaker
+from crypto_trader.structure import MarketStructureAnalyzer
 
 logger = logging.getLogger("crypto_trader.llm")
 
@@ -91,18 +92,29 @@ class LLMAdvice:
         }
 
 
-SYSTEM_PROMPT = """You are a quantitative crypto futures risk advisor.
-You analyze market data and return ONLY a JSON object. No markdown, no explanation.
+SYSTEM_PROMPT = """You are a quantitative crypto futures risk advisor specializing in Smart Money Concepts (SMC) and Price Action (PA) analysis.
+You analyze market structure data and return ONLY a JSON object. No markdown, no explanation.
 
 You are NOT a trader. You do NOT predict direction. You assess:
 1. Uncertainty — is the setup clear or ambiguous?
 2. Risk — are there traps, fakeouts, or liquidation clusters?
-3. Context — funding, OI, and sentiment alignment.
+3. Context — funding, OI, and market structure alignment.
+
+Strategy Context (SOL 10x Snap):
+- The executing bot targets tight 1.0% take-profits and 0.7% stop-losses using 10x leverage (Playbook A: Intraday).
+- The bot also executes 24-48H swings on 4H breakouts (Playbook B: Swing).
+- Therefore, your risk assessment must determine if the current market structure safely supports a clean 1% continuation move without hitting a 0.7% trap or opposite liquidity pool.
+
+SMC & PA Guidelines:
+- Swing Highs / Lows form key liquidity boundaries. Sweeps of these swings indicate high reversal probability (liquidity taken).
+- Breaks of Structure (BOS) indicate trend continuation.
+- Unmitigated Fair Value Gaps (FVG) and Order Blocks (OB) act as powerful magnet support/resistance zones.
+- Rejection Pinbars and Engulfing patterns confirm active buy/sell side pressure.
 
 Rules:
 - Be conservative. "neutral" is better than a forced wrong call.
-- Flag HIGH risk when: declining volume on breakout, RSI divergence, extreme funding.
-- Veto only when: extreme contradictory conditions (e.g., bullish setup but funding +0.1%, OI collapsing).
+- Flag HIGH risk when: extreme opposite funding, sweeps against bias, or trading directly into active unmitigated opposite Order Blocks.
+- Veto only when: extreme contradictory conditions (e.g., bullish setup but funding +0.1%, OI collapsing, or bearish market structure).
 
 Output JSON:
 {
@@ -117,8 +129,77 @@ Output JSON:
 }"""
 
 
+def _build_structure_block(tf_name: str, df: pd.DataFrame) -> str:
+    if df is None or len(df) < 20:
+        return f"[MARKET STRUCTURE - {tf_name}]\n- Insufficient data"
+
+    analyzer = MarketStructureAnalyzer(df, swing_window=3)
+    struct = analyzer.analyze()
+    lines = []
+
+    # EMAs Trend
+    close = df["close"]
+    ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1] if len(close) >= 200 else close.ewm(span=len(close), adjust=False).mean().iloc[-1]
+    last_close = close.iloc[-1]
+
+    if last_close > ema9 > ema21 > ema200:
+        trend = "Strongly Bullish (EMA9 > EMA21 > EMA200)"
+    elif last_close < ema9 < ema21 < ema200:
+        trend = "Strongly Bearish (EMA9 < EMA21 < EMA200)"
+    elif last_close > ema200:
+        trend = "Bullish Core (Price above EMA200)"
+    else:
+        trend = "Bearish Core (Price below EMA200)"
+    lines.append(f"- Trend Alignment: {trend}")
+
+    # BOS
+    recent_bos = struct.get("recent_bos")
+    if recent_bos:
+        bos_type = recent_bos["type"]
+        candles_ago = recent_bos.get("candles_ago", 0)
+        lines.append(f"- Swing Structure: {bos_type} Break of Structure (BOS) occurred {candles_ago} candles ago at {recent_bos['swing_price']:.2f} (Break price: {recent_bos['break_price']:.2f})")
+    else:
+        lines.append("- Swing Structure: Range Bound / Confined")
+
+    # Sweeps
+    recent_sweep = struct.get("recent_sweep")
+    if recent_sweep:
+        sweep_type = recent_sweep["type"]
+        candles_ago = recent_sweep.get("candles_ago", 0)
+        lines.append(f"- Liquidity Sweep: {sweep_type} sweep detected {candles_ago} candles ago at {recent_sweep['swing_price']:.2f} (Wick swept to: {recent_sweep['swept_price']:.2f})")
+
+    # FVGs
+    unmitigated_fvgs = struct.get("unmitigated_fvgs", [])
+    if unmitigated_fvgs:
+        fvg_strs = [f"{f['type']} FVG ({f['bottom']:.2f}-{f['top']:.2f})" for f in unmitigated_fvgs]
+        lines.append(f"- Fair Value Gaps: Active {', '.join(fvg_strs)} (Unmitigated)")
+    else:
+        lines.append("- Fair Value Gaps: No active unmitigated FVGs")
+
+    # OBs
+    unmitigated_obs = struct.get("unmitigated_order_blocks", [])
+    if unmitigated_obs:
+        ob_strs = [f"{o['type']} OB ({o['low']:.2f}-{o['high']:.2f})" for o in unmitigated_obs]
+        lines.append(f"- Order Blocks: Active {', '.join(ob_strs)} (Unmitigated)")
+    else:
+        lines.append("- Order Blocks: No unmitigated Order Blocks")
+
+    # Price Action
+    pa_signals = struct.get("price_action_signals", [])
+    if pa_signals:
+        pa_strs = [f"{sig['pattern']} ({sig['candle']} candle)" for sig in pa_signals]
+        lines.append(f"- Price Action: Recent signals: {', '.join(pa_strs)}")
+
+    block = f"[MARKET STRUCTURE - {tf_name}]\n" + "\n".join(lines)
+    return block
+
+
 def build_prompt(
     symbol: str,
+    df_5m: pd.DataFrame,
+    df_15m: pd.DataFrame,
     df_1h: pd.DataFrame,
     df_4h: pd.DataFrame,
     regime: str,
@@ -129,44 +210,33 @@ def build_prompt(
     taker_ratio: float,
     open_positions: List[dict],
 ) -> str:
-    """Build rich, structured prompt with derivatives context."""
+    """Build rich, structured prompt with pre-calculated SMC & Price Action market structure context."""
 
-    recent_1h = df_1h.tail(6)
-    h1_lines = []
-    for _, row in recent_1h.iterrows():
-        d = "▲" if row["close"] > row["open"] else "▼"
-        h1_lines.append(
-            f"{d} O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f} V:{row['quote_volume']:.0f}"
-        )
+    blocks = []
+    if df_5m is not None:
+        blocks.append(_build_structure_block("5M", df_5m))
+    if df_15m is not None:
+        blocks.append(_build_structure_block("15M", df_15m))
+    if df_1h is not None:
+        blocks.append(_build_structure_block("1H", df_1h))
+    if df_4h is not None:
+        blocks.append(_build_structure_block("4H", df_4h))
 
-    recent_4h = df_4h.tail(4)
-    h4_lines = []
-    for _, row in recent_4h.iterrows():
-        d = "▲" if row["close"] > row["open"] else "▼"
-        h4_lines.append(
-            f"{d} O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f} V:{row['quote_volume']:.0f}"
-        )
-
-    change_24h = (mark_price - df_1h["close"].iloc[-24]) / df_1h["close"].iloc[-24] * 100 if len(df_1h) >= 24 else 0
+    change_24h = (mark_price - df_1h["close"].iloc[-24]) / df_1h["close"].iloc[-24] * 100 if df_1h is not None and len(df_1h) >= 24 else 0
 
     pos_ctx = "No open positions."
     if open_positions:
         p = open_positions[0]
         pos_ctx = f"Open {p['side']} from {p['entry_price']:.2f}, U-PnL: {p['unrealized_pnl']:.2f}"
 
-    h1_block = "\n".join(h1_lines)
-    h4_block = "\n".join(h4_lines)
+    structure_text = "\n\n".join(blocks)
 
     return f"""Analyze {symbol} and return ONLY JSON.
 
 Price: {mark_price:.2f} | 24h: {change_24h:+.2f}% | Regime: {regime} (score={regime_score:.2f})
 Funding: {funding_rate:+.4f}% | OI Delta 24h: {oi_delta:+.1f}% | Taker Buy Ratio: {taker_ratio:.2f}
 
-Last 6 x 1H:
-{h1_block}
-
-Last 4 x 4H:
-{h4_block}
+{structure_text}
 
 Positions: {pos_ctx}
 
@@ -345,6 +415,8 @@ class OllamaAdvisor:
     def get_advice(
         self,
         symbol: str,
+        df_5m: pd.DataFrame,
+        df_15m: pd.DataFrame,
         df_1h: pd.DataFrame,
         df_4h: pd.DataFrame,
         regime: str,
@@ -360,7 +432,7 @@ class OllamaAdvisor:
             logger.warning("[LLM] Circuit breaker active. LLM disabled.")
             return None
 
-        prompt = build_prompt(symbol, df_1h, df_4h, regime, regime_score, mark_price,
+        prompt = build_prompt(symbol, df_5m, df_15m, df_1h, df_4h, regime, regime_score, mark_price,
                               funding_rate, oi_delta, taker_ratio, open_positions)
 
         if not force_refresh:

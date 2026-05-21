@@ -173,6 +173,8 @@ class WebSocketTradingEngine:
             # Fetch historical data via REST
             df_4h = self.data_feed.get_klines(self.symbol, "4h", limit=200)
             df_1h = self.data_feed.get_klines(self.symbol, "1h", limit=150)
+            df_15m = self.data_feed.get_klines(self.symbol, "15m", limit=150)
+            df_5m = self.data_feed.get_klines(self.symbol, "5m", limit=150)
 
             # Get current context from WebSocket (real-time)
             ws_data = self.ws_feed.get_data()
@@ -200,6 +202,8 @@ class WebSocketTradingEngine:
             if self._llm_thread is None or not self._llm_thread.is_alive():
                 self._llm_thread = self.advisor.get_advice_async(
                     symbol=self.symbol,
+                    df_5m=df_5m,
+                    df_15m=df_15m,
                     df_1h=df_1h,
                     df_4h=df_4h,
                     regime=regime.value,
