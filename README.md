@@ -13,6 +13,7 @@ Implements the **"SOL 10× Snap"** strategy — from a basic technical engine (v
 | `binance_futures_trading_system_v2.py` | v2 — Multi-timeframe + Risk Manager | ✅ Yes |
 | `binance_futures_trading_system_v3.py` | v3 — v2 + Ollama LLM filter | ✅ Yes |
 | `ollama_advisor.py` | AI advisory module (used by v3) | ✅ Yes (standalone test) |
+| `crypto_trader/` | v4 — Modular package (`engine`, `wallet`, `risk`, etc.) | ✅ Yes (`python -m crypto_trader.engine`) |
 
 ---
 
@@ -181,6 +182,22 @@ python3 binance_futures_trading_system_v3.py \
     --loop
 ```
 
+### v4 — Modular package runner (`crypto_trader.engine`)
+
+```bash
+# Install package deps
+pip3 install -r crypto_trader/requirements.txt
+
+# Single tick
+python3 -m crypto_trader.engine --symbol SOLUSDT
+
+# Live loop
+python3 -m crypto_trader.engine --symbol SOLUSDT --loop --tick 300
+
+# No LLM mode
+python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --loop
+```
+
 ---
 
 ## ⚙️ Configuration & Tuning
@@ -217,19 +234,24 @@ For other pairs, adjust `A_SL_PCT` and `A_TP_PCT` based on the pair's ATR:
 
 ## 💾 State Persistence
 
-The system automatically saves state to JSON files in the working directory:
+v2/v3 now save state under `~/.crypto_trader/` (not the current working directory).  
+The v4 package uses the same base directory and adds a journal subfolder.
 
 | File | Contents |
 |------|----------|
-| `wallet_{SYMBOL}_v2.json` | Wallet balance, open positions, trade history |
-| `risk_manager_state.json` | Daily trade count, consecutive loss streak |
-| `llm_cache/` | Cached LLM responses (30-min TTL, v3 only) |
+| `~/.crypto_trader/wallet_{SYMBOL}_v2.json` | v2 wallet balance, open positions, trade history |
+| `~/.crypto_trader/risk_manager_state.json` | v2 daily trade count, consecutive loss streak |
+| `~/.crypto_trader/llm_cache/` | v3 cached LLM responses (30-min TTL) |
+| `~/.crypto_trader/wallet_{SYMBOL}.json` | v4 wallet state |
+| `~/.crypto_trader/risk_state.json` | v4 risk state |
+| `~/.crypto_trader/journal/YYYY-MM-DD.jsonl` | v4 append-only trade journal |
 
 To **reset** and start fresh (new wallet):
 
 ```bash
-rm -f wallet_SOLUSDT_v2.json risk_manager_state.json
-rm -rf llm_cache/
+rm -f ~/.crypto_trader/wallet_SOLUSDT_v2.json ~/.crypto_trader/risk_manager_state.json
+rm -f ~/.crypto_trader/wallet_SOLUSDT.json ~/.crypto_trader/risk_state.json
+rm -rf ~/.crypto_trader/llm_cache ~/.crypto_trader/journal
 ```
 
 ---
@@ -247,6 +269,20 @@ binance_futures_trading_system_v3.py  (TradingEngineV3)
         ├── LLMResponseParser — JSON extraction & validation
         ├── LLMCache          — 30-min disk cache (llm_cache/)
         └── LLMAdvice         — Structured result: bias, confidence, veto_reason
+```
+
+**v4 modular architecture:**
+
+```
+crypto_trader/
+├── data_feed.py     (Binance REST + 418/429 handling)
+├── wallet.py        (position lifecycle + partial close accounting)
+├── risk.py          (daily limits + LLM circuit breaker)
+├── regime.py        (regime classification)
+├── playbooks.py     (entry setup logic)
+├── llm_advisor.py   (LLM advice schema + latency metadata)
+├── journal.py       (JSONL journaling)
+└── engine.py        (orchestrator + CLI)
 ```
 
 **Signal flow in v3:**

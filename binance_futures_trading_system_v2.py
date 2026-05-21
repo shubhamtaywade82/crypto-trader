@@ -82,6 +82,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SOL10xSnap")
 
+DATA_DIR = Path.home() / ".crypto_trader"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -212,6 +215,15 @@ class BinanceDataFeed:
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 418:
+                logger.critical("Binance IP ban (418) detected. Sleeping 120s before retry.")
+                time.sleep(120)
+            elif status == 429:
+                logger.warning("Binance rate limit (429) detected. Sleeping 60s before retry.")
+                time.sleep(60)
+            raise
         except requests.RequestException as e:
             logger.error(f"Request failed: {e}")
             raise
@@ -548,7 +560,7 @@ class RiskManager:
         self.daily_count = 0
         self.last_trade_date: Optional[date] = None
         self.consecutive_losses = 0
-        self.state_file = Path("risk_manager_state.json")
+        self.state_file = DATA_DIR / "risk_manager_state.json"
         self._load_state()
 
     def _today(self) -> date:
@@ -627,7 +639,7 @@ class EnhancedFuturesWallet:
         self.leverage = leverage
         self.equity_utilization = equity_utilization
         self.catastrophic_sl_pct = catastrophic_sl_pct
-        self.state_file = Path(state_file)
+        self.state_file = DATA_DIR / state_file
         self.wallet_balance = initial_balance
         self.unrealized_pnl_total = 0.0
         self.realized_pnl_total = 0.0
@@ -713,9 +725,8 @@ class EnhancedFuturesWallet:
             return None
 
         pos.update_pnl(close_price)
-        realized = pos.unrealized_pnl + pos.partial_realized_pnl
+        realized = pos.unrealized_pnl
         pos.unrealized_pnl = 0.0
-        pos.partial_realized_pnl = realized
         pos.status = "CLOSED"
         pos.close_time = int(time.time() * 1000)
         pos.close_price = close_price
@@ -775,7 +786,12 @@ class EnhancedFuturesWallet:
         Update PnL, check TP/SL/Time/Trail/Catastrophic.
         indicators: symbol -> {"ema9_1h": float, "timestamp_ms": int}
         """
-        now_ms = int(time.time() * 1000)
+        indicator_ts = [
+            v.get("timestamp_ms")
+            for v in indicators.values()
+            if isinstance(v, dict) and v.get("timestamp_ms") is not None
+        ]
+        now_ms = int(max(indicator_ts)) if indicator_ts else int(time.time() * 1000)
 
         for symbol, pos in list(self.positions.items()):
             if pos.status != "OPEN":
