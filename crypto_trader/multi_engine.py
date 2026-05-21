@@ -4,8 +4,9 @@ import threading
 from typing import List
 import logging
 from crypto_trader.engine_ws import WebSocketTradingEngine
+from crypto_trader.logger_config import configure_colored_logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+configure_colored_logging()
 logger = logging.getLogger("multi_engine")
 
 def parse_args():

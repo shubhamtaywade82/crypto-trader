@@ -130,6 +130,10 @@ class TradingEngine:
             logger.error(f"Data fetch failed: {e}")
             return self.wallet.get_summary()
 
+        if mark_price <= 0:
+            logger.warning(f"Invalid mark price {mark_price} for {self.symbol}. Skipping tick.")
+            return self.wallet.get_summary()
+
         # 2. Regime analysis
         regime, regime_score, df_4h = self.regime_analyzer.analyze(df_4h)
         logger.info(f"Regime: {regime.value} (score={regime_score:.2f})")

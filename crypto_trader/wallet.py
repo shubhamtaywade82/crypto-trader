@@ -56,7 +56,7 @@ class EnhancedPosition:
     close_reason: Optional[str] = None
 
     def update_pnl(self, mark_price: float):
-        if self.status != "OPEN":
+        if self.status != "OPEN" or mark_price <= 0:
             return
         if self.side == PositionSide.LONG:
             self.unrealized_pnl = (mark_price - self.entry_price) * self.remaining_quantity
@@ -194,6 +194,7 @@ class EnhancedFuturesWallet:
         )
         pos.update_pnl(mark_price)
         self.positions[self.symbol] = pos
+        self._sync_unrealized_total()
 
         logger.info(
             f"[POSITION OPENED] {self.symbol} {side.value} | Playbook={playbook.value} | "
@@ -294,9 +295,7 @@ class EnhancedFuturesWallet:
         elif pos.playbook == Playbook.SWING:
             self._check_swing_exits(pos, mark_price, candle_close_time, ema9_1h)
 
-        self.unrealized_pnl_total = sum(
-            p.unrealized_pnl for p in self.positions.values() if p.status == "OPEN"
-        )
+        self._sync_unrealized_total()
 
     def _check_intraday_exits(self, pos: EnhancedPosition, mark_price: float, candle_close_time: int):
         # Simple TP/SL
@@ -404,6 +403,11 @@ class EnhancedFuturesWallet:
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2, default=str)
 
+    def _sync_unrealized_total(self):
+        self.unrealized_pnl_total = sum(
+            p.unrealized_pnl for p in self.positions.values() if p.status == "OPEN"
+        )
+
     def _load_state(self):
         if not self.state_file.exists():
             return
@@ -418,6 +422,7 @@ class EnhancedFuturesWallet:
                 if d.get("status") == "OPEN"  # BUG FIX: skip closed positions
             }
             self.position_history = state.get("position_history", [])
+            self._sync_unrealized_total()
             logger.info(f"Loaded wallet state from {self.state_file}")
         except Exception as e:
             logger.warning(f"Failed to load state: {e}")

@@ -209,6 +209,10 @@ class WebSocketTradingEngine:
             oi_data = self.data_feed.get_open_interest(self.symbol)
             taker_ratio = self.data_feed.get_taker_ratio(self.symbol)
 
+            if mark_price <= 0:
+                logger.warning(f"[WS-ENGINE] Invalid mark price {mark_price}. Skipping signal tick.")
+                return
+
         except Exception as e:
             logger.error(f"Data fetch failed: {e}")
             return

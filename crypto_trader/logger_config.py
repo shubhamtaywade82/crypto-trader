@@ -61,10 +61,17 @@ class ColoredFormatter(logging.Formatter):
 
 def configure_colored_logging(level=logging.INFO):
     """Configure the root logger to use our ColoredFormatter."""
-    # Check if we should disable colors (NO_COLOR env var or stdout not a TTY)
     no_color_env = os.getenv("NO_COLOR", "false").lower() in ("true", "1", "yes")
-    is_tty = sys.stdout.isatty()
-    use_colors = is_tty and not no_color_env
+    force_color_env = os.getenv("FORCE_COLOR", "false").lower() in ("true", "1", "yes")
+    
+    # IDE integrated terminals (like Cursor/VSCode) often fail the isatty() check 
+    # but support ANSI colors perfectly. We default to True unless explicitly disabled.
+    if force_color_env:
+        use_colors = True
+    elif no_color_env:
+        use_colors = False
+    else:
+        use_colors = True
     
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
