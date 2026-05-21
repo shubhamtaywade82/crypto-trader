@@ -1,2 +1,4 @@
 .antigravitycli/**
 llm_cache/**
+.env
+__pycache__/**

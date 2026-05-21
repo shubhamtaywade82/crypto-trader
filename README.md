@@ -333,3 +333,51 @@ python3 -m crypto_trader.engine_ws --symbol SOLUSDT --loop --tick 300
 python3 -m crypto_trader.engine_ws --symbol SOLUSDT --no-llm --loop
 python3 -m crypto_trader.engine_ws --symbol SOLUSDT --testnet --loop
 ```
+
+---
+
+## 📊 Network & LLM Logging
+
+The v4 engines provide extensive logging capabilities to audit exchange data payloads and verify prompts sent to the LLM layers. You can control these logs individually or globally.
+
+### CLI Flags
+
+You can specify these switches when launching `crypto_trader.engine` or `crypto_trader.engine_ws`:
+
+- `--log-rest`: Enable detailed logging of Binance REST API requests and responses (klines, prices, OI, funding, taker ratio), truncated to 1000 characters to keep stdout clean.
+- `--log-ws`: Enable real-time logging of raw incoming WebSocket messages (e.g. trade updates, book ticker changes).
+- `--log-llm`: Enable multiline printing of the exact prompt sent to the LLM and the raw JSON response received.
+- `--log-responses`: Master switch that activates all of the above (REST, WebSocket, and LLM logging) simultaneously.
+
+**Example Usage**:
+```bash
+# Log only the prompts and JSON responses from Ollama
+python3 -m crypto_trader.engine_ws --symbol SOLUSDT --log-llm --loop
+
+# Log only standard REST endpoints and response JSONs
+python3 -m crypto_trader.engine --symbol SOLUSDT --log-rest --loop
+```
+
+### Environment Variables & .env File
+
+You can configure options globally using environment variables or a `.env` file in the project root. The trading system automatically detects and loads environment variables from `.env` at startup.
+
+Copy the template to create your `.env` configuration:
+```bash
+cp .env.example .env
+```
+
+Available configurations in `.env`:
+```ini
+OLLAMA_HOST=http://localhost:11434  # Ollama server url
+OLLAMA_MODEL=qwen3.5:4b             # Ollama model to pull and use
+OLLAMA_TIMEOUT=320                  # Timeout in seconds
+OLLAMA_MAX_TOKENS=512               # Max tokens for generated advice
+LLM_CACHE_TTL=1800                  # TTL in seconds for Ollama disk cache
+LLM_MAX_AGE=20                      # Age in seconds to reject stale advice
+LLM_MAX_LATENCY=3000                # Latency budget in ms (before proceeding with technical-only)
+LLM_WEIGHT=0.20                     # Weighted confidence fusion influence
+FINAL_SCORE_THRESHOLD=0.75          # Strategy confidence threshold for trade entries
+LOG_BINANCE_RESPONSES=false         # Toggle both REST and WebSocket logging
+LOG_LLM=false                       # Toggle LLM prompt and response logging
+```

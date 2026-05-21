@@ -251,7 +251,10 @@ class OllamaClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("response", "").strip()
+            response_text = data.get("response", "").strip()
+            if not response_text and "thinking" in data:
+                response_text = data["thinking"].strip()
+            return response_text
         except requests.Timeout:
             logger.warning("Ollama request timed out")
             return None

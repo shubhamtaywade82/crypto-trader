@@ -252,12 +252,17 @@ class OllamaClient:
             "prompt": prompt,
             "system": SYSTEM_PROMPT,
             "stream": False,
+            "think": False,
             "options": {"temperature": temperature, "num_predict": self.max_tokens},
         }
         try:
             resp = self.session.post(f"{self.host}/api/generate", json=payload, timeout=self.timeout)
             resp.raise_for_status()
-            return resp.json().get("response", "").strip()
+            data = resp.json()
+            response_text = data.get("response", "").strip()
+            if not response_text and "thinking" in data:
+                response_text = data["thinking"].strip()
+            return response_text
         except requests.Timeout:
             logger.warning("Ollama request timed out")
             return None

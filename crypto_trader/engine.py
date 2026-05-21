@@ -5,6 +5,7 @@ Wires all modules together:
     DataFeed → RegimeAnalyzer → Playbooks → LLM Fusion → Risk → Wallet → Journal
 """
 
+import os
 import time
 import uuid
 import logging
@@ -43,8 +44,8 @@ class TradingEngine:
         leverage: int = LEVERAGE,
         testnet: bool = False,
         use_llm: bool = True,
-        llm_host: str = "http://localhost:11434",
-        llm_model: str = "qwen3.5:4b",
+        llm_host: str = None,
+        llm_model: str = None,
         log_responses: bool = False,
         log_rest: bool = False,
         log_ws: bool = False,
@@ -77,9 +78,11 @@ class TradingEngine:
         self.advisor = None
         self._llm_thread = None
         if use_llm:
-            self.advisor = OllamaAdvisor(host=llm_host, model=llm_model, log_llm=llm_logged)
+            resolved_host = llm_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+            self.advisor = OllamaAdvisor(host=resolved_host, model=resolved_model, log_llm=llm_logged)
             if self.advisor.is_ready():
-                logger.info(f"[LLM] Connected to {llm_model}")
+                logger.info(f"[LLM] Connected to {resolved_model}")
             else:
                 logger.warning("[LLM] Ollama unavailable. Technical-only mode.")
 
@@ -234,8 +237,8 @@ def main():
     parser.add_argument("--leverage", type=int, default=LEVERAGE)
     parser.add_argument("--testnet", action="store_true")
     parser.add_argument("--no-llm", action="store_true")
-    parser.add_argument("--llm-host", default="http://localhost:11434")
-    parser.add_argument("--llm-model", default="qwen3.5:4b")
+    parser.add_argument("--llm-host", default=None, help="Ollama host URL (defaults to OLLAMA_HOST env var)")
+    parser.add_argument("--llm-model", default=None, help="Ollama model name (defaults to OLLAMA_MODEL env var)")
     parser.add_argument("--log-responses", action="store_true", help="Log all REST API, WS, and LLM JSON outputs (master toggle)")
     parser.add_argument("--log-rest", action="store_true", help="Log Binance REST API request/response JSON")
     parser.add_argument("--log-ws", action="store_true", help="Log Binance WebSocket message JSON")
@@ -245,11 +248,8 @@ def main():
     args = parser.parse_args()
 
     # Configure logging ONLY here
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    from .logger_config import configure_colored_logging
+    configure_colored_logging(level=logging.INFO)
 
     engine = TradingEngine(
         symbol=args.symbol,

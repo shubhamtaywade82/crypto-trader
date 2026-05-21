@@ -19,7 +19,43 @@ Usage:
 """
 from __future__ import annotations
 
+# ── Load Environment Variables from .env ──
+def _load_dotenv():
+    import os
+    from pathlib import Path
+    
+    # Check CWD first, then the parent directory of this package
+    cwd_env = Path.cwd() / ".env"
+    pkg_parent_env = Path(__file__).resolve().parent.parent / ".env"
+    
+    dotenv_path = None
+    if cwd_env.is_file():
+        dotenv_path = cwd_env
+    elif pkg_parent_env.is_file():
+        dotenv_path = pkg_parent_env
+        
+    if dotenv_path:
+        try:
+            with open(dotenv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip()
+                        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                            val = val[1:-1]
+                        if key not in os.environ:
+                            os.environ[key] = val
+        except Exception:
+            pass
+
+_load_dotenv()
+
 __version__ = "4.0.0"
+
 __all__ = [
     "TradingEngine",
     "BinanceDataFeed",
