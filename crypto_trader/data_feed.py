@@ -5,6 +5,7 @@ Fetches OHLCV, mark price, funding rate, and open interest.
 Handles rate limits, IP bans, and retries with exponential backoff.
 """
 
+import os
 import time
 import logging
 from typing import Optional
@@ -26,10 +27,12 @@ class BinanceDataFeed:
         base_url: str = BINANCE_FAPI_BASE,
         max_retries: int = 3,
         backoff_base: float = 2.0,
+        log_responses: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self.backoff_base = backoff_base
+        self.log_responses = log_responses or os.getenv("LOG_BINANCE_RESPONSES", "false").lower() in ("true", "1", "yes")
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
@@ -49,6 +52,9 @@ class BinanceDataFeed:
             # Full path endpoints such as 'futures/data/...'
             url = f"{self.base_url}/{endpoint}"
         last_exception = None
+
+        if self.log_responses:
+            logger.info(f"[REST API Request] {method} {url} | Params: {params}")
 
         for attempt in range(self.max_retries):
             try:
@@ -72,7 +78,13 @@ class BinanceDataFeed:
                     continue
 
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                if self.log_responses:
+                    resp_str = str(data)
+                    if len(resp_str) > 1000:
+                        resp_str = resp_str[:1000] + "... (truncated)"
+                    logger.info(f"[REST API Response] {method} {url} | Data: {resp_str}")
+                return data
 
             except requests.Timeout:
                 sleep_sec = self.backoff_base ** attempt
@@ -151,22 +163,19 @@ class BinanceDataFeed:
 
     def get_taker_ratio(self, symbol: str, period: str = "1h") -> float:
         """Get taker buy/sell volume ratio. >1 means more buyers."""
-        # This endpoint is NOT under /fapi/, it's under /futures/data/
-        url = f"{self.base_url}/futures/data/takerlongshortRatio"
         params = {
             "symbol": symbol.upper(),
             "period": period,
             "limit": 1,
         }
         try:
-            resp = self.session.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+            data = self._request("GET", "futures/data/takerlongshortRatio", params)
             if not data:
                 logger.warning("Empty response for taker ratio; defaulting to 1.0")
                 return 1.0
-            # The API returns 'buySellRatio'
-            return float(data[0].get("buySellRatio", 1.0))
+            # Support both buySellRatio and buyRatio just in case
+            val = data[0].get("buySellRatio") or data[0].get("buyRatio", 1.0)
+            return float(val)
         except Exception as e:
             logger.error(f"Failed to fetch or parse taker ratio: {e}")
             return 1.0

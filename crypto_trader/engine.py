@@ -45,13 +45,14 @@ class TradingEngine:
         use_llm: bool = True,
         llm_host: str = "http://localhost:11434",
         llm_model: str = "qwen3.5:4b",
+        log_responses: bool = False,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
 
         # Modules
         base_url = "https://demo-fapi.binance.com" if testnet else "https://fapi.binance.com"
-        self.data_feed = BinanceDataFeed(base_url=base_url)
+        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=log_responses)
         self.wallet = EnhancedFuturesWallet(
             symbol=self.symbol,
             initial_balance=initial_balance,
@@ -228,6 +229,7 @@ def main():
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--llm-host", default="http://localhost:11434")
     parser.add_argument("--llm-model", default="qwen3.5:4b")
+    parser.add_argument("--log-responses", action="store_true", help="Log Binance API request/response JSON")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--tick", type=int, default=300)
     args = parser.parse_args()
@@ -247,6 +249,7 @@ def main():
         use_llm=not args.no_llm,
         llm_host=args.llm_host,
         llm_model=args.llm_model,
+        log_responses=args.log_responses,
     )
 
     if args.loop:
