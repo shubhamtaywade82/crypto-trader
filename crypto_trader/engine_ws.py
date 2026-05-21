@@ -30,7 +30,7 @@ class TradingEngineWS(TradingEngine):
             return mark
         return self.feed.get_mark_price(self.symbol)
 
-    def run_once(self):
+    def _signal_tick(self):
         # Base logic from REST engine
         df4h = self.feed.get_klines(self.symbol, "4h", 200)
         regime, regime_score = self._classify(df4h)
@@ -38,23 +38,50 @@ class TradingEngineWS(TradingEngine):
         if setup and self.risk.can_trade() and self.wallet.position is None:
             final_score = self._final_score(setup, regime, regime_score)
             if final_score >= 0.75:
-                mark = self._entry_price()
-                side = self._side(setup)
-                self.wallet.open_position(side, mark, margin=50.0)
-                self.risk.record_open()
-                snap = self.ws.snapshot()
-                self.journal.append({
-                    "symbol": self.symbol,
-                    "regime": regime,
-                    "regime_score": regime_score,
-                    "final_score": final_score,
-                    "entry_price": mark,
-                    "bid": snap.bid,
-                    "ask": snap.ask,
-                    "mark_price": snap.mark_price,
-                    "ltp": snap.last_trade_price,
-                    "funding_rate": snap.funding_rate,
-                })
+                self._execute_entry(setup, regime, regime_score, final_score)
+
+    def _execute_entry(self, setup, regime, regime_score, final_score):
+        intended = self.feed.get_mark_price(self.symbol)
+        mark = self._entry_price()
+        side = self._side(setup)
+        self.wallet.open_position(side, mark, margin=50.0)
+        self.risk.record_open()
+        snap = self.ws.snapshot()
+        spread_pct = ((snap.ask - snap.bid) / mark * 100) if (snap.ask and snap.bid and mark) else None
+        slip_pct = abs(mark - intended) / intended * 100 if intended else None
+        self.journal.append({
+            "symbol": self.symbol, "regime": regime, "regime_score": regime_score,
+            "final_score": final_score, "entry_price": mark, "intended_price": intended,
+            "spread_pct": spread_pct, "slippage_pct": slip_pct,
+            "bid": snap.bid, "ask": snap.ask, "mark_price": snap.mark_price,
+            "ltp": snap.last_trade_price, "funding_rate": snap.funding_rate,
+        })
+
+    def _check_exits(self):
+        pos = self.wallet.position
+        if not pos:
+            return
+        snap = self.ws.snapshot()
+        prices = list(snap.wick_buffer)
+        if not prices:
+            return
+        px = prices[-1]
+        sl = pos.entry_price * (0.993 if pos.side.name == "LONG" else 1.007)
+        tp = pos.entry_price * (1.01 if pos.side.name == "LONG" else 0.99)
+        if pos.side.name == "LONG":
+            if len(prices) == 5 and all(p <= sl for p in prices):
+                self.wallet.close_position(px); self.risk.record_close(px - pos.entry_price)
+            elif px >= tp:
+                self.wallet.close_position(px); self.risk.record_close(px - pos.entry_price)
+        else:
+            if len(prices) == 5 and all(p >= sl for p in prices):
+                self.wallet.close_position(px); self.risk.record_close(pos.entry_price - px)
+            elif px <= tp:
+                self.wallet.close_position(px); self.risk.record_close(pos.entry_price - px)
+
+    def run_once(self):
+        self._signal_tick()
+        self._check_exits()
 
     # helpers reuse v1 logic cleanly
     def _classify(self, df4h):
@@ -101,3 +128,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# guide-compatible alias
+WebSocketTradingEngine = TradingEngineWS

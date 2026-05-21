@@ -38,6 +38,7 @@ class BinanceFuturesWebSocket:
         self._thread: threading.Thread | None = None
         self.state = WSState()
         self._failures = 0
+        self.rest_fallback_mode = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -82,6 +83,9 @@ class BinanceFuturesWebSocket:
                     self._handle(raw)
             except Exception as exc:
                 self._failures += 1
+                if self._failures >= 10:
+                    self.rest_fallback_mode = True
+                    logger.warning("WS failed %s times; switching to REST fallback mode", self._failures)
                 logger.warning("WS reconnect in %ss after error: %s", backoff, exc)
                 time.sleep(backoff)
             finally:
@@ -136,3 +140,8 @@ class BinanceFuturesWebSocket:
                 kline_4h_last=dict(self.state.kline_4h_last) if self.state.kline_4h_last else None,
                 wick_buffer=deque(self.state.wick_buffer, maxlen=5),
             )
+
+
+# Backward-compatible names matching the integration guide terminology
+WSMarketData = WSState
+BinanceWebSocketFeed = BinanceFuturesWebSocket
