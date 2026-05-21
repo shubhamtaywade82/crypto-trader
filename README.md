@@ -197,8 +197,8 @@ python3 -m crypto_trader.engine --symbol SOLUSDT --loop --tick 300
 # No LLM mode
 python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --loop
 
-# Enable websocket ticker (bookTicker mid-price as live LTP)
-python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --use-ws --loop --tick 5
+# v4 always runs with websocket ticker (bookTicker mid-price as live LTP)
+python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --loop --tick 5
 ```
 
 ### Binance WebSocket data you can use for realtime entries/exits
@@ -209,9 +209,10 @@ For USDⓈ-M futures, useful public streams include:
 - `@aggTrade` / `@trade`: trade flow and micro momentum
 - `@kline_1m` (or other intervals): live candle building
 
-In this repo, `crypto_trader.websocket_feed.RealtimeTicker` currently wires `@bookTicker`
-and exposes `last_bid`, `last_ask`, and `last_price`. `TradingEngine` uses that realtime
-price for entries when `--use-ws` is enabled; otherwise it falls back to REST mark price.
+In this repo, `crypto_trader.websocket_feed.RealtimeTicker` wires `@bookTicker`
+and exposes `last_bid`, `last_ask`, and `last_price`. `TradingEngine` starts
+the websocket feed by default, keeps reconnecting on disconnect, and uses realtime
+price for entries (falling back to REST mark price only until first tick arrives).
 
 ---
 

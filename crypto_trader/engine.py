@@ -10,19 +10,17 @@ from .journal import TradeJournal
 from .websocket_feed import RealtimeTicker
 
 class TradingEngine:
-    def __init__(self, symbol: str = "SOLUSDT", leverage: int = 10, use_llm: bool = True, use_ws: bool = False):
+    def __init__(self, symbol: str = "SOLUSDT", leverage: int = 10, use_llm: bool = True):
         self.symbol = symbol
         self.feed = BinanceDataFeed()
         self.wallet = Wallet(symbol=symbol, leverage=leverage)
         self.risk = RiskManager()
         self.journal = TradeJournal()
         self.use_llm = use_llm
-        self.use_ws = use_ws
         self.cb = LLMCircuitBreaker()
         self.advisor = OllamaAdvisor(timeout=15) if use_llm else None
-        self.ticker = RealtimeTicker(symbol=symbol) if use_ws else None
-        if self.ticker:
-            self.ticker.start()
+        self.ticker = RealtimeTicker(symbol=symbol)
+        self.ticker.start()
 
     def run_once(self):
         df4h = self.feed.get_klines(self.symbol, "4h", 200)
@@ -38,7 +36,7 @@ class TradingEngine:
         if setup and self.risk.can_trade():
             final_score = setup["score"] * (1-llm_weight) + llm_conf * llm_weight
             if final_score >= 0.75 and self.wallet.position is None:
-                mark = self.ticker.last_price if self.ticker and self.ticker.last_price is not None else self.feed.get_mark_price(self.symbol)
+                mark = self.ticker.last_price if self.ticker.last_price is not None else self.feed.get_mark_price(self.symbol)
                 side = PositionSide.LONG if setup["action"] == "LONG" else PositionSide.SHORT
                 self.wallet.open_position(side, mark, margin=50.0)
                 self.risk.record_open()
@@ -53,9 +51,8 @@ def main():
     p.add_argument("--tick", type=int, default=300)
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("--leverage", type=int, default=10)
-    p.add_argument("--use-ws", action="store_true", help="Use Binance websocket bookTicker for near-realtime LTP")
     args = p.parse_args()
-    eng = TradingEngine(symbol=args.symbol, leverage=args.leverage, use_llm=not args.no_llm, use_ws=args.use_ws)
+    eng = TradingEngine(symbol=args.symbol, leverage=args.leverage, use_llm=not args.no_llm)
     if args.loop:
         while True:
             eng.run_once(); time.sleep(args.tick)
