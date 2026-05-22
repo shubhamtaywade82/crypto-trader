@@ -13,6 +13,7 @@ import threading
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Literal, Tuple, Callable
+from typing import Protocol
 from pathlib import Path
 from enum import Enum
 from decimal import Decimal, getcontext
@@ -310,6 +311,8 @@ class EnhancedFuturesWallet:
         taker_fee_rate: float = 0.0005,
         maintenance_margin_ratio: float = 0.005,
         now_ms_fn: Optional[Callable[[], int]] = None,
+        halt_on_invariant_violation: bool = False,
+        event_hook: Optional[Callable[[dict], None]] = None,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -321,6 +324,9 @@ class EnhancedFuturesWallet:
         self.taker_fee_rate = self._to_decimal(taker_fee_rate)
         self.maintenance_margin_ratio = self._to_decimal(maintenance_margin_ratio)
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
+        self.halt_on_invariant_violation = halt_on_invariant_violation
+        self.event_hook = event_hook
+        self.halted = False
         safe_ns = self._sanitize_path_component(self.state_namespace)
         safe_symbol = self._sanitize_path_component(self.symbol)
         self.state_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.json"
@@ -875,10 +881,17 @@ class EnhancedFuturesWallet:
         }
         self._persist_domain_event_to_db(event)
         self.reducer.apply(self._runtime_reducer_state, event)
+        if self.event_hook:
+            try:
+                self.event_hook(event)
+            except Exception:
+                pass
         self.wallet_balance = self._runtime_reducer_state.wallet_balance
         self.realized_pnl_total = self._runtime_reducer_state.realized_pnl_total
         self._sync_orders_from_reducer()
         self._sync_fills_from_reducer()
+        if event_type == "INVARIANT_VIOLATION" and self.halt_on_invariant_violation:
+            self.halted = True
 
     def _sync_positions_from_reducer(self):
         """Align runtime open positions with reducer-authoritative open_positions."""
@@ -1046,6 +1059,8 @@ class EnhancedFuturesWallet:
 
     def evaluate_pending_orders(self, symbol: str, mark_price: float):
         with self.lock:
+            if self.halted:
+                return
             price = self._to_decimal(mark_price)
             for order in list(self.orders.values()):
                 if order.symbol != symbol or order.status != OrderStatus.PENDING:
@@ -1060,6 +1075,14 @@ class EnhancedFuturesWallet:
                             {"order_id": order.id, "reason": "REDUCE_ONLY_WITHOUT_POSITION"},
                         )
                         continue
+                    if order.reduce_only:
+                        pos = self.get_open_position(symbol)
+                        if pos and pos.side == order.side:
+                            self._emit_event(
+                                "ORDER_REJECTED",
+                                {"order_id": order.id, "reason": "REDUCE_ONLY_EXPOSURE_INCREASE"},
+                            )
+                            continue
                     fill_price = self._execution_price(price, order.side, is_entry=True)
                     remaining = max(Decimal("0"), order.quantity - order.filled_quantity)
                     if remaining > Decimal("0"):
@@ -1131,6 +1154,21 @@ class EnhancedFuturesWallet:
         if now - last_ts < int(interval_ms):
             return Decimal("0")
         return self.apply_funding(symbol, self._to_decimal(funding_rate))
+
+    def run_housekeeping(
+        self,
+        symbol: str,
+        mark_price: float,
+        funding_rate: Optional[Decimal] = None,
+        funding_interval_ms: Optional[int] = None,
+    ):
+        """Run operational safety and periodic tasks in one call."""
+        with self.lock:
+            if self.halted:
+                return
+        self.evaluate_pending_orders(symbol, mark_price)
+        if funding_rate is not None and funding_interval_ms is not None:
+            self.run_funding_scheduler(symbol, funding_rate, funding_interval_ms)
 
     def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal, sequence: int = 1):
         prospective_filled = order.filled_quantity + quantity

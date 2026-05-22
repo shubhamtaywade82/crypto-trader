@@ -154,3 +154,29 @@ def test_funding_scheduler_interval_and_snapshot_boot(tmp_path, monkeypatch):
     # new instance should load from db snapshot path without crashing
     w2 = EnhancedFuturesWallet(symbol=w.symbol, state_namespace=w.state_namespace)
     assert w2.wallet_balance == w.wallet_balance
+
+
+def test_reduce_only_rejects_exposure_increase_and_halt_policy(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    events = []
+    w = _fresh_wallet("AVAXUSDT")
+    w.event_hook = lambda e: events.append(e)
+    w.halt_on_invariant_violation = True
+    w.open_position("AVAXUSDT", _setup(side=PositionSide.LONG), mark_price=100)
+    ro = w.place_pending_order(
+        symbol="AVAXUSDT",
+        side=PositionSide.LONG,
+        quantity=Decimal("1"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("99"),
+        reduce_only=True,
+    )
+    w.evaluate_pending_orders("AVAXUSDT", mark_price=99)
+    assert w.orders[ro.id].status.value == "REJECTED"
+
+    # force an invariant violation and verify halt behavior
+    o = next(iter(w.orders.values()))
+    o.filled_quantity = o.quantity + Decimal("1")
+    w._run_invariant_checks()
+    assert w.halted is True
+    assert any(e.get("event_type") == "INVARIANT_VIOLATION" for e in events)
