@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("telegram_bot")
 
+# Suppress verbose httpx logs (polling)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 class TelegramService:
     def __init__(self, token: str, chat_id: str, event_bus: EventBus):
         self.token = token
@@ -50,7 +53,7 @@ class TelegramService:
         self.event_bus.subscribe(RegimeChangeEvent, self._handle_event)
 
         logger.info("Telegram Bot initialized and subscribed to EventBus")
-        self.app.run_polling(close_loop=False)
+        self.app.run_polling(close_loop=False, stop_signals=False)
 
     def _handle_event(self, event: Event):
         """Bridge sync EventBus to async Telegram broadcasting."""
