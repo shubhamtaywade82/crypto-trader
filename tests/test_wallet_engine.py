@@ -140,3 +140,17 @@ def test_funding_event_and_reduce_only_rejection(tmp_path, monkeypatch):
     w2.open_position("DOGEUSDT", _setup(), mark_price=100)
     amt = w2.apply_funding("DOGEUSDT", Decimal("0.0001"))
     assert amt != Decimal("0")
+
+
+def test_funding_scheduler_interval_and_snapshot_boot(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("LTCUSDT")
+    w.open_position("LTCUSDT", _setup(), mark_price=100)
+    a1 = w.run_funding_scheduler("LTCUSDT", Decimal("0.0001"), interval_ms=1000, now_ms=1_000_000)
+    a2 = w.run_funding_scheduler("LTCUSDT", Decimal("0.0001"), interval_ms=1000, now_ms=1_000_500)
+    assert a1 != Decimal("0")
+    assert a2 == Decimal("0")
+    w._save_state()
+    # new instance should load from db snapshot path without crashing
+    w2 = EnhancedFuturesWallet(symbol=w.symbol, state_namespace=w.state_namespace)
+    assert w2.wallet_balance == w.wallet_balance

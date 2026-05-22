@@ -90,6 +90,7 @@ class PortfolioState:
     fills: List[dict] = field(default_factory=list)
     funding_total: Decimal = Decimal("0")
     violations: List[dict] = field(default_factory=list)
+    last_ts: int = 0
 
 class PortfolioReducer:
     """Canonical event reducer for replay-derived portfolio state."""
@@ -97,6 +98,7 @@ class PortfolioReducer:
     def apply(self, state: PortfolioState, event: dict):
         et = event.get("event_type")
         payload = event.get("payload", {})
+        state.last_ts = int(event.get("ts", state.last_ts))
 
         if et == "ORDER_CREATED":
             oid = payload.get("order_id")
@@ -876,6 +878,7 @@ class EnhancedFuturesWallet:
         self.wallet_balance = self._runtime_reducer_state.wallet_balance
         self.realized_pnl_total = self._runtime_reducer_state.realized_pnl_total
         self._sync_orders_from_reducer()
+        self._sync_fills_from_reducer()
 
     def _sync_positions_from_reducer(self):
         """Align runtime open positions with reducer-authoritative open_positions."""
@@ -947,6 +950,27 @@ class EnhancedFuturesWallet:
                     avg_fill_price=odata.get("avg_fill_price", Decimal("0")),
                 )
         self.orders = synced
+
+    def _sync_fills_from_reducer(self):
+        """Align runtime fills from reducer-authoritative fill event stream."""
+        converted: List[Fill] = []
+        for f in self._runtime_reducer_state.fills:
+            try:
+                converted.append(
+                    Fill(
+                        order_id=f.get("order_id"),
+                        symbol=f.get("symbol", self.symbol),
+                        side=PositionSide(f.get("side", "LONG")),
+                        quantity=self._to_decimal(f.get("quantity", "0")),
+                        fill_price=self._to_decimal(f.get("fill_price", "0")),
+                        fee=self._to_decimal(f.get("fee", "0")),
+                        timestamp=int(f.get("ts", self._now_ms())),
+                        sequence=int(f.get("sequence", 1)),
+                    )
+                )
+            except Exception:
+                continue
+        self.fills = converted
 
     def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
         return self._create_order_with_type(
@@ -1081,7 +1105,7 @@ class EnhancedFuturesWallet:
             if o.filled_quantity > o.quantity:
                 self._emit_event(
                     "INVARIANT_VIOLATION",
-                    {"type": "ORDER_OVERFILLED", "order_id": o.id, "filled": o.filled_quantity, "qty": o.quantity},
+                    {"type": "ORDER_OVERFILLED", "severity": "CRITICAL", "order_id": o.id, "filled": o.filled_quantity, "qty": o.quantity},
                 )
         # 2) remaining qty >= 0
         for o in self.orders.values():
@@ -1089,8 +1113,24 @@ class EnhancedFuturesWallet:
             if remaining < Decimal("0"):
                 self._emit_event(
                     "INVARIANT_VIOLATION",
-                    {"type": "NEGATIVE_REMAINING_QTY", "order_id": o.id, "remaining": remaining},
+                    {"type": "NEGATIVE_REMAINING_QTY", "severity": "CRITICAL", "order_id": o.id, "remaining": remaining},
                 )
+        # 3) available margin >= 0
+        if self.available_balance < Decimal("0"):
+            self._emit_event(
+                "INVARIANT_VIOLATION",
+                {"type": "NEGATIVE_AVAILABLE_MARGIN", "severity": "CRITICAL", "available": self.available_balance},
+            )
+
+    def run_funding_scheduler(self, symbol: str, funding_rate: Decimal, interval_ms: int, now_ms: Optional[int] = None) -> Decimal:
+        """Apply funding if interval has elapsed since last application for symbol."""
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with sqlite3.connect(self.db_file) as conn:
+            row = conn.execute("SELECT MAX(ts) FROM funding WHERE symbol = ?", (symbol,)).fetchone()
+            last_ts = int(row[0]) if row and row[0] is not None else 0
+        if now - last_ts < int(interval_ms):
+            return Decimal("0")
+        return self.apply_funding(symbol, self._to_decimal(funding_rate))
 
     def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal, sequence: int = 1):
         prospective_filled = order.filled_quantity + quantity
@@ -1234,6 +1274,8 @@ class EnhancedFuturesWallet:
             )
 
     def _load_state(self):
+        if self._load_from_db_snapshot_and_replay():
+            return
         if not self.state_file.exists():
             return
         try:
@@ -1253,6 +1295,42 @@ class EnhancedFuturesWallet:
             logger.info(f"Loaded wallet state from {self.state_file}")
         except Exception as e:
             logger.warning(f"Failed to load state: {e}")
+
+    def _load_from_db_snapshot_and_replay(self) -> bool:
+        if not self.db_file.exists():
+            return False
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                row = conn.execute(
+                    "SELECT ts, wallet_balance, realized_pnl_total, state_json FROM snapshots ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+            if not row:
+                return False
+            snap_ts, wallet_balance, realized_pnl_total, state_json = row
+            snap = json.loads(state_json)
+            self.wallet_balance = self._to_decimal(wallet_balance)
+            self.realized_pnl_total = self._to_decimal(realized_pnl_total)
+            self.positions = {
+                s: EnhancedPosition.from_dict(d)
+                for s, d in snap.get("positions", {}).items()
+                if d.get("status") == "OPEN"
+            }
+            self.position_history = snap.get("position_history", [])
+            replay_state = PortfolioState(wallet_balance=self.wallet_balance, realized_pnl_total=self.realized_pnl_total)
+            for event in self._iter_events():
+                if int(event.get("ts", 0)) > int(snap_ts):
+                    self.reducer.apply(replay_state, event)
+            self._runtime_reducer_state = replay_state
+            self.wallet_balance = replay_state.wallet_balance
+            self.realized_pnl_total = replay_state.realized_pnl_total
+            self._sync_positions_from_reducer()
+            self._sync_orders_from_reducer()
+            self._sync_fills_from_reducer()
+            self._sync_unrealized_total()
+            return True
+        except Exception as e:
+            logger.warning(f"DB snapshot/replay load failed: {e}")
+            return False
 
     def _load_state_with_recovery(self) -> dict:
         try:
