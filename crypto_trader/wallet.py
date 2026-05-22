@@ -716,6 +716,9 @@ class EnhancedFuturesWallet:
             "position_history": self.position_history,
         }
         self._atomic_write_json(self.state_file, state)
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute("INSERT INTO snapshots (ts, wallet_balance, realized_pnl_total, state_json) VALUES (?, ?, ?, ?)", (self._now_ms(), str(self.wallet_balance), str(self.realized_pnl_total), json.dumps(state, default=self._serialize_decimals)))
+            conn.commit()
 
     def _atomic_write_json(self, path: Path, state: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -752,6 +755,65 @@ class EnhancedFuturesWallet:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                filled_quantity TEXT NOT NULL,
+                avg_fill_price TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reduce_only INTEGER NOT NULL DEFAULT 0,
+                trigger_price TEXT,
+                limit_price TEXT,
+                expires_at INTEGER,
+                updated_ts INTEGER NOT NULL
+            )
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                fill_price TEXT NOT NULL,
+                fee TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                sequence INTEGER NOT NULL
+            )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id)")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS funding (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                rate TEXT NOT NULL,
+                notional TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                ts INTEGER NOT NULL
+            )
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS fees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                reason TEXT,
+                amount TEXT NOT NULL,
+                ts INTEGER NOT NULL
+            )
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                wallet_balance TEXT NOT NULL,
+                realized_pnl_total TEXT NOT NULL,
+                state_json TEXT NOT NULL
+            )
+            """)
             conn.commit()
 
     def _append_event_db(self, event: dict):
@@ -809,6 +871,7 @@ class EnhancedFuturesWallet:
             "namespace": self.state_namespace,
             "payload": payload,
         }
+        self._persist_domain_event_to_db(event)
         self.reducer.apply(self._runtime_reducer_state, event)
         self.wallet_balance = self._runtime_reducer_state.wallet_balance
         self.realized_pnl_total = self._runtime_reducer_state.realized_pnl_total
@@ -1115,6 +1178,48 @@ class EnhancedFuturesWallet:
             last_ts = ts
             self.reducer.apply(state, event)
         return state
+
+
+    def _persist_domain_event_to_db(self, event: dict):
+        et = event.get("event_type")
+        payload = event.get("payload", {})
+        ts = int(event.get("ts", self._now_ms()))
+        with sqlite3.connect(self.db_file) as conn:
+            if et == "ORDER_CREATED":
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO orders
+                    (order_id, symbol, side, order_type, quantity, filled_quantity, avg_fill_price, status, reduce_only, trigger_price, limit_price, expires_at, updated_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload.get("order_id"), payload.get("symbol"), payload.get("side"), payload.get("order_type", "MARKET"),
+                        str(payload.get("quantity", "0")), "0", "0", payload.get("status", "NEW"),
+                        1 if payload.get("reduce_only", False) else 0,
+                        str(payload.get("trigger_price")) if payload.get("trigger_price") is not None else None,
+                        str(payload.get("limit_price")) if payload.get("limit_price") is not None else None,
+                        payload.get("expires_at"), ts,
+                    ),
+                )
+            elif et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED", "ORDER_CANCELLED", "ORDER_REJECTED", "ORDER_EXPIRED"):
+                oid = payload.get("order_id")
+                if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+                    conn.execute(
+                        "INSERT INTO fills (order_id, symbol, side, quantity, fill_price, fee, ts, sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (oid, payload.get("symbol"), payload.get("side"), str(payload.get("quantity", "0")), str(payload.get("fill_price", "0")), str(payload.get("fee", "0")), ts, int(payload.get("sequence", 1))),
+                    )
+                row = conn.execute("SELECT quantity, filled_quantity FROM orders WHERE order_id = ?", (oid,)).fetchone()
+                if row:
+                    qty = Decimal(str(row[0])); filled = Decimal(str(row[1]))
+                    if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+                        filled += Decimal(str(payload.get("quantity", "0")))
+                    status = payload.get("status") or ("CANCELLED" if et=="ORDER_CANCELLED" else "REJECTED" if et=="ORDER_REJECTED" else "EXPIRED" if et=="ORDER_EXPIRED" else "FILLED")
+                    conn.execute("UPDATE orders SET filled_quantity=?, avg_fill_price=?, status=?, updated_ts=? WHERE order_id=?", (str(filled), str(payload.get("fill_price", "0")), status, ts, oid))
+            elif et == "FUNDING_APPLIED":
+                conn.execute("INSERT INTO funding (symbol, rate, notional, amount, ts) VALUES (?, ?, ?, ?, ?)", (payload.get("symbol"), str(payload.get("rate", "0")), str(payload.get("notional", "0")), str(payload.get("amount", "0")), ts))
+            elif et == "FEE_CHARGED":
+                conn.execute("INSERT INTO fees (symbol, reason, amount, ts) VALUES (?, ?, ?, ?)", (payload.get("symbol"), payload.get("reason"), str(payload.get("amount", "0")), ts))
+            conn.commit()
 
     @staticmethod
     def _sanitize_path_component(value: str) -> str:
