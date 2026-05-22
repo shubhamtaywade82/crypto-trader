@@ -196,3 +196,34 @@ def test_event_observability_helpers(tmp_path, monkeypatch):
 
     recent_fills = w.get_recent_events(limit=10, event_type="ORDER_FILLED")
     assert len(recent_fills) >= 1
+
+
+def test_runtime_equals_replay_after_lifecycle_sequence(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("ATOMUSDT")
+    setup = _setup()
+    setup["fill_chunks"] = 3
+    w.open_position("ATOMUSDT", setup, mark_price=100)
+    w.partial_close("ATOMUSDT", mark_price=103, pct=Decimal("0.25"), reason="P1")
+    w.evaluate_pending_orders("ATOMUSDT", mark_price=101)
+    w.apply_funding("ATOMUSDT", Decimal("0.0001"))
+    w.close_position("ATOMUSDT", mark_price=104, reason="FINAL")
+
+    replay = w.replay_portfolio_state()
+    assert replay.wallet_balance + Decimal("1000") == w.wallet_balance
+    assert replay.realized_pnl_total == w.realized_pnl_total
+    assert len(replay.open_positions) == len([p for p in w.positions.values() if p.status == "OPEN"])
+
+
+def test_restart_recovery_matches_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("LINKUSDT")
+    w.open_position("LINKUSDT", _setup(), mark_price=100)
+    w.partial_close("LINKUSDT", mark_price=102, pct=Decimal("0.5"), reason="P1")
+    w.run_funding_scheduler("LINKUSDT", Decimal("0.0001"), interval_ms=1, now_ms=10_000)
+    replay_before = w.replay_portfolio_state()
+    w._save_state()
+
+    w2 = EnhancedFuturesWallet(symbol=w.symbol, state_namespace=w.state_namespace)
+    assert w2.wallet_balance == replay_before.wallet_balance + Decimal("1000")
+    assert w2.realized_pnl_total == replay_before.realized_pnl_total
