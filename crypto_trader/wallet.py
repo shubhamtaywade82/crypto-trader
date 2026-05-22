@@ -10,6 +10,7 @@ import os
 import time
 import logging
 import threading
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Literal, Tuple, Callable
 from pathlib import Path
@@ -277,6 +278,7 @@ class EnhancedFuturesWallet:
         self.state_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.json"
         self.backup_state_file = self.state_file.with_suffix(".bak.json")
         self.events_file = DATA_DIR / f"wallet_events_{safe_ns}_{safe_symbol}.jsonl"
+        self.db_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.db"
 
         self.wallet_balance: Decimal = self._to_decimal(initial_balance)
         self.unrealized_pnl_total: Decimal = Decimal("0")
@@ -287,6 +289,7 @@ class EnhancedFuturesWallet:
         self.fills: List[Fill] = []
         self.reducer = PortfolioReducer()
         self.lock = threading.RLock()
+        self._init_db()
 
         self._load_state()
 
@@ -679,6 +682,58 @@ class EnhancedFuturesWallet:
 
         temp_path.replace(path)
 
+
+    def _init_db(self):
+        self.db_file.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                symbol TEXT,
+                namespace TEXT,
+                payload_json TEXT NOT NULL
+            )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
+            conn.commit()
+
+    def _append_event_db(self, event: dict):
+        payload_json = json.dumps(event.get("payload", {}), default=self._serialize_decimals)
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
+                "INSERT INTO events (ts, event_type, symbol, namespace, payload_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    int(event.get("ts", 0)),
+                    event.get("event_type"),
+                    event.get("symbol"),
+                    event.get("namespace"),
+                    payload_json,
+                ),
+            )
+            conn.commit()
+
+    def _iter_events(self):
+        if self.db_file.exists():
+            with sqlite3.connect(self.db_file) as conn:
+                rows = conn.execute(
+                    "SELECT ts, event_type, symbol, namespace, payload_json FROM events ORDER BY ts ASC, id ASC"
+                ).fetchall()
+            for ts, et, sym, ns, payload_json in rows:
+                yield {"ts": ts, "event_type": et, "symbol": sym, "namespace": ns, "payload": json.loads(payload_json)}
+            return
+
+        if self.events_file.exists():
+            with open(self.events_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        yield json.loads(line)
+
     def _append_event(self, event_type: str, payload: dict):
         event = {
             "ts": self._now_ms(),
@@ -690,6 +745,7 @@ class EnhancedFuturesWallet:
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=self._serialize_decimals) + "\n")
+        self._append_event_db(event)
 
     def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
         order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
@@ -749,17 +805,13 @@ class EnhancedFuturesWallet:
         event_count = 0
         order_count = 0
         fill_count = 0
-        with open(self.events_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                event_count += 1
-                et = event.get("event_type")
-                if et == "ORDER_CREATED":
-                    order_count += 1
-                elif et == "ORDER_FILLED":
-                    fill_count += 1
+        for event in self._iter_events():
+            event_count += 1
+            et = event.get("event_type")
+            if et == "ORDER_CREATED":
+                order_count += 1
+            elif et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+                fill_count += 1
         return {"event_count": event_count, "order_count": order_count, "fill_count": fill_count}
 
     def replay_portfolio_state(self) -> PortfolioState:
@@ -770,20 +822,16 @@ class EnhancedFuturesWallet:
 
         last_ts = -1
         seen = set()
-        with open(self.events_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                fingerprint = json.dumps(event, sort_keys=True, default=str)
-                if fingerprint in seen:
-                    continue
-                seen.add(fingerprint)
-                ts = int(event.get("ts", 0))
-                if ts < last_ts:
-                    raise ValueError("Out-of-order event stream detected")
-                last_ts = ts
-                self.reducer.apply(state, event)
+        for event in self._iter_events():
+            fingerprint = json.dumps(event, sort_keys=True, default=str)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            ts = int(event.get("ts", 0))
+            if ts < last_ts:
+                raise ValueError("Out-of-order event stream detected")
+            last_ts = ts
+            self.reducer.apply(state, event)
         return state
 
     @staticmethod
@@ -805,9 +853,9 @@ class EnhancedFuturesWallet:
             state = self._load_state_with_recovery()
             self.wallet_balance = self._to_decimal(state.get("wallet_balance", self.wallet_balance))
             self.realized_pnl_total = self._to_decimal(state.get("realized_pnl_total", Decimal("0")))
-            self.maker_fee_rate = state.get("maker_fee_rate", self.maker_fee_rate)
-            self.taker_fee_rate = state.get("taker_fee_rate", self.taker_fee_rate)
-            self.maintenance_margin_ratio = state.get("maintenance_margin_ratio", self.maintenance_margin_ratio)
+            self.maker_fee_rate = self._to_decimal(state.get("maker_fee_rate", self.maker_fee_rate))
+            self.taker_fee_rate = self._to_decimal(state.get("taker_fee_rate", self.taker_fee_rate))
+            self.maintenance_margin_ratio = self._to_decimal(state.get("maintenance_margin_ratio", self.maintenance_margin_ratio))
             self.positions = {
                 s: EnhancedPosition.from_dict(d)
                 for s, d in state.get("positions", {}).items()
