@@ -390,9 +390,11 @@ class WebSocketPositionManager:
         wallet,
         check_interval_ms: int = 1000,  # Check every 1s
         wick_buffer_size: int = 5,       # 5 samples = 5s
+        event_bus=None,
     ):
         self.ws = ws_feed
         self.wallet = wallet
+        self.event_bus = event_bus
         self.symbol = self.ws.symbol.upper()
         self.check_interval_ms = check_interval_ms
         self.wick_buffer = deque(maxlen=wick_buffer_size)
@@ -485,7 +487,19 @@ class WebSocketPositionManager:
         # 1. Catastrophic SL
         cat_sl = pos.margin_used * self.wallet.catastrophic_sl_pct
         if pnl <= cat_sl:
-            self.wallet.close_position(self.symbol, data.mark_price, f"CATASTROPHIC_SL ({pnl:.2f})")
+            reason = f"CATASTROPHIC_SL ({pnl:.2f})"
+            closed_pos = self.wallet.close_position(self.symbol, data.mark_price, reason)
+            if closed_pos and self.event_bus:
+                from .events import TradeClosedEvent
+                self.event_bus.publish(TradeClosedEvent(
+                    symbol=self.symbol,
+                    side=closed_pos.side.value,
+                    realized_pnl=closed_pos.realized_pnl,
+                    pnl_percent=(closed_pos.realized_pnl / closed_pos.margin_used * 100) if closed_pos.margin_used > 0 else 0,
+                    exit_price=data.mark_price,
+                    reason=reason,
+                    duration_minutes=(time.time() - closed_pos.entry_time) / 60 if hasattr(closed_pos, 'entry_time') else 0
+                ))
             return
 
         # 2. Playbook-specific exits
@@ -500,17 +514,21 @@ class WebSocketPositionManager:
         # Simple TP/SL using mid price
         if pos.side == PositionSide.LONG:
             if price >= pos.tp_levels[0]["price"]:
-                self.wallet.close_position(self.symbol, price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
+                reason = f"TP_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
             if price <= pos.sl_price:
-                self.wallet.close_position(self.symbol, price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+                reason = f"SL_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
         else:
             if price <= pos.tp_levels[0]["price"]:
-                self.wallet.close_position(self.symbol, price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
+                reason = f"TP_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
             if price >= pos.sl_price:
-                self.wallet.close_position(self.symbol, price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+                reason = f"SL_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
 
         # Time stop (using candle time from WS kline)
@@ -543,10 +561,10 @@ class WebSocketPositionManager:
 
         # SL check
         if pos.side == PositionSide.LONG and price_sl_tp <= pos.sl_price:
-            self.wallet.close_position(self.symbol, price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            self._handle_close(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
         elif pos.side == PositionSide.SHORT and price_sl_tp >= pos.sl_price:
-            self.wallet.close_position(self.symbol, price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            self._handle_close(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
 
         # Trailing stop using LTP (more reactive to momentum)
@@ -557,7 +575,7 @@ class WebSocketPositionManager:
                 pos._highest_since_tp2 = max(pos._highest_since_tp2, price_trail)
                 trail_price = pos._highest_since_tp2 * 0.995  # 0.5% trail
                 if price_trail < trail_price:
-                    self.wallet.close_position(self.symbol, price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
+                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
                     return
             else:
                 if not hasattr(pos, '_lowest_since_tp2'):
@@ -565,5 +583,20 @@ class WebSocketPositionManager:
                 pos._lowest_since_tp2 = min(pos._lowest_since_tp2, price_trail)
                 trail_price = pos._lowest_since_tp2 * 1.005
                 if price_trail > trail_price:
-                    self.wallet.close_position(self.symbol, price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
+                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
                     return
+    
+    def _handle_close(self, price: float, reason: str):
+        """Internal helper to close position and publish event."""
+        closed_pos = self.wallet.close_position(self.symbol, price, reason)
+        if closed_pos and self.event_bus:
+            from .events import TradeClosedEvent
+            self.event_bus.publish(TradeClosedEvent(
+                symbol=self.symbol,
+                side=closed_pos.side.value,
+                realized_pnl=closed_pos.realized_pnl,
+                pnl_percent=(closed_pos.realized_pnl / closed_pos.margin_used * 100) if closed_pos.margin_used > 0 else 0,
+                exit_price=price,
+                reason=reason,
+                duration_minutes=(time.time() - closed_pos.entry_time) / 60 if hasattr(closed_pos, 'entry_time') else 0
+            ))

@@ -1,11 +1,19 @@
 import argparse
 import time
 import threading
+import os
 from typing import List
 import logging
+from dotenv import load_dotenv
+
 from crypto_trader.engine_ws import WebSocketTradingEngine
 from crypto_trader.wallet import EnhancedFuturesWallet
 from crypto_trader.logger_config import configure_colored_logging
+from crypto_trader.events import bus
+from crypto_trader.telegram_bot import TelegramService
+
+# Load environment variables for Telegram
+load_dotenv()
 
 configure_colored_logging()
 logger = logging.getLogger("multi_engine")
@@ -47,6 +55,16 @@ def main():
     # Create one shared wallet for all engines
     global_wallet = EnhancedFuturesWallet(symbol="GLOBAL", initial_balance=total_balance, leverage=args.leverage)
     
+    # Initialize Telegram Service if token is available
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if telegram_token and telegram_chat_id:
+        tg_service = TelegramService(telegram_token, telegram_chat_id, bus)
+        tg_service.start()
+        logger.info("Telegram notification service started")
+    else:
+        logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing. Notifications disabled.")
+
     # Divide total balance equally among symbols to prevent overallocation
     per_symbol_balance = total_balance / len(symbols)
 
@@ -64,6 +82,7 @@ def main():
             log_rest=args.log_rest,
             log_ws=args.log_ws,
             log_llm=args.log_llm,
+            event_bus=bus,
         )
         engines.append(engine)
         
