@@ -292,6 +292,10 @@ class EnhancedFuturesWallet:
         self._init_db()
 
         self._load_state()
+        self._runtime_reducer_state = PortfolioState(
+            wallet_balance=self.wallet_balance,
+            realized_pnl_total=self.realized_pnl_total,
+        )
 
     @property
     def margin_balance(self) -> float:
@@ -380,8 +384,7 @@ class EnhancedFuturesWallet:
                 time_stop_hours=setup.get("time_stop_hours", 18),
             )
             pos.update_pnl(mark_price)
-            self.wallet_balance -= fee_open
-            self.realized_pnl_total -= fee_open
+            self._emit_event("FEE_CHARGED", {"amount": fee_open, "reason": "OPEN_FEE", "symbol": symbol})
             self.positions[symbol] = pos
             self._sync_unrealized_total()
 
@@ -391,7 +394,7 @@ class EnhancedFuturesWallet:
                 f"SL={sl_price:.2f} | TP={tp_levels}"
             )
             self._save_state()
-            self._append_event(
+            self._emit_event(
                 "POSITION_OPENED",
                 {
                     "symbol": symbol,
@@ -431,19 +434,7 @@ class EnhancedFuturesWallet:
             fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
 
             # Credit the slice immediately (net fees)
-            self.wallet_balance += (pnl_slice - fee_close)
-            self.realized_pnl_total += (pnl_slice - fee_close)
-
-            logger.info(
-                f"[PARTIAL CLOSE] {symbol} {pos.side.value} | Closed {pct*100:.0f}% | "
-                f"Qty={qty_to_close:.4f} | PnL={pnl_slice:.2f} | Reason={reason}"
-            )
-
-            if pos.remaining_quantity <= Decimal("0.0001"):
-                return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
-
-            self._save_state()
-            self._append_event(
+            self._emit_event(
                 "POSITION_PARTIALLY_CLOSED",
                 {
                     "symbol": symbol,
@@ -454,6 +445,16 @@ class EnhancedFuturesWallet:
                     "fee": fee_close,
                 },
             )
+
+            logger.info(
+                f"[PARTIAL CLOSE] {symbol} {pos.side.value} | Closed {pct*100:.0f}% | "
+                f"Qty={qty_to_close:.4f} | PnL={pnl_slice:.2f} | Reason={reason}"
+            )
+
+            if pos.remaining_quantity <= Decimal("0.0001"):
+                return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
+
+            self._save_state()
             return pnl_slice
 
     def close_position(self, symbol: str, mark_price: float, reason: str) -> Optional[EnhancedPosition]:
@@ -470,8 +471,17 @@ class EnhancedFuturesWallet:
             fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
 
             # Credit remaining PnL
-            self.wallet_balance += (remaining_pnl - fee_close)
-            self.realized_pnl_total += (remaining_pnl - fee_close)
+            self._emit_event(
+                "POSITION_CLOSED",
+                {
+                    "symbol": symbol,
+                    "side": pos.side.value,
+                    "close_price": execution_price,
+                    "fee": fee_close,
+                    "reason": reason,
+                    "remaining_pnl": remaining_pnl,
+                },
+            )
 
             pos.unrealized_pnl = Decimal("0")
             pos.status = "CLOSED"
@@ -488,17 +498,6 @@ class EnhancedFuturesWallet:
                 f"Total Trade PnL={pos.partial_realized_pnl + remaining_pnl:.2f} | Reason={reason}"
             )
             self._save_state()
-            self._append_event(
-                "POSITION_CLOSED",
-                {
-                    "symbol": symbol,
-                    "side": pos.side.value,
-                    "close_price": execution_price,
-                    "fee": fee_close,
-                    "reason": reason,
-                    "remaining_pnl": remaining_pnl,
-                },
-            )
             return pos
 
     def update_positions(
@@ -746,6 +745,20 @@ class EnhancedFuturesWallet:
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=self._serialize_decimals) + "\n")
         self._append_event_db(event)
+
+    def _emit_event(self, event_type: str, payload: dict):
+        """Authoritative runtime transition: append event, then apply reducer-derived runtime updates."""
+        self._append_event(event_type, payload)
+        event = {
+            "ts": self._now_ms(),
+            "event_type": event_type,
+            "symbol": self.symbol,
+            "namespace": self.state_namespace,
+            "payload": payload,
+        }
+        self.reducer.apply(self._runtime_reducer_state, event)
+        self.wallet_balance = self._runtime_reducer_state.wallet_balance
+        self.realized_pnl_total = self._runtime_reducer_state.realized_pnl_total
 
     def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
         order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
