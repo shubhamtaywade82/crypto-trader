@@ -79,6 +79,89 @@ class PortfolioState:
     orders: Dict[str, dict] = field(default_factory=dict)
     fills: List[dict] = field(default_factory=list)
 
+class PortfolioReducer:
+    """Canonical event reducer for replay-derived portfolio state."""
+
+    def apply(self, state: PortfolioState, event: dict):
+        et = event.get("event_type")
+        payload = event.get("payload", {})
+
+        if et == "ORDER_CREATED":
+            oid = payload.get("order_id")
+            if oid:
+                state.orders[oid] = {
+                    "symbol": payload.get("symbol"),
+                    "side": payload.get("side"),
+                    "quantity": Decimal(str(payload.get("quantity", "0"))),
+                    "filled_quantity": Decimal("0"),
+                    "status": payload.get("status", OrderStatus.NEW.value),
+                }
+            return
+
+        if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+            oid = payload.get("order_id")
+            fill_qty = Decimal(str(payload.get("quantity", "0")))
+            fee = Decimal(str(payload.get("fee", "0")))
+            if oid and oid in state.orders:
+                order_ref = state.orders[oid]
+                order_ref["filled_quantity"] += fill_qty
+                order_ref["status"] = payload.get("status", OrderStatus.FILLED.value)
+            state.fills.append(payload)
+            state.wallet_balance -= fee
+            state.realized_pnl_total -= fee
+            return
+
+        if et == "ORDER_CANCELLED":
+            oid = payload.get("order_id")
+            if oid and oid in state.orders:
+                state.orders[oid]["status"] = OrderStatus.CANCELLED.value
+            return
+
+        if et == "ORDER_REJECTED":
+            oid = payload.get("order_id")
+            if oid and oid in state.orders:
+                state.orders[oid]["status"] = OrderStatus.REJECTED.value
+            return
+
+        if et == "POSITION_OPENED":
+            symbol = payload.get("symbol")
+            if symbol:
+                state.open_positions[symbol] = {
+                    "entry_price": Decimal(str(payload.get("execution_price", payload.get("entry_price", "0")))),
+                    "quantity": Decimal(str(payload.get("quantity", "0"))),
+                    "margin": Decimal(str(payload.get("margin", "0"))),
+                }
+            return
+
+        if et == "POSITION_PARTIALLY_CLOSED":
+            pnl = Decimal(str(payload.get("pnl", "0")))
+            fee = Decimal(str(payload.get("fee", "0")))
+            state.wallet_balance += (pnl - fee)
+            state.realized_pnl_total += (pnl - fee)
+            return
+
+        if et in ("POSITION_CLOSED", "LIQUIDATION"):
+            symbol = payload.get("symbol")
+            pnl = Decimal(str(payload.get("remaining_pnl", "0")))
+            fee = Decimal(str(payload.get("fee", "0")))
+            state.wallet_balance += (pnl - fee)
+            state.realized_pnl_total += (pnl - fee)
+            if symbol in state.open_positions:
+                del state.open_positions[symbol]
+            return
+
+        if et == "FUNDING_APPLIED":
+            amt = Decimal(str(payload.get("amount", "0")))
+            state.wallet_balance += amt
+            state.realized_pnl_total += amt
+            return
+
+        if et == "FEE_CHARGED":
+            amt = Decimal(str(payload.get("amount", "0")))
+            state.wallet_balance -= amt
+            state.realized_pnl_total -= amt
+            return
+
 @dataclass
 class EnhancedPosition:
     symbol: str
@@ -202,6 +285,7 @@ class EnhancedFuturesWallet:
         self.position_history: List[dict] = []
         self.orders: Dict[str, Order] = {}
         self.fills: List[Fill] = []
+        self.reducer = PortfolioReducer()
         self.lock = threading.RLock()
 
         self._load_state()
@@ -684,68 +768,23 @@ class EnhancedFuturesWallet:
         if not self.events_file.exists():
             return state
 
+        last_ts = -1
+        seen = set()
         with open(self.events_file, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
                 event = json.loads(line)
-                self._apply_event_to_state(state, event)
+                fingerprint = json.dumps(event, sort_keys=True, default=str)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                ts = int(event.get("ts", 0))
+                if ts < last_ts:
+                    raise ValueError("Out-of-order event stream detected")
+                last_ts = ts
+                self.reducer.apply(state, event)
         return state
-
-    def _apply_event_to_state(self, state: PortfolioState, event: dict):
-        et = event.get("event_type")
-        payload = event.get("payload", {})
-
-        if et == "ORDER_CREATED":
-            oid = payload.get("order_id")
-            if oid:
-                state.orders[oid] = {
-                    "symbol": payload.get("symbol"),
-                    "side": payload.get("side"),
-                    "quantity": self._to_decimal(payload.get("quantity", "0")),
-                    "filled_quantity": Decimal("0"),
-                    "status": payload.get("status", OrderStatus.NEW.value),
-                }
-            return
-
-        if et == "ORDER_FILLED":
-            oid = payload.get("order_id")
-            fill_qty = self._to_decimal(payload.get("quantity", "0"))
-            fee = self._to_decimal(payload.get("fee", "0"))
-            if oid and oid in state.orders:
-                order_ref = state.orders[oid]
-                order_ref["filled_quantity"] += fill_qty
-                order_ref["status"] = payload.get("status", OrderStatus.FILLED.value)
-            state.fills.append(payload)
-            state.wallet_balance -= fee
-            state.realized_pnl_total -= fee
-            return
-
-        if et == "POSITION_OPENED":
-            symbol = payload.get("symbol")
-            if symbol:
-                state.open_positions[symbol] = {
-                    "entry_price": self._to_decimal(payload.get("execution_price", payload.get("entry_price", "0"))),
-                    "quantity": self._to_decimal(payload.get("quantity", "0")),
-                    "margin": self._to_decimal(payload.get("margin", "0")),
-                }
-            return
-
-        if et == "POSITION_PARTIALLY_CLOSED":
-            pnl = self._to_decimal(payload.get("pnl", "0"))
-            fee = self._to_decimal(payload.get("fee", "0"))
-            state.wallet_balance += (pnl - fee)
-            state.realized_pnl_total += (pnl - fee)
-            return
-
-        if et == "POSITION_CLOSED":
-            symbol = payload.get("symbol")
-            pnl = self._to_decimal(payload.get("remaining_pnl", "0"))
-            fee = self._to_decimal(payload.get("fee", "0"))
-            state.wallet_balance += (pnl - fee)
-            state.realized_pnl_total += (pnl - fee)
-            if symbol in state.open_positions:
-                del state.open_positions[symbol]
 
     @staticmethod
     def _sanitize_path_component(value: str) -> str:
