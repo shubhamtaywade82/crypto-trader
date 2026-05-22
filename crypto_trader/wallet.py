@@ -14,12 +14,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Literal, Tuple, Callable
 from pathlib import Path
 from enum import Enum
+from decimal import Decimal, getcontext
 
 logger = logging.getLogger("crypto_trader.wallet")
 
 DATA_DIR = Path.home() / ".crypto_trader"
 DATA_DIR.mkdir(exist_ok=True)
 STATE_SCHEMA_VERSION = 2
+getcontext().prec = 28
 
 
 class PositionSide(Enum):
@@ -37,29 +39,29 @@ class EnhancedPosition:
     symbol: str
     side: PositionSide
     playbook: Playbook
-    entry_price: float
-    original_quantity: float
-    remaining_quantity: float
-    notional: float
-    margin_used: float
+    entry_price: Decimal
+    original_quantity: Decimal
+    remaining_quantity: Decimal
+    notional: Decimal
+    margin_used: Decimal
     leverage: int
     open_time: int  # candle close_time ms, NOT wall clock
 
-    sl_price: float
+    sl_price: Decimal
     tp_levels: List[dict] = field(default_factory=list)
     trailing_active: bool = False
     trailing_stop_price: Optional[float] = None
     time_stop_hours: int = 18
 
-    unrealized_pnl: float = 0.0
-    partial_realized_pnl: float = 0.0
+    unrealized_pnl: Decimal = Decimal("0")
+    partial_realized_pnl: Decimal = Decimal("0")
     status: Literal["OPEN", "CLOSED"] = "OPEN"
     close_time: Optional[int] = None
-    close_price: Optional[float] = None
+    close_price: Optional[Decimal] = None
     close_reason: Optional[str] = None
 
-    def update_pnl(self, mark_price: float):
-        if self.status != "OPEN" or mark_price <= 0:
+    def update_pnl(self, mark_price: Decimal):
+        if self.status != "OPEN" or mark_price <= Decimal("0"):
             return
         
         # Calculate dynamic notional and margin_used based on current mark_price
@@ -77,8 +79,8 @@ class EnhancedPosition:
 
     @property
     def current_margin_pnl_pct(self) -> float:
-        if self.margin_used == 0:
-            return 0.0
+        if self.margin_used == Decimal("0"):
+            return Decimal("0")
         return self.unrealized_pnl / self.margin_used
 
     def to_dict(self) -> dict:
@@ -110,6 +112,9 @@ class EnhancedPosition:
     def from_dict(cls, data: dict) -> "EnhancedPosition":
         data["side"] = PositionSide(data["side"])
         data["playbook"] = Playbook(data["playbook"])
+        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price"]:
+            if k in data and data[k] is not None:
+                data[k] = Decimal(str(data[k]))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -135,9 +140,9 @@ class EnhancedFuturesWallet:
         self.equity_utilization = equity_utilization
         self.catastrophic_sl_pct = catastrophic_sl_pct
         self.state_namespace = state_namespace or "default"
-        self.maker_fee_rate = maker_fee_rate
-        self.taker_fee_rate = taker_fee_rate
-        self.maintenance_margin_ratio = maintenance_margin_ratio
+        self.maker_fee_rate = self._to_decimal(maker_fee_rate)
+        self.taker_fee_rate = self._to_decimal(taker_fee_rate)
+        self.maintenance_margin_ratio = self._to_decimal(maintenance_margin_ratio)
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
         safe_ns = self._sanitize_path_component(self.state_namespace)
         safe_symbol = self._sanitize_path_component(self.symbol)
@@ -145,9 +150,9 @@ class EnhancedFuturesWallet:
         self.backup_state_file = self.state_file.with_suffix(".bak.json")
         self.events_file = DATA_DIR / f"wallet_events_{safe_ns}_{safe_symbol}.jsonl"
 
-        self.wallet_balance: float = initial_balance
-        self.unrealized_pnl_total: float = 0.0
-        self.realized_pnl_total: float = 0.0
+        self.wallet_balance: Decimal = self._to_decimal(initial_balance)
+        self.unrealized_pnl_total: Decimal = Decimal("0")
+        self.realized_pnl_total: Decimal = Decimal("0")
         self.positions: Dict[str, EnhancedPosition] = {}
         self.position_history: List[dict] = []
         self.lock = threading.RLock()
@@ -163,7 +168,7 @@ class EnhancedFuturesWallet:
     def available_balance(self) -> float:
         with self.lock:
             used = sum(p.margin_used for p in self.positions.values() if p.status == "OPEN")
-            return max(0.0, self.margin_balance - used)
+            return max(Decimal("0"), self.margin_balance - used)
 
     def get_open_position(self, symbol: Optional[str] = None) -> Optional[EnhancedPosition]:
         with self.lock:
@@ -195,13 +200,13 @@ class EnhancedFuturesWallet:
                 logger.info(f"[OPEN BLOCKED] {symbol}: {reason}")
                 return None
 
-            margin = custom_margin if custom_margin is not None else self.available_balance * self.equity_utilization
-            if margin <= 0:
+            margin = (self._to_decimal(custom_margin) if custom_margin is not None else self.available_balance * self._to_decimal(self.equity_utilization))
+            if margin <= Decimal("0"):
                 return None
 
-            entry = setup["entry_price"]
-            if custom_quantity is not None and custom_quantity > 0:
-                qty = custom_quantity
+            entry = self._to_decimal(setup["entry_price"])
+            if custom_quantity is not None and self._to_decimal(custom_quantity) > Decimal("0"):
+                qty = self._to_decimal(custom_quantity)
                 notional = qty * entry
                 margin = notional / self.leverage
                 if margin > self.available_balance:
@@ -263,17 +268,18 @@ class EnhancedFuturesWallet:
             )
             return pos
 
-    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str) -> float:
+    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str) -> Decimal:
         """Close a percentage of the position. Returns realized PnL from this slice."""
         with self.lock:
+            mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
-                return 0.0
+                return Decimal("0")
 
-            qty_to_close = pos.remaining_quantity * pct
+            qty_to_close = pos.remaining_quantity * self._to_decimal(pct)
             execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
-            if qty_to_close <= 0:
-                return 0.0
+            if qty_to_close <= Decimal("0"):
+                return Decimal("0")
 
             if pos.side == PositionSide.LONG:
                 pnl_slice = (execution_price - pos.entry_price) * qty_to_close
@@ -296,7 +302,7 @@ class EnhancedFuturesWallet:
                 f"Qty={qty_to_close:.4f} | PnL={pnl_slice:.2f} | Reason={reason}"
             )
 
-            if pos.remaining_quantity <= 0.0001:
+            if pos.remaining_quantity <= Decimal("0.0001"):
                 return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
 
             self._save_state()
@@ -316,6 +322,7 @@ class EnhancedFuturesWallet:
     def close_position(self, symbol: str, mark_price: float, reason: str) -> Optional[EnhancedPosition]:
         """Close full position. Only credits remaining unrealized (partials already credited)."""
         with self.lock:
+            mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
                 return None
@@ -329,7 +336,7 @@ class EnhancedFuturesWallet:
             self.wallet_balance += (remaining_pnl - fee_close)
             self.realized_pnl_total += (remaining_pnl - fee_close)
 
-            pos.unrealized_pnl = 0.0
+            pos.unrealized_pnl = Decimal("0")
             pos.status = "CLOSED"
             pos.close_time = self._now_ms()
             pos.close_price = execution_price
@@ -366,22 +373,17 @@ class EnhancedFuturesWallet:
     ):
         """Update PnL and check all exit conditions."""
         with self.lock:
+            mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
                 self._sync_unrealized_total()
                 return
 
-            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
-            fee_open = self._calculate_fee(execution_price * qty, is_taker=True)
-
-            pos.entry_price = execution_price
             pos.update_pnl(mark_price)
-            self.wallet_balance -= fee_open
-            self.realized_pnl_total -= fee_open
             pnl = pos.unrealized_pnl
 
             # 1. Catastrophic SL (-50% margin)
-            cat_sl = pos.margin_used * self.catastrophic_sl_pct
+            cat_sl = pos.margin_used * self._to_decimal(self.catastrophic_sl_pct)
             if self._is_liquidation_required(pos, mark_price):
                 self.close_position(symbol, mark_price, reason="LIQUIDATION")
                 return
@@ -468,12 +470,12 @@ class EnhancedFuturesWallet:
             open_pos = [p.to_dict() for p in self.positions.values() if p.status == "OPEN"]
             utilized = sum(p.margin_used for p in self.positions.values() if p.status == "OPEN")
             return {
-                "wallet_balance": round(self.wallet_balance, 4),
-                "unrealized_pnl": round(self.unrealized_pnl_total, 4),
-                "realized_pnl": round(self.realized_pnl_total, 4),
-                "margin_balance": round(self.margin_balance, 4),
-                "available": round(self.available_balance, 4),
-                "utilized": round(utilized, 4),
+                "wallet_balance": float(round(self.wallet_balance, 4)),
+                "unrealized_pnl": float(round(self.unrealized_pnl_total, 4)),
+                "realized_pnl": float(round(self.realized_pnl_total, 4)),
+                "margin_balance": float(round(self.margin_balance, 4)),
+                "available": float(round(self.available_balance, 4)),
+                "utilized": float(round(utilized, 4)),
                 "open_count": len(open_pos),
                 "open_positions": open_pos,
                 "history_count": len(self.position_history),
@@ -497,6 +499,19 @@ class EnhancedFuturesWallet:
                   f"U-PnL={p['unrealized_pnl']:.4f} ({p['unrealized_pnl']/p['margin_used']*100:.2f}%)")
         print("=" * 65 + "\n")
 
+
+    @staticmethod
+    def _to_decimal(value) -> Decimal:
+        if isinstance(value, Decimal):
+            return value
+        return Decimal(str(value))
+
+    @staticmethod
+    def _serialize_decimals(obj):
+        if isinstance(obj, Decimal):
+            return str(obj)
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
     def _save_state(self):
         state = {
             "schema_version": STATE_SCHEMA_VERSION,
@@ -516,7 +531,7 @@ class EnhancedFuturesWallet:
     def _atomic_write_json(self, path: Path, state: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
-        payload = json.dumps(state, indent=2, default=str)
+        payload = json.dumps(state, indent=2, default=self._serialize_decimals)
         with open(temp_path, "w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
@@ -540,7 +555,7 @@ class EnhancedFuturesWallet:
         }
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.events_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, default=str) + "\n")
+            f.write(json.dumps(event, default=self._serialize_decimals) + "\n")
 
     @staticmethod
     def _sanitize_path_component(value: str) -> str:
@@ -559,8 +574,8 @@ class EnhancedFuturesWallet:
             return
         try:
             state = self._load_state_with_recovery()
-            self.wallet_balance = state.get("wallet_balance", self.wallet_balance)
-            self.realized_pnl_total = state.get("realized_pnl_total", 0.0)
+            self.wallet_balance = self._to_decimal(state.get("wallet_balance", self.wallet_balance))
+            self.realized_pnl_total = self._to_decimal(state.get("realized_pnl_total", Decimal("0")))
             self.maker_fee_rate = state.get("maker_fee_rate", self.maker_fee_rate)
             self.taker_fee_rate = state.get("taker_fee_rate", self.taker_fee_rate)
             self.maintenance_margin_ratio = state.get("maintenance_margin_ratio", self.maintenance_margin_ratio)
@@ -593,20 +608,20 @@ class EnhancedFuturesWallet:
     def _now_ms(self) -> int:
         return int(self._now_ms_fn())
 
-    def _calculate_fee(self, notional: float, is_taker: bool = True) -> float:
+    def _calculate_fee(self, notional: Decimal, is_taker: bool = True) -> float:
         rate = self.taker_fee_rate if is_taker else self.maker_fee_rate
         return abs(notional) * rate
 
-    def _execution_price(self, mark_price: float, side: PositionSide, is_entry: bool, setup: Optional[dict] = None) -> float:
+    def _execution_price(self, mark_price: Decimal, side: PositionSide, is_entry: bool, setup: Optional[dict] = None) -> Decimal:
         setup = setup or {}
-        spread_bps = float(setup.get("spread_bps", 2.0))
-        slippage_bps = float(setup.get("slippage_bps", 3.0))
-        bump = (spread_bps + slippage_bps) / 10000.0
+        spread_bps = self._to_decimal(setup.get("spread_bps", 2.0))
+        slippage_bps = self._to_decimal(setup.get("slippage_bps", 3.0))
+        bump = (spread_bps + slippage_bps) / Decimal("10000")
         if is_entry:
             return mark_price * (1 + bump) if side == PositionSide.LONG else mark_price * (1 - bump)
         return mark_price * (1 - bump) if side == PositionSide.LONG else mark_price * (1 + bump)
 
-    def _is_liquidation_required(self, pos: EnhancedPosition, mark_price: float) -> bool:
+    def _is_liquidation_required(self, pos: EnhancedPosition, mark_price: Decimal) -> bool:
         pos.update_pnl(mark_price)
         equity = (pos.margin_used + pos.unrealized_pnl)
         maintenance = pos.notional * self.maintenance_margin_ratio
@@ -615,9 +630,9 @@ class EnhancedFuturesWallet:
         with self.lock:
             self.positions.clear()
             self.position_history.clear()
-            self.wallet_balance = 1_000.0
-            self.unrealized_pnl_total = 0.0
-            self.realized_pnl_total = 0.0
+            self.wallet_balance = self._to_decimal(1_000.0)
+            self.unrealized_pnl_total = Decimal("0")
+            self.realized_pnl_total = Decimal("0")
             if self.state_file.exists():
                 self.state_file.unlink()
             logger.info("Wallet state reset")
