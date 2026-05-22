@@ -131,14 +131,26 @@ class PortfolioReducer:
                     "entry_price": Decimal(str(payload.get("execution_price", payload.get("entry_price", "0")))),
                     "quantity": Decimal(str(payload.get("quantity", "0"))),
                     "margin": Decimal(str(payload.get("margin", "0"))),
+                    "side": payload.get("side"),
+                    "playbook": payload.get("playbook", "INTRADAY"),
+                    "sl_price": Decimal(str(payload.get("sl_price", "0"))),
+                    "leverage": int(payload.get("leverage", 1)),
+                    "open_time": int(payload.get("open_time", 0)),
                 }
             return
 
         if et == "POSITION_PARTIALLY_CLOSED":
+            symbol = payload.get("symbol")
             pnl = Decimal(str(payload.get("pnl", "0")))
             fee = Decimal(str(payload.get("fee", "0")))
             state.wallet_balance += (pnl - fee)
             state.realized_pnl_total += (pnl - fee)
+            if symbol in state.open_positions:
+                qty_closed = Decimal(str(payload.get("closed_qty", "0")))
+                state.open_positions[symbol]["quantity"] = max(
+                    Decimal("0"),
+                    state.open_positions[symbol]["quantity"] - qty_closed,
+                )
             return
 
         if et in ("POSITION_CLOSED", "LIQUIDATION"):
@@ -404,8 +416,13 @@ class EnhancedFuturesWallet:
                     "margin": margin,
                     "execution_price": execution_price,
                     "fee": fee_open,
+                    "playbook": playbook.value,
+                    "sl_price": sl_price,
+                    "leverage": self.leverage,
+                    "open_time": pos.open_time,
                 },
             )
+            self._sync_positions_from_reducer()
             return pos
 
     def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str) -> Decimal:
@@ -426,11 +443,6 @@ class EnhancedFuturesWallet:
             else:
                 pnl_slice = (pos.entry_price - execution_price) * qty_to_close
 
-            pos.partial_realized_pnl += pnl_slice
-            pos.remaining_quantity -= qty_to_close
-            pos.notional = pos.remaining_quantity * pos.entry_price
-            pos.margin_used = pos.notional / pos.leverage
-
             fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
 
             # Credit the slice immediately (net fees)
@@ -443,8 +455,10 @@ class EnhancedFuturesWallet:
                     "price": execution_price,
                     "pnl": pnl_slice,
                     "fee": fee_close,
+                    "closed_qty": qty_to_close,
                 },
             )
+            self._sync_positions_from_reducer()
 
             logger.info(
                 f"[PARTIAL CLOSE] {symbol} {pos.side.value} | Closed {pct*100:.0f}% | "
@@ -488,9 +502,7 @@ class EnhancedFuturesWallet:
             pos.close_time = self._now_ms()
             pos.close_price = execution_price
             pos.close_reason = reason
-
             self.position_history.append(pos.to_dict())
-            del self.positions[symbol]
 
             logger.info(
                 f"[POSITION CLOSED] {symbol} {pos.side.value} | "
@@ -498,6 +510,7 @@ class EnhancedFuturesWallet:
                 f"Total Trade PnL={pos.partial_realized_pnl + remaining_pnl:.2f} | Reason={reason}"
             )
             self._save_state()
+            self._sync_positions_from_reducer()
             return pos
 
     def update_positions(
@@ -759,6 +772,41 @@ class EnhancedFuturesWallet:
         self.reducer.apply(self._runtime_reducer_state, event)
         self.wallet_balance = self._runtime_reducer_state.wallet_balance
         self.realized_pnl_total = self._runtime_reducer_state.realized_pnl_total
+
+    def _sync_positions_from_reducer(self):
+        """Align runtime open positions with reducer-authoritative open_positions."""
+        current = {}
+        for symbol, pdata in self._runtime_reducer_state.open_positions.items():
+            existing = self.positions.get(symbol)
+            if existing and existing.status == "OPEN":
+                existing.remaining_quantity = pdata["quantity"]
+                existing.original_quantity = max(existing.original_quantity, pdata["quantity"])
+                existing.entry_price = pdata["entry_price"]
+                existing.sl_price = pdata.get("sl_price", existing.sl_price)
+                existing.notional = existing.remaining_quantity * existing.entry_price
+                existing.margin_used = existing.notional / existing.leverage
+                current[symbol] = existing
+            else:
+                side = PositionSide(pdata.get("side", "LONG"))
+                playbook = Playbook(pdata.get("playbook", "INTRADAY"))
+                qty = pdata["quantity"]
+                entry = pdata["entry_price"]
+                lev = int(pdata.get("leverage", self.leverage))
+                current[symbol] = EnhancedPosition(
+                    symbol=symbol,
+                    side=side,
+                    playbook=playbook,
+                    entry_price=entry,
+                    original_quantity=qty,
+                    remaining_quantity=qty,
+                    notional=qty * entry,
+                    margin_used=(qty * entry) / lev,
+                    leverage=lev,
+                    open_time=int(pdata.get("open_time", self._now_ms())),
+                    sl_price=pdata.get("sl_price", Decimal("0")),
+                    tp_levels=[],
+                )
+        self.positions = current
 
     def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
         order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
