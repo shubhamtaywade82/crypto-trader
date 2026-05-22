@@ -34,6 +34,41 @@ class Playbook(Enum):
     SWING = "SWING"
 
 
+class OrderStatus(Enum):
+    NEW = "NEW"
+    FILLED = "FILLED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+class OrderType(Enum):
+    MARKET = "MARKET"
+
+
+@dataclass
+class Order:
+    id: str
+    symbol: str
+    side: PositionSide
+    order_type: OrderType
+    quantity: Decimal
+    status: OrderStatus
+    created_at: int
+    filled_quantity: Decimal = Decimal("0")
+    avg_fill_price: Decimal = Decimal("0")
+
+
+@dataclass
+class Fill:
+    order_id: str
+    symbol: str
+    side: PositionSide
+    quantity: Decimal
+    fill_price: Decimal
+    fee: Decimal
+    timestamp: int
+
 @dataclass
 class EnhancedPosition:
     symbol: str
@@ -155,6 +190,8 @@ class EnhancedFuturesWallet:
         self.realized_pnl_total: Decimal = Decimal("0")
         self.positions: Dict[str, EnhancedPosition] = {}
         self.position_history: List[dict] = []
+        self.orders: Dict[str, Order] = {}
+        self.fills: List[Fill] = []
         self.lock = threading.RLock()
 
         self._load_state()
@@ -218,30 +255,33 @@ class EnhancedFuturesWallet:
 
             side = setup["side"]
             playbook = setup["playbook"]
+            mark_price = self._to_decimal(mark_price)
 
+            sl_price = self._to_decimal(setup["sl_price"])
             tp_levels = setup.get("tp_levels", [])
             if not tp_levels and "tp_price" in setup:
-                tp_levels = [{"price": setup["tp_price"], "pct": 1.0, "hit": False, "label": "TP"}]
+                tp_levels = [{"price": self._to_decimal(setup["tp_price"]), "pct": 1.0, "hit": False, "label": "TP"}]
+
+            order = self._create_order(symbol=symbol, side=side, quantity=qty)
+            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
+            fee_open = self._calculate_fee(execution_price * qty, is_taker=True)
+            self._record_fill(order, qty, execution_price, fee_open)
 
             pos = EnhancedPosition(
                 symbol=symbol,
                 side=side,
                 playbook=playbook,
-                entry_price=entry,
+                entry_price=execution_price,
                 original_quantity=qty,
                 remaining_quantity=qty,
                 notional=notional,
                 margin_used=margin,
                 leverage=self.leverage,
                 open_time=setup.get("candle_close_time", self._now_ms()),
-                sl_price=setup["sl_price"],
+                sl_price=sl_price,
                 tp_levels=tp_levels,
                 time_stop_hours=setup.get("time_stop_hours", 18),
             )
-            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
-            fee_open = self._calculate_fee(execution_price * qty, is_taker=True)
-
-            pos.entry_price = execution_price
             pos.update_pnl(mark_price)
             self.wallet_balance -= fee_open
             self.realized_pnl_total -= fee_open
@@ -251,7 +291,7 @@ class EnhancedFuturesWallet:
             logger.info(
                 f"[POSITION OPENED] {symbol} {side.value} | Playbook={playbook.value} | "
                 f"Qty={qty:.4f} @ {entry:.2f} | Margin={margin:.2f} | "
-                f"SL={setup['sl_price']:.2f} | TP={tp_levels}"
+                f"SL={sl_price:.2f} | TP={tp_levels}"
             )
             self._save_state()
             self._append_event(
@@ -556,6 +596,76 @@ class EnhancedFuturesWallet:
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=self._serialize_decimals) + "\n")
+
+    def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
+        order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
+        order = Order(
+            id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            status=OrderStatus.NEW,
+            created_at=self._now_ms(),
+        )
+        self.orders[order_id] = order
+        self._append_event(
+            "ORDER_CREATED",
+            {
+                "order_id": order.id,
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "quantity": order.quantity,
+                "status": order.status.value,
+            },
+        )
+        return order
+
+    def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal):
+        fill = Fill(
+            order_id=order.id,
+            symbol=order.symbol,
+            side=order.side,
+            quantity=quantity,
+            fill_price=fill_price,
+            fee=fee,
+            timestamp=self._now_ms(),
+        )
+        self.fills.append(fill)
+        order.filled_quantity += quantity
+        order.avg_fill_price = fill_price if order.filled_quantity > Decimal("0") else Decimal("0")
+        order.status = OrderStatus.FILLED if order.filled_quantity >= order.quantity else OrderStatus.PARTIALLY_FILLED
+        self._append_event(
+            "ORDER_FILLED",
+            {
+                "order_id": order.id,
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "quantity": quantity,
+                "fill_price": fill_price,
+                "fee": fee,
+                "status": order.status.value,
+            },
+        )
+
+    def replay_event_log(self) -> dict:
+        if not self.events_file.exists():
+            return {"event_count": 0, "order_count": 0, "fill_count": 0}
+        event_count = 0
+        order_count = 0
+        fill_count = 0
+        with open(self.events_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                event_count += 1
+                et = event.get("event_type")
+                if et == "ORDER_CREATED":
+                    order_count += 1
+                elif et == "ORDER_FILLED":
+                    fill_count += 1
+        return {"event_count": event_count, "order_count": order_count, "fill_count": fill_count}
 
     @staticmethod
     def _sanitize_path_component(value: str) -> str:
