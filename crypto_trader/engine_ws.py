@@ -34,6 +34,7 @@ logger = logging.getLogger("crypto_trader.engine_ws")
 
 DEFAULT_SYMBOL = "SOLUSDT"
 LEVERAGE = 10
+FUNDING_EXTREME = 0.0005
 
 
 class WebSocketTradingEngine:
@@ -250,7 +251,8 @@ class WebSocketTradingEngine:
                 )
 
         # 4. Risk check
-        can_trade, risk_reason = self.risk_manager.can_trade()
+        self.risk_manager.update_peak_balance(self.wallet.margin_balance)
+        can_trade, risk_reason = self.risk_manager.can_trade(current_balance=self.wallet.margin_balance)
         if not can_trade:
             logger.info(f"[RISK] {risk_reason}")
 
@@ -302,6 +304,15 @@ class WebSocketTradingEngine:
         if final_score < dynamic_threshold:
             logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
             return
+        if (
+            (setup["side"] == PositionSide.LONG and funding_rate > FUNDING_EXTREME)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -FUNDING_EXTREME)
+        ):
+            logger.info(
+                f"[BLOCKED] Funding extreme for {setup['side'].value}: {funding_rate:+.4%} "
+                f"(threshold={FUNDING_EXTREME:.2%})"
+            )
+            return
 
         # Execute entry using WebSocket LTP for precise price
         self._execute_entry(setup, final_score, llm_weight, explanation,
@@ -350,14 +361,23 @@ class WebSocketTradingEngine:
                 else:
                     tp_level["price"] = entry_price * (1 - 0.010 if tp_level["label"] == "TP1" else 0.020)
 
-        # Size based on final score
-        base_margin = self.wallet.available_balance * self.wallet.equity_utilization
-        adjusted_margin = base_margin * min(final_score / dynamic_threshold, 1.0)
+        # Risk-based sizing from stop distance.
+        stop_distance = abs(entry_price - setup["sl_price"])
+        risk_budget = self.wallet.margin_balance * 0.01
+        size_multiplier = min(final_score / dynamic_threshold, 1.0)
+        risk_budget *= size_multiplier
+        quantity = (risk_budget / stop_distance) if stop_distance > 0 else 0.0
 
         trade_id = str(uuid.uuid4())[:8]
 
         # Open position
-        pos = self.wallet.open_position(self.symbol, setup, entry_price, custom_margin=adjusted_margin)
+        pos = self.wallet.open_position(
+            self.symbol,
+            setup,
+            entry_price,
+            custom_margin=None,
+            custom_quantity=quantity,
+        )
 
         if pos:
             self.risk_manager.record_open()
@@ -378,7 +398,7 @@ class WebSocketTradingEngine:
                 llm_advice=advice.to_dict() if self.advisor and advice else None,
                 llm_weight=llm_weight,
                 final_score=final_score,
-                margin=adjusted_margin,
+                margin=pos.margin_used,
                 notional=pos.notional,
                 entry_price=entry_price,
                 funding_rate=funding_rate,
@@ -388,7 +408,7 @@ class WebSocketTradingEngine:
 
             logger.info(
                 f"[EXECUTED] Trade {trade_id} | Entry={entry_price:.2f} | "
-                f"Margin={adjusted_margin:.2f} | Score={final_score:.2f} | "
+                f"Margin={pos.margin_used:.2f} | Score={final_score:.2f} | "
                 f"Spread={spread_pct:.3f}% | Slippage={slippage:.3f}%"
             )
 

@@ -21,6 +21,7 @@ from .playbooks import PlaybookA, PlaybookB
 from .regime import MarketRegimeAnalyzer, compute_ema
 from .llm_advisor import OllamaAdvisor
 from .journal import TradeJournal
+from .market_state import OpenInterestTracker
 
 logger = logging.getLogger("crypto_trader.engine")
 
@@ -32,6 +33,7 @@ CATASTROPHIC_SL_PCT = -0.50
 
 TF_4H, TF_1H, TF_15M, TF_5M = "4h", "1h", "15m", "5m"
 LIMIT_4H, LIMIT_1H, LIMIT_15M, LIMIT_5M = 200, 150, 150, 150
+FUNDING_EXTREME = 0.0005
 
 
 class TradingEngine:
@@ -80,6 +82,7 @@ class TradingEngine:
         self.playbook_a = PlaybookA()
         self.playbook_b = PlaybookB()
         self.journal = TradeJournal()
+        self.oi_tracker = OpenInterestTracker()
 
         # LLM
         self.advisor = None
@@ -138,9 +141,9 @@ class TradingEngine:
         regime, regime_score, df_4h = self.regime_analyzer.analyze(df_4h)
         logger.info(f"Regime: {regime.value} (score={regime_score:.2f})")
 
-        # OI delta: would require storing historical OI to compute a proper delta.
-        # Using 0.0 for now — the raw oi value is still passed to the LLM prompt.
-        oi_delta = 0.0
+        oi_value = float(oi_data.get("openInterest", 0.0)) if isinstance(oi_data, dict) else 0.0
+        oi_metrics = self.oi_tracker.update(oi_value)
+        oi_delta = oi_metrics.oi_delta_15m
 
         # 4. Start LLM async (non-blocking)
         if self.use_llm and self.advisor:
@@ -161,8 +164,9 @@ class TradingEngine:
                     open_positions=open_positions,
                 )
 
+        self.risk_manager.update_peak_balance(self.wallet.margin_balance)
         # 5. Risk check
-        can_trade, risk_reason = self.risk_manager.can_trade()
+        can_trade, risk_reason = self.risk_manager.can_trade(current_balance=self.wallet.margin_balance)
         if not can_trade:
             logger.info(f"[RISK] {risk_reason}")
 
@@ -211,12 +215,29 @@ class TradingEngine:
                 # Execute if final score passes threshold
                 dynamic_threshold = self.adaptive_threshold.get_threshold()
                 if final_score >= dynamic_threshold:
-                    # Adjust margin by final score (higher score = full size, lower = reduced)
-                    base_margin = self.wallet.available_balance * self.wallet.equity_utilization
-                    adjusted_margin = base_margin * min(final_score / dynamic_threshold, 1.0)
-
+                    if (
+                        (setup["side"] == PositionSide.LONG and funding_rate > FUNDING_EXTREME)
+                        or (setup["side"] == PositionSide.SHORT and funding_rate < -FUNDING_EXTREME)
+                    ):
+                        logger.info(
+                            f"[BLOCKED] Funding extreme for {setup['side'].value}: {funding_rate:+.4%} "
+                            f"(threshold={FUNDING_EXTREME:.2%})"
+                        )
+                        return self.wallet.get_summary()
+                    # Risk-based sizing from stop distance (ATR-ready because stop comes from setup).
+                    stop_distance = abs(mark_price - setup["sl_price"])
+                    risk_budget = self.wallet.margin_balance * 0.01
+                    size_multiplier = min(final_score / dynamic_threshold, 1.0)
+                    risk_budget *= size_multiplier
+                    quantity = (risk_budget / stop_distance) if stop_distance > 0 else 0.0
                     trade_id = str(uuid.uuid4())[:8]
-                    pos = self.wallet.open_position(self.symbol, setup, mark_price, custom_margin=adjusted_margin)
+                    pos = self.wallet.open_position(
+                        self.symbol,
+                        setup,
+                        mark_price,
+                        custom_margin=None,
+                        custom_quantity=quantity,
+                    )
 
                     if pos:
                         self.risk_manager.record_open()
@@ -231,14 +252,17 @@ class TradingEngine:
                             llm_advice=advice.to_dict() if advice else None,
                             llm_weight=llm_weight,
                             final_score=final_score,
-                            margin=adjusted_margin,
+                            margin=pos.margin_used,
                             notional=pos.notional,
                             entry_price=mark_price,
                             funding_rate=funding_rate,
                             oi_delta=oi_delta,
                             taker_ratio=taker_ratio,
                         )
-                        logger.info(f"[EXECUTED] Trade {trade_id} | margin={adjusted_margin:.2f} | score={final_score:.2f} (threshold={dynamic_threshold:.2f})")
+                        logger.info(
+                            f"[EXECUTED] Trade {trade_id} | margin={pos.margin_used:.2f} | "
+                            f"score={final_score:.2f} (threshold={dynamic_threshold:.2f})"
+                        )
                 else:
                     logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
 

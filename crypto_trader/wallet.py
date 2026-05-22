@@ -171,6 +171,7 @@ class EnhancedFuturesWallet:
         setup: dict,
         mark_price: float,
         custom_margin: Optional[float] = None,
+        custom_quantity: Optional[float] = None,
     ) -> Optional[EnhancedPosition]:
         """Open a position. custom_margin overrides equity_utilization for LLM-adjusted sizing."""
         with self.lock:
@@ -183,9 +184,17 @@ class EnhancedFuturesWallet:
             if margin <= 0:
                 return None
 
-            notional = margin * self.leverage
             entry = setup["entry_price"]
-            qty = notional / entry
+            if custom_quantity is not None and custom_quantity > 0:
+                qty = custom_quantity
+                notional = qty * entry
+                margin = notional / self.leverage
+                if margin > self.available_balance:
+                    logger.info(f"[OPEN BLOCKED] {symbol}: risk-sized margin exceeds available balance")
+                    return None
+            else:
+                notional = margin * self.leverage
+                qty = notional / entry
 
             side = setup["side"]
             playbook = setup["playbook"]
