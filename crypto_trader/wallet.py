@@ -88,6 +88,8 @@ class PortfolioState:
     open_positions: Dict[str, dict] = field(default_factory=dict)
     orders: Dict[str, dict] = field(default_factory=dict)
     fills: List[dict] = field(default_factory=list)
+    funding_total: Decimal = Decimal("0")
+    violations: List[dict] = field(default_factory=list)
 
 class PortfolioReducer:
     """Canonical event reducer for replay-derived portfolio state."""
@@ -194,12 +196,17 @@ class PortfolioReducer:
             amt = Decimal(str(payload.get("amount", "0")))
             state.wallet_balance += amt
             state.realized_pnl_total += amt
+            state.funding_total += amt
             return
 
         if et == "FEE_CHARGED":
             amt = Decimal(str(payload.get("amount", "0")))
             state.wallet_balance -= amt
             state.realized_pnl_total -= amt
+            return
+
+        if et == "INVARIANT_VIOLATION":
+            state.violations.append(payload)
             return
 
 @dataclass
@@ -960,6 +967,12 @@ class EnhancedFuturesWallet:
                     self._emit_event("ORDER_EXPIRED", {"order_id": order.id})
                     continue
                 if self._should_trigger_order(order, price):
+                    if order.reduce_only and not self.get_open_position(symbol):
+                        self._emit_event(
+                            "ORDER_REJECTED",
+                            {"order_id": order.id, "reason": "REDUCE_ONLY_WITHOUT_POSITION"},
+                        )
+                        continue
                     fill_price = self._execution_price(price, order.side, is_entry=True)
                     remaining = max(Decimal("0"), order.quantity - order.filled_quantity)
                     if remaining > Decimal("0"):
@@ -970,6 +983,7 @@ class EnhancedFuturesWallet:
                             fee_rate=self.taker_fee_rate,
                             chunk_count=1,
                         )
+            self._run_invariant_checks()
 
     def _should_trigger_order(self, order: Order, mark_price: Decimal) -> bool:
         if order.order_type == OrderType.MARKET:
@@ -981,6 +995,39 @@ class EnhancedFuturesWallet:
         if order.order_type == OrderType.TAKE_PROFIT and order.trigger_price is not None:
             return mark_price >= order.trigger_price if order.side == PositionSide.LONG else mark_price <= order.trigger_price
         return False
+
+    def apply_funding(self, symbol: str, funding_rate: Decimal):
+        with self.lock:
+            pos = self.get_open_position(symbol)
+            if not pos:
+                return Decimal("0")
+            funding_rate = self._to_decimal(funding_rate)
+            notional = pos.remaining_quantity * pos.entry_price
+            # Longs usually pay when positive, shorts receive; simplified sign by side.
+            direction = Decimal("-1") if pos.side == PositionSide.LONG else Decimal("1")
+            amount = (notional * funding_rate) * direction
+            self._emit_event(
+                "FUNDING_APPLIED",
+                {"symbol": symbol, "rate": funding_rate, "notional": notional, "amount": amount},
+            )
+            return amount
+
+    def _run_invariant_checks(self):
+        # 1) order filled qty <= order qty
+        for o in self.orders.values():
+            if o.filled_quantity > o.quantity:
+                self._emit_event(
+                    "INVARIANT_VIOLATION",
+                    {"type": "ORDER_OVERFILLED", "order_id": o.id, "filled": o.filled_quantity, "qty": o.quantity},
+                )
+        # 2) remaining qty >= 0
+        for o in self.orders.values():
+            remaining = o.quantity - o.filled_quantity
+            if remaining < Decimal("0"):
+                self._emit_event(
+                    "INVARIANT_VIOLATION",
+                    {"type": "NEGATIVE_REMAINING_QTY", "order_id": o.id, "remaining": remaining},
+                )
 
     def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal, sequence: int = 1):
         prospective_filled = order.filled_quantity + quantity

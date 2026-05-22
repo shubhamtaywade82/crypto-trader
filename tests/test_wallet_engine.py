@@ -118,3 +118,25 @@ def test_limit_order_triggers_and_cancel_flow(tmp_path, monkeypatch):
     )
     assert w.cancel_order(o2.id) is True
     assert w.orders[o2.id].status.value == "CANCELLED"
+
+
+def test_funding_event_and_reduce_only_rejection(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("DOGEUSDT")
+    # reduce-only without a position should reject on trigger
+    ro = w.place_pending_order(
+        symbol="DOGEUSDT",
+        side=PositionSide.LONG,
+        quantity=Decimal("1"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("99"),
+        reduce_only=True,
+    )
+    w.evaluate_pending_orders("DOGEUSDT", mark_price=99)
+    assert w.orders[ro.id].status.value == "REJECTED"
+
+    # funding should apply once a position exists
+    w2 = _fresh_wallet("DOGEUSDT")
+    w2.open_position("DOGEUSDT", _setup(), mark_price=100)
+    amt = w2.apply_funding("DOGEUSDT", Decimal("0.0001"))
+    assert amt != Decimal("0")
