@@ -6,11 +6,12 @@ Supports partial closes, trailing stops, and time stops.
 """
 
 import json
+import os
 import time
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Literal, Tuple
+from typing import Dict, List, Optional, Literal, Tuple, Callable
 from pathlib import Path
 from enum import Enum
 
@@ -18,6 +19,7 @@ logger = logging.getLogger("crypto_trader.wallet")
 
 DATA_DIR = Path.home() / ".crypto_trader"
 DATA_DIR.mkdir(exist_ok=True)
+STATE_SCHEMA_VERSION = 2
 
 
 class PositionSide(Enum):
@@ -121,14 +123,27 @@ class EnhancedFuturesWallet:
         equity_utilization: float = 0.50,
         catastrophic_sl_pct: float = -0.50,
         symbol: Optional[str] = None,
+        state_namespace: Optional[str] = None,
+        maker_fee_rate: float = 0.0002,
+        taker_fee_rate: float = 0.0005,
+        maintenance_margin_ratio: float = 0.005,
+        now_ms_fn: Optional[Callable[[], int]] = None,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
         self.leverage = leverage
         self.equity_utilization = equity_utilization
         self.catastrophic_sl_pct = catastrophic_sl_pct
-        # Use a single global state file regardless of symbol.
-        self.state_file = DATA_DIR / "wallet_global.json"
+        self.state_namespace = state_namespace or "default"
+        self.maker_fee_rate = maker_fee_rate
+        self.taker_fee_rate = taker_fee_rate
+        self.maintenance_margin_ratio = maintenance_margin_ratio
+        self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
+        safe_ns = self._sanitize_path_component(self.state_namespace)
+        safe_symbol = self._sanitize_path_component(self.symbol)
+        self.state_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.json"
+        self.backup_state_file = self.state_file.with_suffix(".bak.json")
+        self.events_file = DATA_DIR / f"wallet_events_{safe_ns}_{safe_symbol}.jsonl"
 
         self.wallet_balance: float = initial_balance
         self.unrealized_pnl_total: float = 0.0
@@ -213,12 +228,18 @@ class EnhancedFuturesWallet:
                 notional=notional,
                 margin_used=margin,
                 leverage=self.leverage,
-                open_time=setup.get("candle_close_time", int(time.time() * 1000)),
+                open_time=setup.get("candle_close_time", self._now_ms()),
                 sl_price=setup["sl_price"],
                 tp_levels=tp_levels,
                 time_stop_hours=setup.get("time_stop_hours", 18),
             )
+            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
+            fee_open = self._calculate_fee(execution_price * qty, is_taker=True)
+
+            pos.entry_price = execution_price
             pos.update_pnl(mark_price)
+            self.wallet_balance -= fee_open
+            self.realized_pnl_total -= fee_open
             self.positions[symbol] = pos
             self._sync_unrealized_total()
 
@@ -228,6 +249,18 @@ class EnhancedFuturesWallet:
                 f"SL={setup['sl_price']:.2f} | TP={tp_levels}"
             )
             self._save_state()
+            self._append_event(
+                "POSITION_OPENED",
+                {
+                    "symbol": symbol,
+                    "side": side.value,
+                    "entry_price": entry,
+                    "quantity": qty,
+                    "margin": margin,
+                    "execution_price": execution_price,
+                    "fee": fee_open,
+                },
+            )
             return pos
 
     def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str) -> float:
@@ -238,22 +271,25 @@ class EnhancedFuturesWallet:
                 return 0.0
 
             qty_to_close = pos.remaining_quantity * pct
+            execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
             if qty_to_close <= 0:
                 return 0.0
 
             if pos.side == PositionSide.LONG:
-                pnl_slice = (mark_price - pos.entry_price) * qty_to_close
+                pnl_slice = (execution_price - pos.entry_price) * qty_to_close
             else:
-                pnl_slice = (pos.entry_price - mark_price) * qty_to_close
+                pnl_slice = (pos.entry_price - execution_price) * qty_to_close
 
             pos.partial_realized_pnl += pnl_slice
             pos.remaining_quantity -= qty_to_close
             pos.notional = pos.remaining_quantity * pos.entry_price
             pos.margin_used = pos.notional / pos.leverage
 
-            # Credit the slice immediately
-            self.wallet_balance += pnl_slice
-            self.realized_pnl_total += pnl_slice
+            fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
+
+            # Credit the slice immediately (net fees)
+            self.wallet_balance += (pnl_slice - fee_close)
+            self.realized_pnl_total += (pnl_slice - fee_close)
 
             logger.info(
                 f"[PARTIAL CLOSE] {symbol} {pos.side.value} | Closed {pct*100:.0f}% | "
@@ -264,6 +300,17 @@ class EnhancedFuturesWallet:
                 return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
 
             self._save_state()
+            self._append_event(
+                "POSITION_PARTIALLY_CLOSED",
+                {
+                    "symbol": symbol,
+                    "reason": reason,
+                    "pct": pct,
+                    "price": execution_price,
+                    "pnl": pnl_slice,
+                    "fee": fee_close,
+                },
+            )
             return pnl_slice
 
     def close_position(self, symbol: str, mark_price: float, reason: str) -> Optional[EnhancedPosition]:
@@ -273,17 +320,19 @@ class EnhancedFuturesWallet:
             if not pos:
                 return None
 
-            pos.update_pnl(mark_price)
+            execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
+            pos.update_pnl(execution_price)
             remaining_pnl = pos.unrealized_pnl  # Only the still-open portion
+            fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
 
             # Credit remaining PnL
-            self.wallet_balance += remaining_pnl
-            self.realized_pnl_total += remaining_pnl
+            self.wallet_balance += (remaining_pnl - fee_close)
+            self.realized_pnl_total += (remaining_pnl - fee_close)
 
             pos.unrealized_pnl = 0.0
             pos.status = "CLOSED"
-            pos.close_time = int(time.time() * 1000)
-            pos.close_price = mark_price
+            pos.close_time = self._now_ms()
+            pos.close_price = execution_price
             pos.close_reason = reason
 
             self.position_history.append(pos.to_dict())
@@ -291,10 +340,21 @@ class EnhancedFuturesWallet:
 
             logger.info(
                 f"[POSITION CLOSED] {symbol} {pos.side.value} | "
-                f"Close={mark_price:.2f} | Remaining PnL={remaining_pnl:.2f} | "
+                f"Close={execution_price:.2f} | Remaining PnL={remaining_pnl:.2f} | "
                 f"Total Trade PnL={pos.partial_realized_pnl + remaining_pnl:.2f} | Reason={reason}"
             )
             self._save_state()
+            self._append_event(
+                "POSITION_CLOSED",
+                {
+                    "symbol": symbol,
+                    "side": pos.side.value,
+                    "close_price": execution_price,
+                    "fee": fee_close,
+                    "reason": reason,
+                    "remaining_pnl": remaining_pnl,
+                },
+            )
             return pos
 
     def update_positions(
@@ -311,11 +371,20 @@ class EnhancedFuturesWallet:
                 self._sync_unrealized_total()
                 return
 
+            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
+            fee_open = self._calculate_fee(execution_price * qty, is_taker=True)
+
+            pos.entry_price = execution_price
             pos.update_pnl(mark_price)
+            self.wallet_balance -= fee_open
+            self.realized_pnl_total -= fee_open
             pnl = pos.unrealized_pnl
 
             # 1. Catastrophic SL (-50% margin)
             cat_sl = pos.margin_used * self.catastrophic_sl_pct
+            if self._is_liquidation_required(pos, mark_price):
+                self.close_position(symbol, mark_price, reason="LIQUIDATION")
+                return
             if pnl <= cat_sl:
                 self.close_position(symbol, mark_price, reason=f"CATASTROPHIC_SL ({pnl:.2f})")
                 return
@@ -430,13 +499,54 @@ class EnhancedFuturesWallet:
 
     def _save_state(self):
         state = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "saved_at": self._now_ms(),
             "wallet_balance": self.wallet_balance,
             "realized_pnl_total": self.realized_pnl_total,
+            "symbol": self.symbol,
+            "state_namespace": self.state_namespace,
+            "maker_fee_rate": self.maker_fee_rate,
+            "taker_fee_rate": self.taker_fee_rate,
+            "maintenance_margin_ratio": self.maintenance_margin_ratio,
             "positions": {s: p.to_dict() for s, p in self.positions.items()},
             "position_history": self.position_history,
         }
-        with open(self.state_file, "w") as f:
-            json.dump(state, f, indent=2, default=str)
+        self._atomic_write_json(self.state_file, state)
+
+    def _atomic_write_json(self, path: Path, state: dict):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        payload = json.dumps(state, indent=2, default=str)
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if path.exists():
+            try:
+                path.replace(self.backup_state_file)
+            except Exception as e:
+                logger.warning(f"Failed to rotate wallet backup {path} -> {self.backup_state_file}: {e}")
+
+        temp_path.replace(path)
+
+    def _append_event(self, event_type: str, payload: dict):
+        event = {
+            "ts": self._now_ms(),
+            "event_type": event_type,
+            "symbol": self.symbol,
+            "namespace": self.state_namespace,
+            "payload": payload,
+        }
+        self.events_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+
+    @staticmethod
+    def _sanitize_path_component(value: str) -> str:
+        allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        sanitized = "".join(ch if ch in allowed else "_" for ch in value)
+        return sanitized or "default"
 
     def _sync_unrealized_total(self):
         with self.lock:
@@ -448,10 +558,12 @@ class EnhancedFuturesWallet:
         if not self.state_file.exists():
             return
         try:
-            with open(self.state_file, "r") as f:
-                state = json.load(f)
+            state = self._load_state_with_recovery()
             self.wallet_balance = state.get("wallet_balance", self.wallet_balance)
             self.realized_pnl_total = state.get("realized_pnl_total", 0.0)
+            self.maker_fee_rate = state.get("maker_fee_rate", self.maker_fee_rate)
+            self.taker_fee_rate = state.get("taker_fee_rate", self.taker_fee_rate)
+            self.maintenance_margin_ratio = state.get("maintenance_margin_ratio", self.maintenance_margin_ratio)
             self.positions = {
                 s: EnhancedPosition.from_dict(d)
                 for s, d in state.get("positions", {}).items()
@@ -463,6 +575,42 @@ class EnhancedFuturesWallet:
         except Exception as e:
             logger.warning(f"Failed to load state: {e}")
 
+    def _load_state_with_recovery(self) -> dict:
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as primary_err:
+            logger.warning(f"Primary wallet state load failed ({self.state_file}): {primary_err}")
+            if self.backup_state_file.exists():
+                with open(self.backup_state_file, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                logger.warning(f"Recovered wallet state from backup file {self.backup_state_file}")
+                return state
+            raise
+
+
+
+    def _now_ms(self) -> int:
+        return int(self._now_ms_fn())
+
+    def _calculate_fee(self, notional: float, is_taker: bool = True) -> float:
+        rate = self.taker_fee_rate if is_taker else self.maker_fee_rate
+        return abs(notional) * rate
+
+    def _execution_price(self, mark_price: float, side: PositionSide, is_entry: bool, setup: Optional[dict] = None) -> float:
+        setup = setup or {}
+        spread_bps = float(setup.get("spread_bps", 2.0))
+        slippage_bps = float(setup.get("slippage_bps", 3.0))
+        bump = (spread_bps + slippage_bps) / 10000.0
+        if is_entry:
+            return mark_price * (1 + bump) if side == PositionSide.LONG else mark_price * (1 - bump)
+        return mark_price * (1 - bump) if side == PositionSide.LONG else mark_price * (1 + bump)
+
+    def _is_liquidation_required(self, pos: EnhancedPosition, mark_price: float) -> bool:
+        pos.update_pnl(mark_price)
+        equity = (pos.margin_used + pos.unrealized_pnl)
+        maintenance = pos.notional * self.maintenance_margin_ratio
+        return equity <= maintenance
     def reset(self):
         with self.lock:
             self.positions.clear()
