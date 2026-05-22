@@ -210,7 +210,7 @@ def test_runtime_equals_replay_after_lifecycle_sequence(tmp_path, monkeypatch):
     w.close_position("ATOMUSDT", mark_price=104, reason="FINAL")
 
     replay = w.replay_portfolio_state()
-    assert replay.wallet_balance + Decimal("1000") == w.wallet_balance
+    assert replay.wallet_balance == w.wallet_balance
     assert replay.realized_pnl_total == w.realized_pnl_total
     assert len(replay.open_positions) == len([p for p in w.positions.values() if p.status == "OPEN"])
 
@@ -225,5 +225,84 @@ def test_restart_recovery_matches_replay(tmp_path, monkeypatch):
     w._save_state()
 
     w2 = EnhancedFuturesWallet(symbol=w.symbol, state_namespace=w.state_namespace)
-    assert w2.wallet_balance == replay_before.wallet_balance + Decimal("1000")
+    assert w2.wallet_balance == replay_before.wallet_balance
     assert w2.realized_pnl_total == replay_before.realized_pnl_total
+
+
+def test_phase4_snapshot_features_and_phase5_observability(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    
+    # Fresh wallet with max_snapshots=3 to test rotation
+    w = _fresh_wallet("OPUSDT")
+    w.max_snapshots = 3
+    
+    # Check initial metrics
+    assert w.replay_duration_ms == 0.0
+    assert w.delta_size == 0
+    
+    # Apply some state transitions
+    w.open_position("OPUSDT", _setup(), mark_price=100)
+    w._save_state()  # Snapshot 1
+    
+    w.apply_funding("OPUSDT", Decimal("0.0001"))
+    w._save_state()  # Snapshot 2
+    
+    w.partial_close("OPUSDT", mark_price=105, pct=Decimal("0.5"), reason="P1")
+    w._save_state()  # Snapshot 3
+    
+    w.close_position("OPUSDT", mark_price=106, reason="Close")
+    w._save_state()  # Snapshot 4
+    
+    # 1. Test Snapshot Rotation in SQLite
+    with sqlite3.connect(w.db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        assert count <= 3, f"Rotation failed: count={count}"
+        
+        # Grab state_json from the latest snapshot
+        state_json = conn.execute("SELECT state_json FROM snapshots ORDER BY ts DESC LIMIT 1").fetchone()[0]
+        assert state_json.startswith("v1_gzip_b64:"), "Encoding/Compression format mismatch"
+
+    # 2. Test Observability methods (Phase 5)
+    timeline = w.get_position_timeline("OPUSDT")
+    assert len(timeline) >= 4  # ORDER_CREATED, ORDER_FILLED, POSITION_OPENED, etc.
+    
+    funding_history = w.get_funding_history("OPUSDT")
+    assert len(funding_history) == 1
+    assert funding_history[0]["symbol"] == "OPUSDT"
+    
+    past_state = w.replay_until(w._now_ms() - 1000)
+    assert past_state is not None
+    
+    # Test compare_runtime_vs_replay
+    diff_report = w.compare_runtime_vs_replay()
+    assert diff_report["in_sync"] is True
+    
+    # 3. Test Bootstrap Metrics recovery (Phase 4)
+    w2 = EnhancedFuturesWallet(symbol=w.symbol, state_namespace=w.state_namespace, max_snapshots=3)
+    assert w2.recovery_latency_ms > 0
+    assert w2.delta_size == 0
+    
+    # Emit an event without saving, then reload to verify delta_size > 0
+    w2._emit_event("ORDER_CREATED", {
+        "order_id": "test-delta-1",
+        "symbol": "OPUSDT",
+        "side": "LONG",
+        "quantity": "1.0",
+        "status": "PENDING",
+        "order_type": "MARKET",
+        "reduce_only": False,
+        "trigger_price": None,
+        "limit_price": None,
+        "expires_at": None,
+    })
+    
+    w3 = EnhancedFuturesWallet(symbol=w.symbol, state_namespace=w.state_namespace, max_snapshots=3)
+    assert w3.delta_size == 1
+    assert w3.replay_duration_ms >= 0
+
+    # 4. Test Snapshot Integrity Check failure
+    with sqlite3.connect(w.db_file) as conn:
+        conn.execute("UPDATE snapshots SET state_json = 'v1_gzip_b64:corrupt_hash:corrupt_base64'")
+        conn.commit()
+    
+    assert w3._load_from_db_snapshot_and_replay() is False

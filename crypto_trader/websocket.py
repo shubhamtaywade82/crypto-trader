@@ -24,7 +24,7 @@ import time
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Any
 from collections import deque
 
 import websocket
@@ -486,7 +486,7 @@ class WebSocketPositionManager:
         # 1. Catastrophic SL
         cat_sl = pos.margin_used * Decimal(str(self.wallet.catastrophic_sl_pct))
         if pnl <= cat_sl:
-            self.wallet.close_position(self.symbol, data.mark_price, f"CATASTROPHIC_SL ({pnl:.2f})")
+            self._handle_close(data.mark_price, f"CATASTROPHIC_SL ({pnl:.2f})")
             return
 
         # 2. Playbook-specific exits
@@ -496,24 +496,26 @@ class WebSocketPositionManager:
         elif pos.playbook == Playbook.SWING:
             self._check_swing(pos, price_for_sl_tp, price_for_trail, data)
 
-    def _check_intraday(self, pos, price: Decimal, data: WSMarketData):
+    def _check_intraday(self, pos, price: float, data: WSMarketData):
         from .wallet import PositionSide
         # Simple TP/SL using mid price
-        tp_price = Decimal(str(pos.tp_levels[0]["price"]))
-        sl_price = Decimal(str(pos.sl_price))
         if pos.side == PositionSide.LONG:
-            if price >= tp_price:
-                self.wallet.close_position(self.symbol, price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
+            if pos.tp_levels and price >= pos.tp_levels[0]["price"]:
+                reason = f"TP_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
-            if price <= sl_price:
-                self.wallet.close_position(self.symbol, price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            if price <= pos.sl_price:
+                reason = f"SL_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
         else:
-            if price <= tp_price:
-                self.wallet.close_position(self.symbol, price, f"TP_HIT ({pos.unrealized_pnl:.2f})")
+            if pos.tp_levels and price <= pos.tp_levels[0]["price"]:
+                reason = f"TP_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
-            if price >= sl_price:
-                self.wallet.close_position(self.symbol, price, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            if price >= pos.sl_price:
+                reason = f"SL_HIT ({pos.unrealized_pnl:.2f})"
+                self._handle_close(price, reason)
                 return
 
         # Time stop (using candle time from WS kline)
@@ -535,23 +537,20 @@ class WebSocketPositionManager:
                 hit = True
 
             if hit:
-                tp["hit"] = True
-                self.wallet.partial_close(self.symbol, price_sl_tp, tp["pct"], f"{tp['label']} HIT")
+                self.wallet.partial_close(self.symbol, price_sl_tp, tp["pct"], f"{tp['label']} HIT", tp_label=tp["label"])
                 if tp["label"] == "TP1":
-                    pos.sl_price = pos.entry_price
-                    logger.info(f"[SL ADJUSTED] {pos.symbol} → BREAKEVEN")
+                    self.wallet.adjust_sl_price(self.symbol, pos.entry_price)
                 elif tp["label"] == "TP2":
-                    pos.trailing_active = True
-                    logger.info(f"[TRAIL ACTIVE] {pos.symbol}")
+                    self.wallet.activate_trailing_stop(self.symbol)
                 return
 
         # SL check
         sl_price = Decimal(str(pos.sl_price))
         if pos.side == PositionSide.LONG and price_sl_tp <= sl_price:
-            self.wallet.close_position(self.symbol, price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            self._handle_close(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
         elif pos.side == PositionSide.SHORT and price_sl_tp >= sl_price:
-            self.wallet.close_position(self.symbol, price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            self._handle_close(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
 
         # Trailing stop using LTP (more reactive to momentum)
@@ -563,7 +562,7 @@ class WebSocketPositionManager:
                 pos._highest_since_tp2 = max(highest, price_trail)
                 trail_price = pos._highest_since_tp2 * Decimal("0.995")  # 0.5% trail
                 if price_trail < trail_price:
-                    self.wallet.close_position(self.symbol, price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
+                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
                     return
             else:
                 if not hasattr(pos, '_lowest_since_tp2'):
@@ -572,5 +571,26 @@ class WebSocketPositionManager:
                 pos._lowest_since_tp2 = min(lowest, price_trail)
                 trail_price = pos._lowest_since_tp2 * Decimal("1.005")
                 if price_trail > trail_price:
-                    self.wallet.close_position(self.symbol, price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
+                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
                     return
+
+    def _handle_close(self, price: Any, reason: str):
+        """Internal helper to close position and publish event."""
+        # Ensure price is converted to float for event and wallet if needed
+        f_price = float(price)
+        closed_pos = self.wallet.close_position(self.symbol, f_price, reason)
+        if closed_pos and self.event_bus:
+            from .events import TradeClosedEvent
+            # Calculate metrics
+            pnl_pct = (float(closed_pos.realized_pnl) / float(closed_pos.margin_used) * 100) if float(closed_pos.margin_used) > 0 else 0
+            duration = (time.time() - closed_pos.open_time / 1000) / 60 if hasattr(closed_pos, 'open_time') else 0
+            
+            self.event_bus.publish(TradeClosedEvent(
+                symbol=self.symbol,
+                side=closed_pos.side.value,
+                realized_pnl=float(closed_pos.realized_pnl),
+                pnl_percent=pnl_pct,
+                exit_price=f_price,
+                reason=reason,
+                duration_minutes=duration
+            ))
