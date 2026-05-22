@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Tuple, Optional
+from decimal import Decimal
 
 logger = logging.getLogger("crypto_trader.risk")
 
@@ -58,7 +59,9 @@ class RiskManager:
                 remaining = int((self.cooldown_after_loss_seconds - elapsed) // 60) + 1
                 return False, f"Cooldown after loss active ({remaining}m remaining)"
         if current_balance is not None and self.peak_balance and self.peak_balance > 0:
-            dd = (self.peak_balance - current_balance) / self.peak_balance
+            cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
+            peak = float(self.peak_balance) if isinstance(self.peak_balance, Decimal) else float(self.peak_balance)
+            dd = (peak - cur) / peak
             if dd >= self.max_drawdown_pct:
                 return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
         return True, "OK"
@@ -83,10 +86,12 @@ class RiskManager:
         self._save_state()
 
     def update_peak_balance(self, current_balance: float):
-        if current_balance <= 0:
+        cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
+        if cur <= 0:
             return
-        if self.peak_balance is None or current_balance > self.peak_balance:
-            self.peak_balance = current_balance
+        peak = float(self.peak_balance) if self.peak_balance is not None else None
+        if peak is None or cur > peak:
+            self.peak_balance = cur
             self._save_state()
 
     def reset_consecutive_losses(self):
