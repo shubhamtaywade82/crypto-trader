@@ -2,7 +2,7 @@ from decimal import Decimal
 import sqlite3
 import uuid
 
-from crypto_trader.wallet import DATA_DIR, EnhancedFuturesWallet, Playbook, PositionSide
+from crypto_trader.wallet import DATA_DIR, EnhancedFuturesWallet, Playbook, PositionSide, OrderType
 
 
 def _setup(side=PositionSide.LONG):
@@ -91,3 +91,30 @@ def test_multi_fill_emits_partial_fill_events(tmp_path, monkeypatch):
         filled_count = conn.execute("SELECT COUNT(*) FROM events WHERE event_type='ORDER_FILLED'").fetchone()[0]
     assert partial_count == 2
     assert filled_count >= 1
+
+
+def test_limit_order_triggers_and_cancel_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("BNBUSDT")
+    o = w.place_pending_order(
+        symbol="BNBUSDT",
+        side=PositionSide.LONG,
+        quantity=Decimal("10"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("99"),
+    )
+    assert o.status.value == "PENDING"
+    w.evaluate_pending_orders("BNBUSDT", mark_price=101)
+    assert w.orders[o.id].status.value == "PENDING"
+    w.evaluate_pending_orders("BNBUSDT", mark_price=99)
+    assert w.orders[o.id].status.value == "FILLED"
+
+    o2 = w.place_pending_order(
+        symbol="BNBUSDT",
+        side=PositionSide.SHORT,
+        quantity=Decimal("2"),
+        order_type=OrderType.STOP_MARKET,
+        trigger_price=Decimal("105"),
+    )
+    assert w.cancel_order(o2.id) is True
+    assert w.orders[o2.id].status.value == "CANCELLED"

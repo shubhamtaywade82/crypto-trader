@@ -42,10 +42,14 @@ class OrderStatus(Enum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
 
 
 class OrderType(Enum):
     MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP_MARKET = "STOP_MARKET"
+    TAKE_PROFIT = "TAKE_PROFIT"
 
 
 @dataclass
@@ -57,6 +61,10 @@ class Order:
     quantity: Decimal
     status: OrderStatus
     created_at: int
+    reduce_only: bool = False
+    trigger_price: Optional[Decimal] = None
+    limit_price: Optional[Decimal] = None
+    expires_at: Optional[int] = None
     filled_quantity: Decimal = Decimal("0")
     avg_fill_price: Decimal = Decimal("0")
 
@@ -99,6 +107,11 @@ class PortfolioReducer:
                     "remaining_quantity": Decimal(str(payload.get("quantity", "0"))),
                     "avg_fill_price": Decimal("0"),
                     "status": payload.get("status", OrderStatus.NEW.value),
+                    "order_type": payload.get("order_type", OrderType.MARKET.value),
+                    "reduce_only": bool(payload.get("reduce_only", False)),
+                    "trigger_price": Decimal(str(payload.get("trigger_price"))) if payload.get("trigger_price") is not None else None,
+                    "limit_price": Decimal(str(payload.get("limit_price"))) if payload.get("limit_price") is not None else None,
+                    "expires_at": int(payload.get("expires_at")) if payload.get("expires_at") is not None else None,
                 }
             return
 
@@ -130,6 +143,12 @@ class PortfolioReducer:
             oid = payload.get("order_id")
             if oid and oid in state.orders:
                 state.orders[oid]["status"] = OrderStatus.REJECTED.value
+            return
+        
+        if et == "ORDER_EXPIRED":
+            oid = payload.get("order_id")
+            if oid and oid in state.orders:
+                state.orders[oid]["status"] = OrderStatus.EXPIRED.value
             return
 
         if et == "POSITION_OPENED":
@@ -835,22 +854,50 @@ class EnhancedFuturesWallet:
                 existing.filled_quantity = odata.get("filled_quantity", existing.filled_quantity)
                 existing.avg_fill_price = odata.get("avg_fill_price", existing.avg_fill_price)
                 existing.status = OrderStatus(odata.get("status", existing.status.value))
+                existing.order_type = OrderType(odata.get("order_type", existing.order_type.value))
+                existing.reduce_only = bool(odata.get("reduce_only", existing.reduce_only))
+                existing.trigger_price = odata.get("trigger_price", existing.trigger_price)
+                existing.limit_price = odata.get("limit_price", existing.limit_price)
+                existing.expires_at = odata.get("expires_at", existing.expires_at)
                 synced[oid] = existing
             else:
                 synced[oid] = Order(
                     id=oid,
                     symbol=odata.get("symbol", self.symbol),
                     side=side,
-                    order_type=OrderType.MARKET,
+                    order_type=OrderType(odata.get("order_type", OrderType.MARKET.value)),
                     quantity=odata.get("quantity", Decimal("0")),
                     status=OrderStatus(odata.get("status", OrderStatus.NEW.value)),
                     created_at=self._now_ms(),
+                    reduce_only=bool(odata.get("reduce_only", False)),
+                    trigger_price=odata.get("trigger_price"),
+                    limit_price=odata.get("limit_price"),
+                    expires_at=odata.get("expires_at"),
                     filled_quantity=odata.get("filled_quantity", Decimal("0")),
                     avg_fill_price=odata.get("avg_fill_price", Decimal("0")),
                 )
         self.orders = synced
 
     def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
+        return self._create_order_with_type(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=OrderType.MARKET,
+        )
+
+    def _create_order_with_type(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        reduce_only: bool = False,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        expires_at: Optional[int] = None,
+    ) -> Order:
         order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
         self._emit_event(
             "ORDER_CREATED",
@@ -860,9 +907,80 @@ class EnhancedFuturesWallet:
                 "side": side.value,
                 "quantity": quantity,
                 "status": OrderStatus.PENDING.value,
+                "order_type": order_type.value,
+                "reduce_only": reduce_only,
+                "trigger_price": trigger_price,
+                "limit_price": limit_price,
+                "expires_at": expires_at,
             },
         )
         return self.orders[order_id]
+
+    def cancel_order(self, order_id: str, reason: str = "USER_CANCEL") -> bool:
+        with self.lock:
+            order = self.orders.get(order_id)
+            if not order:
+                return False
+            if order.status in {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                return False
+            self._emit_event("ORDER_CANCELLED", {"order_id": order_id, "reason": reason})
+            return True
+
+    def place_pending_order(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        with self.lock:
+            return self._create_order_with_type(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                order_type=order_type,
+                reduce_only=reduce_only,
+                trigger_price=trigger_price,
+                limit_price=limit_price,
+                expires_at=expires_at,
+            )
+
+    def evaluate_pending_orders(self, symbol: str, mark_price: float):
+        with self.lock:
+            price = self._to_decimal(mark_price)
+            for order in list(self.orders.values()):
+                if order.symbol != symbol or order.status != OrderStatus.PENDING:
+                    continue
+                if order.expires_at and self._now_ms() >= order.expires_at:
+                    self._emit_event("ORDER_EXPIRED", {"order_id": order.id})
+                    continue
+                if self._should_trigger_order(order, price):
+                    fill_price = self._execution_price(price, order.side, is_entry=True)
+                    remaining = max(Decimal("0"), order.quantity - order.filled_quantity)
+                    if remaining > Decimal("0"):
+                        self._execute_order_in_chunks(
+                            order=order,
+                            total_quantity=remaining,
+                            fill_price=fill_price,
+                            fee_rate=self.taker_fee_rate,
+                            chunk_count=1,
+                        )
+
+    def _should_trigger_order(self, order: Order, mark_price: Decimal) -> bool:
+        if order.order_type == OrderType.MARKET:
+            return True
+        if order.order_type == OrderType.LIMIT and order.limit_price is not None:
+            return mark_price <= order.limit_price if order.side == PositionSide.LONG else mark_price >= order.limit_price
+        if order.order_type == OrderType.STOP_MARKET and order.trigger_price is not None:
+            return mark_price >= order.trigger_price if order.side == PositionSide.LONG else mark_price <= order.trigger_price
+        if order.order_type == OrderType.TAKE_PROFIT and order.trigger_price is not None:
+            return mark_price >= order.trigger_price if order.side == PositionSide.LONG else mark_price <= order.trigger_price
+        return False
 
     def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal, sequence: int = 1):
         prospective_filled = order.filled_quantity + quantity
