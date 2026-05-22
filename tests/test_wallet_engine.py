@@ -180,3 +180,19 @@ def test_reduce_only_rejects_exposure_increase_and_halt_policy(tmp_path, monkeyp
     w._run_invariant_checks()
     assert w.halted is True
     assert any(e.get("event_type") == "INVARIANT_VIOLATION" for e in events)
+
+
+def test_event_observability_helpers(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("UNIUSDT")
+    s = _setup()
+    s["fill_chunks"] = 2
+    w.open_position("UNIUSDT", s, mark_price=100)
+    order = next(iter(w.orders.values()))
+
+    timeline = w.get_order_timeline(order.id)
+    assert len(timeline) >= 2
+    assert timeline[0]["payload"]["order_id"] == order.id
+
+    recent_fills = w.get_recent_events(limit=10, event_type="ORDER_FILLED")
+    assert len(recent_fills) >= 1

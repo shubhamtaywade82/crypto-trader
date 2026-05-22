@@ -1237,6 +1237,26 @@ class EnhancedFuturesWallet:
                 fill_count += 1
         return {"event_count": event_count, "order_count": order_count, "fill_count": fill_count}
 
+    def get_order_timeline(self, order_id: str) -> List[dict]:
+        """Return chronological event timeline for one order id."""
+        timeline: List[dict] = []
+        for event in self._iter_events():
+            payload = event.get("payload", {})
+            if payload.get("order_id") == order_id:
+                timeline.append(event)
+        timeline.sort(key=lambda e: (int(e.get("ts", 0)), e.get("event_type", "")))
+        return timeline
+
+    def get_recent_events(self, limit: int = 100, event_type: Optional[str] = None) -> List[dict]:
+        """Simple event browser helper for observability tooling."""
+        rows: List[dict] = []
+        for event in self._iter_events():
+            if event_type and event.get("event_type") != event_type:
+                continue
+            rows.append(event)
+        rows.sort(key=lambda e: int(e.get("ts", 0)), reverse=True)
+        return rows[: max(1, limit)]
+
     def replay_portfolio_state(self) -> PortfolioState:
         """Rebuild a minimal portfolio view from event log only."""
         state = PortfolioState()
