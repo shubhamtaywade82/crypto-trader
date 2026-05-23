@@ -61,9 +61,11 @@ class WebSocketTradingEngine:
         log_ws: bool = False,
         log_llm: bool = False,
         wallet = None,
+        event_bus = None,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
+        self.event_bus = event_bus
 
         rest_logged = log_responses or log_rest
         ws_logged = log_responses or log_ws
@@ -144,11 +146,34 @@ class WebSocketTradingEngine:
             ws_feed=self.ws_feed,
             wallet=self.wallet,
             check_interval_ms=1000,  # Check every 1 second
+            event_bus=self.event_bus,
         )
 
         # State
         self._last_signal_candle_ms = 0
         self._pending_entry = None  # Signal waiting for WebSocket confirmation
+        self._halted = False
+
+        # Command Listeners
+        if self.event_bus:
+            from .events import CommandEvent
+            self.event_bus.subscribe(CommandEvent, self._handle_command)
+
+    def _handle_command(self, event):
+        """Handle incoming commands from EventBus (e.g., Telegram)."""
+        if event.command == "KILL_ALL" or (event.command == "KILL" and event.params.get("symbol") == self.symbol):
+            self._halted = True
+            logger.warning(f"🛑 [HALTED] {self.symbol} received KILL command.")
+            # Optional: Close all positions immediately
+            # self.wallet.close_all_positions(reason="REMOTE_KILL")
+        
+        elif event.command == "RESUME_ALL" or (event.command == "RESUME" and event.params.get("symbol") == self.symbol):
+            self._halted = False
+            logger.info(f"✅ [RESUMED] {self.symbol} received RESUME command.")
+
+        elif event.command == "STATUS":
+            # Engine will respond via logs or potentially publish a StatusEvent
+            logger.info(f"📊 [STATUS] {self.symbol} | Halted: {self._halted} | Pos: {self.wallet.get_open_position(self.symbol) is not None}")
 
     # ── Lifecycle ──
 
@@ -198,6 +223,10 @@ class WebSocketTradingEngine:
 
     def _signal_tick(self):
         """Generate signals using REST data (runs every 5 min)."""
+        if self._halted:
+            logger.debug(f"[SIGNAL-TICK] {self.symbol} is halted. Skipping.")
+            return
+
         logger.info(f"--- Signal Tick: {self.symbol} ---")
 
         try:
@@ -413,6 +442,26 @@ class WebSocketTradingEngine:
                 f"Margin={pos.margin_used:.2f} | Score={final_score:.2f} | "
                 f"Spread={spread_pct:.3f}% | Slippage={slippage:.3f}%"
             )
+
+            # Publish Event for Telegram
+            if self.event_bus:
+                from .events import TradeOpenedEvent
+                self.event_bus.publish(TradeOpenedEvent(
+                    symbol=self.symbol,
+                    side=setup["side"].value,
+                    leverage=self.wallet.leverage,
+                    entry_price=entry_price,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    margin=pos.margin_used,
+                    notional=pos.notional,
+                    regime=regime.value,
+                    tech_score=tech_score,
+                    llm_decision="ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
+                    funding=funding_rate,
+                    oi_delta=oi_delta,
+                    liquidation_price=pos.liquidation_price
+                ))
 
     # ── WebSocket Callbacks ──
 
