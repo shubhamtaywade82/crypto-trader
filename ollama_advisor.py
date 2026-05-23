@@ -40,7 +40,7 @@ logger = logging.getLogger("OllamaAdvisor")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")  # Fast, good at JSON
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "320"))   # Seconds — covers cold-start (~34s) + full prompt inference
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))   # Seconds — covers cold-start (~34s) + full prompt inference
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "1024"))
 
 # Cache settings
