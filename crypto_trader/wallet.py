@@ -193,7 +193,8 @@ class PortfolioReducer:
 
         if et == "POSITION_PARTIALLY_CLOSED":
             symbol = payload.get("symbol")
-            pnl = Decimal(str(payload.get("pnl", "0")))
+            pnl_str = payload.get("pnl", payload.get("remaining_pnl", "0"))
+            pnl = Decimal(str(pnl_str))
             fee = Decimal(str(payload.get("fee", "0")))
             state.wallet_balance += (pnl - fee)
             state.realized_pnl_total += (pnl - fee)
@@ -1187,6 +1188,17 @@ class EnhancedFuturesWallet:
                 lev = int(pdata.get("leverage", self.leverage))
                 prior = self.positions.get(symbol)
                 prior_tp = prior.tp_levels if prior and prior.tp_levels else []
+                tp_levels = pdata.get("tp_levels", prior_tp)
+                if not tp_levels:
+                    # Retroactive fallback for legacy database positions
+                    if playbook == Playbook.INTRADAY:
+                        p1 = entry * Decimal("1.01" if side == PositionSide.LONG else "0.99")
+                        p2 = entry * Decimal("1.02" if side == PositionSide.LONG else "0.98")
+                        tp_levels = [
+                            {"label": "TP1", "pct": 0.5, "price": p1, "hit": False},
+                            {"label": "TP2", "pct": 0.5, "price": p2, "hit": False}
+                        ]
+
                 current[symbol] = EnhancedPosition(
                     symbol=symbol,
                     side=side,
@@ -1199,7 +1211,7 @@ class EnhancedFuturesWallet:
                     leverage=lev,
                     open_time=int(pdata.get("open_time", self._now_ms())),
                     sl_price=pdata.get("sl_price", Decimal("0")),
-                    tp_levels=pdata.get("tp_levels", []),
+                    tp_levels=tp_levels,
                     trailing_active=bool(pdata.get("trailing_active", False)),
                     time_stop_hours=int(pdata.get("time_stop_hours", 18)),
                 )
