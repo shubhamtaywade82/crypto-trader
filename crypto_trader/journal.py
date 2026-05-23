@@ -143,25 +143,55 @@ class TradeJournal:
     def analyze_llm_contribution(self, days: int = 30) -> Dict:
         """Analyze whether LLM-filtered trades performed better."""
         entries = self.get_recent(days)
-        trades_with_llm = []
-        trades_without_llm = []
 
+        # Pass 1: index open records by trade_id (no "event" key = open record)
+        open_records: Dict[str, dict] = {}
         for e in entries:
             if e.get("event") == "close":
                 continue
-            if e.get("llm_weight", 0) > 0:
-                trades_with_llm.append(e)
-            else:
-                trades_without_llm.append(e)
+            tid = e.get("trade_id")
+            if tid:
+                open_records[tid] = e
+
+        # Pass 2: join close records with their opens to get full trade data
+        closed_trades = []
+        for e in entries:
+            if e.get("event") != "close":
+                continue
+            tid = e.get("trade_id")
+            open_rec = open_records.get(tid)
+            if open_rec and e.get("realized_pnl") is not None:
+                closed_trades.append({
+                    "trade_id": tid,
+                    "realized_pnl": float(e["realized_pnl"]),
+                    "llm_weight": open_rec.get("llm_weight", 0.0),
+                    "llm_bias": open_rec.get("llm_bias"),
+                    "regime": open_rec.get("regime"),
+                })
+
+        with_llm = [t for t in closed_trades if t["llm_weight"] > 0]
+        without_llm = [t for t in closed_trades if t["llm_weight"] == 0]
 
         def avg_pnl(trades):
-            pnls = [t.get("realized_pnl", 0) for t in trades if t.get("realized_pnl") is not None]
-            return sum(pnls) / len(pnls) if pnls else 0
+            pnls = [t["realized_pnl"] for t in trades]
+            return round(sum(pnls) / len(pnls), 4) if pnls else 0.0
+
+        def win_rate(trades):
+            if not trades:
+                return 0.0
+            return round(sum(1 for t in trades if t["realized_pnl"] > 0) / len(trades), 4)
+
+        total_pnl = sum(t["realized_pnl"] for t in closed_trades)
 
         return {
-            "with_llm_count": len(trades_with_llm),
-            "with_llm_avg_pnl": avg_pnl(trades_with_llm),
-            "without_llm_count": len(trades_without_llm),
-            "without_llm_avg_pnl": avg_pnl(trades_without_llm),
-            "llm_value_add": avg_pnl(trades_with_llm) - avg_pnl(trades_without_llm),
+            "total_trades": len(closed_trades),
+            "total_pnl": round(total_pnl, 4),
+            "win_rate": win_rate(closed_trades),
+            "with_llm_count": len(with_llm),
+            "with_llm_avg_pnl": avg_pnl(with_llm),
+            "with_llm_win_rate": win_rate(with_llm),
+            "without_llm_count": len(without_llm),
+            "without_llm_avg_pnl": avg_pnl(without_llm),
+            "without_llm_win_rate": win_rate(without_llm),
+            "llm_value_add": round(avg_pnl(with_llm) - avg_pnl(without_llm), 4),
         }

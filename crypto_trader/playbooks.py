@@ -35,7 +35,7 @@ class PlaybookA:
         rsi_lo: float = 40,
         rsi_hi: float = 60,
         ema_period: int = 21,
-        min_score: float = 0.60,
+        min_score: float = 0.75,
     ):
         self.sl_pct = sl_pct
         self.tp_pct = tp_pct
@@ -46,7 +46,7 @@ class PlaybookA:
         self.ema_period = ema_period
         self.min_score = min_score
 
-    def evaluate(self, df_1h: pd.DataFrame, regime: MarketRegime) -> Optional[Dict]:
+    def evaluate(self, df_1h: pd.DataFrame, regime: MarketRegime, structure: Optional[Dict] = None) -> Optional[Dict]:
         if len(df_1h) < 30:
             return None
 
@@ -134,6 +134,44 @@ class PlaybookA:
             score += 0.20
             checks_passed += 1
 
+        # SMC confirmation gates (from MarketStructureAnalyzer output)
+        smc_bonus = 0.0
+        if structure:
+            current_price = float(price)
+            recent_bos = structure.get("recent_bos")
+            recent_sweep = structure.get("recent_sweep")
+            unmitigated_obs = structure.get("unmitigated_order_blocks", [])
+            unmitigated_fvgs = structure.get("unmitigated_fvgs", [])
+
+            if direction == PositionSide.LONG:
+                if recent_bos and recent_bos["type"] == "BULLISH" and recent_bos.get("candles_ago", 999) <= 10:
+                    smc_bonus += 0.15
+                if recent_sweep and recent_sweep["type"] == "BULLISH" and recent_sweep.get("candles_ago", 999) <= 5:
+                    smc_bonus += 0.15
+                for ob in unmitigated_obs:
+                    if ob["type"] == "BULLISH" and float(ob["low"]) <= current_price <= float(ob["high"]):
+                        smc_bonus += 0.15
+                        break
+                for fvg in unmitigated_fvgs:
+                    if fvg["type"] == "BULLISH" and float(fvg["bottom"]) > current_price:
+                        smc_bonus += 0.10
+                        break
+            else:
+                if recent_bos and recent_bos["type"] == "BEARISH" and recent_bos.get("candles_ago", 999) <= 10:
+                    smc_bonus += 0.15
+                if recent_sweep and recent_sweep["type"] == "BEARISH" and recent_sweep.get("candles_ago", 999) <= 5:
+                    smc_bonus += 0.15
+                for ob in unmitigated_obs:
+                    if ob["type"] == "BEARISH" and float(ob["low"]) <= current_price <= float(ob["high"]):
+                        smc_bonus += 0.15
+                        break
+                for fvg in unmitigated_fvgs:
+                    if fvg["type"] == "BEARISH" and float(fvg["top"]) < current_price:
+                        smc_bonus += 0.10
+                        break
+
+        score += smc_bonus
+
         if score < self.min_score:
             return None
 
@@ -154,7 +192,7 @@ class PlaybookA:
             "time_stop_hours": self.time_h,
             "score": round(score, 3),
             "checks": f"{checks_passed}/{total_checks}",
-            "reason": f"PlaybookA: EMA21 pullback + vol + RSI({rsi:.1f}) + rejection | score={score:.2f}",
+            "reason": f"PlaybookA: EMA21 pullback + vol + RSI({rsi:.1f}) + rejection | score={score:.2f} (smc={smc_bonus:.2f})",
         }
 
 
@@ -179,7 +217,7 @@ class PlaybookB:
         rsi_long_hi: float = 65,
         rsi_short_lo: float = 35,
         rsi_short_hi: float = 55,
-        min_score: float = 0.65,
+        min_score: float = 0.75,
     ):
         self.sl_pct = sl_pct
         self.tp1_pct = tp1_pct
@@ -196,6 +234,7 @@ class PlaybookB:
         df_1h: pd.DataFrame,
         df_4h: pd.DataFrame,
         regime: MarketRegime,
+        structure: Optional[Dict] = None,
     ) -> Optional[Dict]:
         if len(df_4h) < 10 or len(df_1h) < 30:
             return None
@@ -280,6 +319,43 @@ class PlaybookB:
         score += 0.20
         checks_passed += 1
 
+        # SMC confirmation gates (from MarketStructureAnalyzer output)
+        smc_bonus = 0.0
+        if structure:
+            current_price = float(price)
+            recent_bos = structure.get("recent_bos")
+            unmitigated_obs = structure.get("unmitigated_order_blocks", [])
+            pa_signals = structure.get("price_action_signals", [])
+
+            if direction == PositionSide.LONG:
+                if recent_bos and recent_bos["type"] == "BULLISH" and recent_bos.get("candles_ago", 999) <= 10:
+                    smc_bonus += 0.20
+                for ob in unmitigated_obs:
+                    if (ob["type"] == "BULLISH"
+                            and breakout_level > 0
+                            and abs(float(ob["high"]) - breakout_level) / breakout_level < 0.005):
+                        smc_bonus += 0.15
+                        break
+                for sig in pa_signals:
+                    if sig["candle"] == "completed" and sig["pattern"] == "BULLISH_ENGULFING":
+                        smc_bonus += 0.10
+                        break
+            else:
+                if recent_bos and recent_bos["type"] == "BEARISH" and recent_bos.get("candles_ago", 999) <= 10:
+                    smc_bonus += 0.20
+                for ob in unmitigated_obs:
+                    if (ob["type"] == "BEARISH"
+                            and breakout_level > 0
+                            and abs(float(ob["low"]) - breakout_level) / breakout_level < 0.005):
+                        smc_bonus += 0.15
+                        break
+                for sig in pa_signals:
+                    if sig["candle"] == "completed" and sig["pattern"] == "BEARISH_ENGULFING":
+                        smc_bonus += 0.10
+                        break
+
+        score += smc_bonus
+
         if score < self.min_score:
             return None
 
@@ -295,5 +371,5 @@ class PlaybookB:
             "time_stop_hours": self.time_h,
             "score": round(score, 3),
             "checks": f"{checks_passed}/{total_checks}",
-            "reason": f"PlaybookB: 4H breakout + 1H retest | RSI(4H)={rsi_4h:.1f} | score={score:.2f}",
+            "reason": f"PlaybookB: 4H breakout + 1H retest | RSI(4H)={rsi_4h:.1f} | score={score:.2f} (smc={smc_bonus:.2f})",
         }

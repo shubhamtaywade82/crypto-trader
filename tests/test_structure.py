@@ -188,5 +188,30 @@ class TestMarketStructureAnalyzer(unittest.TestCase):
         self.assertEqual(pa_signals[0]['pattern'], 'BULLISH_PINBAR')
         self.assertEqual(pa_signals[0]['candle'], 'completed')
 
+    def test_playbooka_smc_gates_increase_score(self):
+        """SMC structure dict boosts PlaybookA score from below threshold to tradeable."""
+        from crypto_trader.playbooks import PlaybookA
+        from crypto_trader.regime import MarketRegime
+
+        df = self._create_flat_df(50, price=100.0)
+        pa = PlaybookA()  # min_score=0.75 (default after fix)
+
+        # Without SMC: base score=0.60 < min_score=0.75 → None
+        result_no_smc = pa.evaluate(df, MarketRegime.TRENDING_UP, structure=None)
+        self.assertIsNone(result_no_smc)
+
+        # With full bullish SMC: score = 0.60 + 0.55 = 1.15 > 0.75 → returns signal
+        mock_structure = {
+            "recent_bos": {"type": "BULLISH", "candles_ago": 5},
+            "recent_sweep": {"type": "BULLISH", "candles_ago": 3},
+            "unmitigated_order_blocks": [{"type": "BULLISH", "low": 99.0, "high": 101.0}],
+            "unmitigated_fvgs": [{"type": "BULLISH", "bottom": 102.0, "top": 103.5}],
+            "price_action_signals": [],
+        }
+        result_with_smc = pa.evaluate(df, MarketRegime.TRENDING_UP, structure=mock_structure)
+        self.assertIsNotNone(result_with_smc)
+        self.assertGreater(result_with_smc["score"], 0.60)
+
+
 if __name__ == '__main__':
     unittest.main()

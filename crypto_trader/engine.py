@@ -19,6 +19,7 @@ from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, LLMCircuitBreaker, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB
 from .regime import MarketRegimeAnalyzer, compute_ema
+from .structure import MarketStructureAnalyzer
 from .llm_advisor import OllamaAdvisor
 from .journal import TradeJournal
 from .market_state import OpenInterestTracker
@@ -141,6 +142,21 @@ class TradingEngine:
         regime, regime_score, df_4h = self.regime_analyzer.analyze(df_4h)
         logger.info(f"Regime: {regime.value} (score={regime_score:.2f})")
 
+        # 3. Market structure analysis (SMC signals for playbook gating)
+        structure = None
+        try:
+            msa = MarketStructureAnalyzer(df_1h, swing_window=3)
+            structure = msa.analyze()
+            recent_bos = structure.get("recent_bos")
+            logger.debug(
+                f"[STRUCTURE] BOS={recent_bos['type'] if recent_bos else 'None'} | "
+                f"OBs={len(structure.get('unmitigated_order_blocks', []))} | "
+                f"FVGs={len(structure.get('unmitigated_fvgs', []))}"
+            )
+        except Exception as e:
+            logger.warning(f"[STRUCTURE] MarketStructureAnalyzer failed: {e}")
+            structure = None
+
         oi_value = float(oi_data.get("openInterest", 0.0)) if isinstance(oi_data, dict) else 0.0
         oi_metrics = self.oi_tracker.update(oi_value)
         oi_delta = oi_metrics.oi_delta_15m
@@ -184,13 +200,13 @@ class TradingEngine:
             setup = None
 
             # Try Playbook A
-            setup = self.playbook_a.evaluate(df_1h, regime)
+            setup = self.playbook_a.evaluate(df_1h, regime, structure=structure)
             if setup:
                 logger.info(f"[PLAYBOOK A] Signal: {setup['side'].value} | score={setup['score']:.2f}")
 
             # Try Playbook B
             if not setup:
-                setup = self.playbook_b.evaluate(df_1h, df_4h, regime)
+                setup = self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure)
                 if setup:
                     logger.info(f"[PLAYBOOK B] Signal: {setup['side'].value} | score={setup['score']:.2f}")
 
