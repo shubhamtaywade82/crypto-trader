@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .data_feed import BinanceDataFeed
-from .websocket import BinanceWebSocketFeed, WebSocketPositionManager
+from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB
@@ -284,7 +284,18 @@ class WebSocketTradingEngine:
         self.risk_manager.update_peak_balance(self.wallet.margin_balance)
         can_trade, risk_reason = self.risk_manager.can_trade(current_balance=self.wallet.margin_balance)
         if not can_trade:
+            if not getattr(self, "_halt_published", False):
+                if self.event_bus:
+                    from .events import RiskHaltEvent
+                    self.event_bus.publish(RiskHaltEvent(
+                        reason=risk_reason,
+                        daily_pnl=float(self.wallet.realized_pnl_total),
+                        trades_today=self.risk_manager.daily_count
+                    ))
+                self._halt_published = True
             logger.info(f"[RISK] {risk_reason}")
+            return
+        self._halt_published = False
 
         # 5. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:

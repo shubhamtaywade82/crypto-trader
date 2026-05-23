@@ -51,7 +51,9 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     atr = compute_atr(df, period)
     plus_di = 100 * (plus_dm.ewm(alpha=1/period).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / atr)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    denominator = plus_di + minus_di
+    dx = np.where(denominator == 0, 0.0, 100 * (plus_di - minus_di).abs() / denominator)
+    dx = pd.Series(dx, index=plus_di.index)
     return dx.ewm(alpha=1/period).mean()
 
 def find_pivots(df: pd.DataFrame, window: int = 3) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:

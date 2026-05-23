@@ -44,7 +44,7 @@ class ColoredFormatter(logging.Formatter):
         if record.name == "crypto_trader.llm":
             MAGENTA = "\x1b[35;20m"
             record.msg = f"{MAGENTA}{record.msg}{self.RESET}"
-        elif record.name == "crypto_trader.websocket":
+        elif record.name == "crypto_trader.ws_client":
             ORANGE = "\x1b[38;5;208m"
             record.msg = f"{ORANGE}{record.msg}{self.RESET}"
         elif record.name == "crypto_trader.data_feed":

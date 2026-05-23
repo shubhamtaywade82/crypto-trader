@@ -193,7 +193,8 @@ class PortfolioReducer:
 
         if et == "POSITION_PARTIALLY_CLOSED":
             symbol = payload.get("symbol")
-            pnl = Decimal(str(payload.get("pnl", "0")))
+            pnl_str = payload.get("pnl", payload.get("remaining_pnl", "0"))
+            pnl = Decimal(str(pnl_str))
             fee = Decimal(str(payload.get("fee", "0")))
             state.wallet_balance += (pnl - fee)
             state.realized_pnl_total += (pnl - fee)
@@ -596,6 +597,7 @@ class EnhancedFuturesWallet:
                     "tp_label": tp_label,
                 },
             )
+            pos.partial_realized_pnl += (pnl_slice - fee_close)
 
             logger.info(
                 f"[PARTIAL CLOSE] {symbol} {pos.side.value} | Closed {pct*100:.0f}% | "
@@ -649,6 +651,35 @@ class EnhancedFuturesWallet:
             self._save_state()
             return pos
 
+    def _liquidate_position(self, symbol: str, mark_price: Decimal) -> None:
+        """Force-close at maintenance boundary with no additional fee charge."""
+        pos = self.get_open_position(symbol)
+        if not pos:
+            return
+        pos.update_pnl(mark_price)
+        self._emit_event(
+            "LIQUIDATION",
+            {
+                "symbol": symbol,
+                "side": pos.side.value,
+                "close_price": mark_price,
+                "fee": Decimal("0"),
+                "reason": "LIQUIDATION",
+                "remaining_pnl": pos.unrealized_pnl,
+            },
+        )
+        pos.unrealized_pnl = Decimal("0")
+        pos.status = "CLOSED"
+        pos.close_time = self._now_ms()
+        pos.close_price = mark_price
+        pos.close_reason = "LIQUIDATION"
+        self.position_history.append(pos.to_dict())
+        logger.warning(
+            f"[LIQUIDATION] {symbol} {pos.side.value} | Price={mark_price:.2f} | "
+            f"Margin Lost={pos.margin_used:.2f}"
+        )
+        self._save_state()
+
     def adjust_sl_price(self, symbol: str, new_sl_price: Decimal):
         """Adjust Stop Loss price for symbol position via events."""
         with self.lock:
@@ -682,7 +713,7 @@ class EnhancedFuturesWallet:
             # 1. Catastrophic SL (-50% margin)
             cat_sl = pos.margin_used * self._to_decimal(self.catastrophic_sl_pct)
             if self._is_liquidation_required(pos, mark_price):
-                self.close_position(symbol, mark_price, reason="LIQUIDATION")
+                self._liquidate_position(symbol, mark_price)
                 return
             if pnl <= cat_sl:
                 self.close_position(symbol, mark_price, reason=f"CATASTROPHIC_SL ({pnl:.2f})")
@@ -697,21 +728,22 @@ class EnhancedFuturesWallet:
             self._sync_unrealized_total()
 
     def _check_intraday_exits(self, symbol: str, pos: EnhancedPosition, mark_price: float, candle_close_time: int):
-        # Simple TP/SL
-        if pos.side == PositionSide.LONG:
-            if mark_price >= pos.tp_levels[0]["price"]:
+        # TP check (guarded: positions may have empty tp_levels after reducer sync)
+        if pos.tp_levels:
+            if pos.side == PositionSide.LONG and mark_price >= pos.tp_levels[0]["price"]:
                 self.close_position(symbol, mark_price, reason=f"TP_HIT ({pos.unrealized_pnl:.2f})")
                 return
-            if mark_price <= pos.sl_price:
-                self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
-                return
-        else:
-            if mark_price <= pos.tp_levels[0]["price"]:
+            elif pos.side == PositionSide.SHORT and mark_price <= pos.tp_levels[0]["price"]:
                 self.close_position(symbol, mark_price, reason=f"TP_HIT ({pos.unrealized_pnl:.2f})")
                 return
-            if mark_price >= pos.sl_price:
-                self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
-                return
+
+        # SL check
+        if pos.side == PositionSide.LONG and mark_price <= pos.sl_price:
+            self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            return
+        elif pos.side == PositionSide.SHORT and mark_price >= pos.sl_price:
+            self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
+            return
 
         # Time stop (using candle time, not wall clock)
         hours_open = (candle_close_time - pos.open_time) / 3_600_000
@@ -1154,6 +1186,19 @@ class EnhancedFuturesWallet:
                 qty = pdata["quantity"]
                 entry = pdata["entry_price"]
                 lev = int(pdata.get("leverage", self.leverage))
+                prior = self.positions.get(symbol)
+                prior_tp = prior.tp_levels if prior and prior.tp_levels else []
+                tp_levels = pdata.get("tp_levels", prior_tp)
+                if not tp_levels:
+                    # Retroactive fallback for legacy database positions
+                    if playbook == Playbook.INTRADAY:
+                        p1 = entry * Decimal("1.01" if side == PositionSide.LONG else "0.99")
+                        p2 = entry * Decimal("1.02" if side == PositionSide.LONG else "0.98")
+                        tp_levels = [
+                            {"label": "TP1", "pct": 0.5, "price": p1, "hit": False},
+                            {"label": "TP2", "pct": 0.5, "price": p2, "hit": False}
+                        ]
+
                 current[symbol] = EnhancedPosition(
                     symbol=symbol,
                     side=side,
@@ -1166,7 +1211,7 @@ class EnhancedFuturesWallet:
                     leverage=lev,
                     open_time=int(pdata.get("open_time", self._now_ms())),
                     sl_price=pdata.get("sl_price", Decimal("0")),
-                    tp_levels=pdata.get("tp_levels", []),
+                    tp_levels=tp_levels,
                     trailing_active=bool(pdata.get("trailing_active", False)),
                     time_stop_hours=int(pdata.get("time_stop_hours", 18)),
                 )
@@ -2099,7 +2144,7 @@ class EnhancedFuturesWallet:
         pos.update_pnl(mark_price)
         equity = (pos.margin_used + pos.unrealized_pnl)
         maintenance = pos.notional * self.maintenance_margin_ratio
-        return equity <= maintenance
+        return equity < maintenance
     def reset(self):
         with self.lock:
             self.positions.clear()
