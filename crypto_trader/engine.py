@@ -10,6 +10,7 @@ import time
 import uuid
 import logging
 import argparse
+from decimal import Decimal
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -242,10 +243,11 @@ class TradingEngine:
                         return self.wallet.get_summary()
                     # Risk-based sizing from stop distance (ATR-ready because stop comes from setup).
                     stop_distance = abs(mark_price - setup["sl_price"])
-                    risk_budget = self.wallet.margin_balance * 0.01
+                    risk_budget = self.wallet.margin_balance * Decimal("0.01")
                     size_multiplier = min(final_score / dynamic_threshold, 1.0)
-                    risk_budget *= size_multiplier
-                    quantity = (risk_budget / stop_distance) if stop_distance > 0 else 0.0
+                    risk_budget *= Decimal(str(size_multiplier))
+                    stop_distance_dec = Decimal(str(stop_distance))
+                    quantity = (risk_budget / stop_distance_dec) if stop_distance_dec > 0 else Decimal("0")
                     trade_id = str(uuid.uuid4())[:8]
                     pos = self.wallet.open_position(
                         self.symbol,

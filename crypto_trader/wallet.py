@@ -11,8 +11,12 @@ import time
 import logging
 import threading
 import sqlite3
+import gzip
+import base64
+import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Literal, Tuple, Callable
+from typing import Protocol
 from pathlib import Path
 from enum import Enum
 from decimal import Decimal, getcontext
@@ -42,10 +46,14 @@ class OrderStatus(Enum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
 
 
 class OrderType(Enum):
     MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP_MARKET = "STOP_MARKET"
+    TAKE_PROFIT = "TAKE_PROFIT"
 
 
 @dataclass
@@ -57,6 +65,10 @@ class Order:
     quantity: Decimal
     status: OrderStatus
     created_at: int
+    reduce_only: bool = False
+    trigger_price: Optional[Decimal] = None
+    limit_price: Optional[Decimal] = None
+    expires_at: Optional[int] = None
     filled_quantity: Decimal = Decimal("0")
     avg_fill_price: Decimal = Decimal("0")
 
@@ -70,6 +82,7 @@ class Fill:
     fill_price: Decimal
     fee: Decimal
     timestamp: int
+    sequence: int = 1
 
 
 @dataclass
@@ -79,6 +92,10 @@ class PortfolioState:
     open_positions: Dict[str, dict] = field(default_factory=dict)
     orders: Dict[str, dict] = field(default_factory=dict)
     fills: List[dict] = field(default_factory=list)
+    funding_total: Decimal = Decimal("0")
+    violations: List[dict] = field(default_factory=list)
+    last_ts: int = 0
+    events_applied: int = 0
 
 class PortfolioReducer:
     """Canonical event reducer for replay-derived portfolio state."""
@@ -86,6 +103,13 @@ class PortfolioReducer:
     def apply(self, state: PortfolioState, event: dict):
         et = event.get("event_type")
         payload = event.get("payload", {})
+        state.last_ts = int(event.get("ts", state.last_ts))
+        state.events_applied += 1
+
+        if et == "WALLET_INITIALIZED":
+            state.wallet_balance = Decimal(str(payload.get("initial_balance", "0")))
+            state.realized_pnl_total = Decimal("0")
+            return
 
         if et == "ORDER_CREATED":
             oid = payload.get("order_id")
@@ -95,7 +119,14 @@ class PortfolioReducer:
                     "side": payload.get("side"),
                     "quantity": Decimal(str(payload.get("quantity", "0"))),
                     "filled_quantity": Decimal("0"),
+                    "remaining_quantity": Decimal(str(payload.get("quantity", "0"))),
+                    "avg_fill_price": Decimal("0"),
                     "status": payload.get("status", OrderStatus.NEW.value),
+                    "order_type": payload.get("order_type", OrderType.MARKET.value),
+                    "reduce_only": bool(payload.get("reduce_only", False)),
+                    "trigger_price": Decimal(str(payload.get("trigger_price"))) if payload.get("trigger_price") is not None else None,
+                    "limit_price": Decimal(str(payload.get("limit_price"))) if payload.get("limit_price") is not None else None,
+                    "expires_at": int(payload.get("expires_at")) if payload.get("expires_at") is not None else None,
                 }
             return
 
@@ -106,6 +137,11 @@ class PortfolioReducer:
             if oid and oid in state.orders:
                 order_ref = state.orders[oid]
                 order_ref["filled_quantity"] += fill_qty
+                order_ref["remaining_quantity"] = max(
+                    Decimal("0"),
+                    order_ref["quantity"] - order_ref["filled_quantity"],
+                )
+                order_ref["avg_fill_price"] = Decimal(str(payload.get("fill_price", "0")))
                 order_ref["status"] = payload.get("status", OrderStatus.FILLED.value)
             state.fills.append(payload)
             state.wallet_balance -= fee
@@ -123,10 +159,24 @@ class PortfolioReducer:
             if oid and oid in state.orders:
                 state.orders[oid]["status"] = OrderStatus.REJECTED.value
             return
+        
+        if et == "ORDER_EXPIRED":
+            oid = payload.get("order_id")
+            if oid and oid in state.orders:
+                state.orders[oid]["status"] = OrderStatus.EXPIRED.value
+            return
 
         if et == "POSITION_OPENED":
             symbol = payload.get("symbol")
             if symbol:
+                tp_levels = []
+                for tp in payload.get("tp_levels", []):
+                    tp_levels.append({
+                        "price": Decimal(str(tp.get("price", "0"))),
+                        "pct": float(tp.get("pct", 0.0)),
+                        "hit": bool(tp.get("hit", False)),
+                        "label": tp.get("label", ""),
+                    })
                 state.open_positions[symbol] = {
                     "entry_price": Decimal(str(payload.get("execution_price", payload.get("entry_price", "0")))),
                     "quantity": Decimal(str(payload.get("quantity", "0"))),
@@ -136,6 +186,8 @@ class PortfolioReducer:
                     "sl_price": Decimal(str(payload.get("sl_price", "0"))),
                     "leverage": int(payload.get("leverage", 1)),
                     "open_time": int(payload.get("open_time", 0)),
+                    "tp_levels": tp_levels,
+                    "trailing_active": bool(payload.get("trailing_active", False)),
                 }
             return
 
@@ -151,6 +203,24 @@ class PortfolioReducer:
                     Decimal("0"),
                     state.open_positions[symbol]["quantity"] - qty_closed,
                 )
+                tp_label = payload.get("tp_label")
+                if tp_label:
+                    for tp in state.open_positions[symbol].get("tp_levels", []):
+                        if tp["label"] == tp_label:
+                            tp["hit"] = True
+            return
+
+        if et == "SL_ADJUSTED":
+            symbol = payload.get("symbol")
+            sl_price = Decimal(str(payload.get("sl_price", "0")))
+            if symbol in state.open_positions:
+                state.open_positions[symbol]["sl_price"] = sl_price
+            return
+
+        if et == "TRAILING_STOP_ACTIVATED":
+            symbol = payload.get("symbol")
+            if symbol in state.open_positions:
+                state.open_positions[symbol]["trailing_active"] = True
             return
 
         if et in ("POSITION_CLOSED", "LIQUIDATION"):
@@ -167,12 +237,17 @@ class PortfolioReducer:
             amt = Decimal(str(payload.get("amount", "0")))
             state.wallet_balance += amt
             state.realized_pnl_total += amt
+            state.funding_total += amt
             return
 
         if et == "FEE_CHARGED":
             amt = Decimal(str(payload.get("amount", "0")))
             state.wallet_balance -= amt
             state.realized_pnl_total -= amt
+            return
+
+        if et == "INVARIANT_VIOLATION":
+            state.violations.append(payload)
             return
 
 @dataclass
@@ -259,6 +334,20 @@ class EnhancedPosition:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
+class Severity(Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    FATAL = "FATAL"
+
+
+@dataclass
+class InvariantRule:
+    name: str
+    severity: Severity
+    fn: Callable[[], Tuple[bool, dict]]
+
+
 class EnhancedFuturesWallet:
     """Broker-like futures wallet with position tracking and persistence."""
 
@@ -274,6 +363,11 @@ class EnhancedFuturesWallet:
         taker_fee_rate: float = 0.0005,
         maintenance_margin_ratio: float = 0.005,
         now_ms_fn: Optional[Callable[[], int]] = None,
+        halt_on_invariant_violation: bool = False,
+        event_hook: Optional[Callable[[dict], None]] = None,
+        halt_on_critical: bool = False,
+        halt_on_fatal: bool = True,
+        max_snapshots: int = 10,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -285,6 +379,16 @@ class EnhancedFuturesWallet:
         self.taker_fee_rate = self._to_decimal(taker_fee_rate)
         self.maintenance_margin_ratio = self._to_decimal(maintenance_margin_ratio)
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
+        self.halt_on_invariant_violation = halt_on_invariant_violation
+        self.event_hook = event_hook
+        self.halted = False
+        self.max_snapshots = max_snapshots
+
+        # Fast bootstrap metrics
+        self.replay_duration_ms: float = 0.0
+        self.delta_size: int = 0
+        self.recovery_latency_ms: float = 0.0
+
         safe_ns = self._sanitize_path_component(self.state_namespace)
         safe_symbol = self._sanitize_path_component(self.symbol)
         self.state_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.json"
@@ -292,7 +396,8 @@ class EnhancedFuturesWallet:
         self.events_file = DATA_DIR / f"wallet_events_{safe_ns}_{safe_symbol}.jsonl"
         self.db_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.db"
 
-        self.wallet_balance: Decimal = self._to_decimal(initial_balance)
+        self.initial_balance: Decimal = self._to_decimal(initial_balance)
+        self.wallet_balance: Decimal = self.initial_balance
         self.unrealized_pnl_total: Decimal = Decimal("0")
         self.realized_pnl_total: Decimal = Decimal("0")
         self.positions: Dict[str, EnhancedPosition] = {}
@@ -304,10 +409,34 @@ class EnhancedFuturesWallet:
         self._init_db()
 
         self._load_state()
-        self._runtime_reducer_state = PortfolioState(
-            wallet_balance=self.wallet_balance,
-            realized_pnl_total=self.realized_pnl_total,
-        )
+        if not hasattr(self, "_runtime_reducer_state"):
+            self._runtime_reducer_state = PortfolioState(
+                wallet_balance=self.wallet_balance,
+                realized_pnl_total=self.realized_pnl_total,
+            )
+
+        self.halt_on_critical = halt_on_critical or halt_on_invariant_violation
+        self.halt_on_fatal = halt_on_fatal
+        self.invariant_rules: List[InvariantRule] = []
+        self._register_default_invariants()
+
+        events_empty = True
+        if self.events_file.exists() and self.events_file.stat().st_size > 0:
+            events_empty = False
+        elif self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                    if count > 0:
+                        events_empty = False
+            except Exception:
+                pass
+
+        if events_empty:
+            self._emit_event(
+                "WALLET_INITIALIZED",
+                {"initial_balance": str(self.wallet_balance)}
+            )
 
     @property
     def margin_balance(self) -> float:
@@ -328,6 +457,8 @@ class EnhancedFuturesWallet:
 
     def can_open(self, symbol: Optional[str] = None) -> Tuple[bool, str]:
         with self.lock:
+            if self.halted:
+                return False, "Wallet is halted due to invariant violation"
             target = symbol or self.symbol
             if self.get_open_position(target):
                 return False, f"Already have open position on {target}"
@@ -377,8 +508,14 @@ class EnhancedFuturesWallet:
 
             order = self._create_order(symbol=symbol, side=side, quantity=qty)
             execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
-            fee_open = self._calculate_fee(execution_price * qty, is_taker=True)
-            self._record_fill(order, qty, execution_price, fee_open)
+            fill_chunks = int(setup.get("fill_chunks", 1))
+            fee_open = self._execute_order_in_chunks(
+                order=order,
+                total_quantity=qty,
+                fill_price=execution_price,
+                fee_rate=self.taker_fee_rate,
+                chunk_count=fill_chunks,
+            )
 
             pos = EnhancedPosition(
                 symbol=symbol,
@@ -405,7 +542,6 @@ class EnhancedFuturesWallet:
                 f"Qty={qty:.4f} @ {entry:.2f} | Margin={margin:.2f} | "
                 f"SL={sl_price:.2f} | TP={tp_levels}"
             )
-            self._save_state()
             self._emit_event(
                 "POSITION_OPENED",
                 {
@@ -420,12 +556,13 @@ class EnhancedFuturesWallet:
                     "sl_price": sl_price,
                     "leverage": self.leverage,
                     "open_time": pos.open_time,
+                    "tp_levels": tp_levels,
                 },
             )
-            self._sync_positions_from_reducer()
+            self._save_state()
             return pos
 
-    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str) -> Decimal:
+    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str, tp_label: Optional[str] = None) -> Decimal:
         """Close a percentage of the position. Returns realized PnL from this slice."""
         with self.lock:
             mark_price = self._to_decimal(mark_price)
@@ -456,9 +593,9 @@ class EnhancedFuturesWallet:
                     "pnl": pnl_slice,
                     "fee": fee_close,
                     "closed_qty": qty_to_close,
+                    "tp_label": tp_label,
                 },
             )
-            self._sync_positions_from_reducer()
             pos.partial_realized_pnl += (pnl_slice - fee_close)
 
             logger.info(
@@ -511,7 +648,6 @@ class EnhancedFuturesWallet:
                 f"Total Trade PnL={pos.partial_realized_pnl + remaining_pnl:.2f} | Reason={reason}"
             )
             self._save_state()
-            self._sync_positions_from_reducer()
             return pos
 
     def _liquidate_position(self, symbol: str, mark_price: Decimal) -> None:
@@ -542,7 +678,18 @@ class EnhancedFuturesWallet:
             f"Margin Lost={pos.margin_used:.2f}"
         )
         self._save_state()
-        self._sync_positions_from_reducer()
+
+    def adjust_sl_price(self, symbol: str, new_sl_price: Decimal):
+        """Adjust Stop Loss price for symbol position via events."""
+        with self.lock:
+            self._emit_event("SL_ADJUSTED", {"symbol": symbol, "sl_price": self._to_decimal(new_sl_price)})
+            self._save_state()
+
+    def activate_trailing_stop(self, symbol: str):
+        """Activate Trailing Stop for symbol position via events."""
+        with self.lock:
+            self._emit_event("TRAILING_STOP_ACTIVATED", {"symbol": symbol})
+            self._save_state()
 
     def update_positions(
         self,
@@ -614,14 +761,11 @@ class EnhancedFuturesWallet:
                 hit = True
 
             if hit:
-                tp["hit"] = True
-                self.partial_close(symbol, mark_price, tp["pct"], reason=f"{tp['label']} HIT")
+                self.partial_close(symbol, mark_price, tp["pct"], reason=f"{tp['label']} HIT", tp_label=tp["label"])
                 if tp["label"] == "TP1":
-                    pos.sl_price = pos.entry_price
-                    logger.info(f"[SL ADJUSTED] {symbol} SL → BREAKEVEN")
+                    self.adjust_sl_price(symbol, pos.entry_price)
                 elif tp["label"] == "TP2":
-                    pos.trailing_active = True
-                    logger.info(f"[TRAIL ACTIVE] {symbol} trailing on 1H EMA9")
+                    self.activate_trailing_stop(symbol)
                 return  # Only one TP per tick
 
         # SL check
@@ -693,6 +837,137 @@ class EnhancedFuturesWallet:
             return str(obj)
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
+    def _to_json_compatible(self, val):
+        if isinstance(val, Decimal):
+            return str(val)
+        if isinstance(val, Enum):
+            return val.value
+        if isinstance(val, dict):
+            return {k: self._to_json_compatible(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [self._to_json_compatible(x) for x in val]
+        return val
+
+    def _deserialize_reducer_state(self, snap: dict) -> PortfolioState:
+        state = PortfolioState(
+            wallet_balance=self._to_decimal(snap.get("wallet_balance", "0")),
+            realized_pnl_total=self._to_decimal(snap.get("realized_pnl_total", "0")),
+            funding_total=self._to_decimal(snap.get("funding_total", "0") or "0"),
+            last_ts=int(snap.get("reducer_last_ts") or snap.get("last_ts") or 0),
+            events_applied=int(snap.get("reducer_events_applied", 0))
+        )
+        
+        # open_positions
+        raw_pos = snap.get("reducer_open_positions")
+        if raw_pos is not None:
+            for symbol, pdata in raw_pos.items():
+                tp_levels = []
+                for tp in pdata.get("tp_levels", []):
+                    tp_levels.append({
+                        "price": self._to_decimal(tp.get("price", "0")),
+                        "pct": float(tp.get("pct", 0.0)),
+                        "hit": bool(tp.get("hit", False)),
+                        "label": tp.get("label", ""),
+                    })
+                state.open_positions[symbol] = {
+                    "entry_price": self._to_decimal(pdata.get("entry_price", "0")),
+                    "quantity": self._to_decimal(pdata.get("quantity", "0")),
+                    "margin": self._to_decimal(pdata.get("margin", "0")),
+                    "side": pdata.get("side"),
+                    "playbook": pdata.get("playbook", "INTRADAY"),
+                    "sl_price": self._to_decimal(pdata.get("sl_price", "0")),
+                    "leverage": int(pdata.get("leverage", 1)),
+                    "open_time": int(pdata.get("open_time", 0)),
+                    "tp_levels": tp_levels,
+                    "trailing_active": bool(pdata.get("trailing_active", False)),
+                }
+        elif "positions" in snap:
+            # Fallback for legacy snapshots
+            for symbol, pdata in snap["positions"].items():
+                if pdata.get("status") == "OPEN":
+                    tp_levels = []
+                    for tp in pdata.get("tp_levels", []):
+                        tp_levels.append({
+                            "price": self._to_decimal(tp.get("price", "0")),
+                            "pct": float(tp.get("pct", 0.0)),
+                            "hit": bool(tp.get("hit", False)),
+                            "label": tp.get("label", ""),
+                        })
+                    state.open_positions[symbol] = {
+                        "entry_price": self._to_decimal(pdata.get("entry_price", "0")),
+                        "quantity": self._to_decimal(pdata.get("remaining_quantity", "0")),
+                        "margin": self._to_decimal(pdata.get("margin_used", "0")),
+                        "side": pdata.get("side"),
+                        "playbook": pdata.get("playbook", "INTRADAY"),
+                        "sl_price": self._to_decimal(pdata.get("sl_price", "0")),
+                        "leverage": int(pdata.get("leverage", 1)),
+                        "open_time": int(pdata.get("open_time", 0)),
+                        "tp_levels": tp_levels,
+                        "trailing_active": bool(pdata.get("trailing_active", False)),
+                    }
+
+        # orders
+        raw_orders = snap.get("reducer_orders", {})
+        for oid, odata in raw_orders.items():
+            state.orders[oid] = {
+                "symbol": odata.get("symbol"),
+                "side": odata.get("side"),
+                "quantity": self._to_decimal(odata.get("quantity", "0")),
+                "filled_quantity": self._to_decimal(odata.get("filled_quantity", "0")),
+                "remaining_quantity": self._to_decimal(odata.get("remaining_quantity", "0")),
+                "avg_fill_price": self._to_decimal(odata.get("avg_fill_price", "0")),
+                "status": odata.get("status"),
+                "order_type": odata.get("order_type"),
+                "reduce_only": bool(odata.get("reduce_only", False)),
+                "trigger_price": self._to_decimal(odata.get("trigger_price")) if odata.get("trigger_price") is not None else None,
+                "limit_price": self._to_decimal(odata.get("limit_price")) if odata.get("limit_price") is not None else None,
+                "expires_at": int(odata.get("expires_at")) if odata.get("expires_at") is not None else None,
+            }
+
+        # fills
+        raw_fills = snap.get("reducer_fills", [])
+        for f in raw_fills:
+            state.fills.append({
+                "order_id": f.get("order_id"),
+                "symbol": f.get("symbol"),
+                "side": f.get("side"),
+                "quantity": self._to_decimal(f.get("quantity", "0")),
+                "fill_price": self._to_decimal(f.get("fill_price", "0")),
+                "fee": self._to_decimal(f.get("fee", "0")),
+                "ts": int(f.get("ts", 0)),
+                "sequence": int(f.get("sequence", 1)),
+                **{k: v for k, v in f.items() if k not in ("quantity", "fill_price", "fee", "ts", "sequence")}
+            })
+
+        # violations
+        state.violations = list(snap.get("reducer_violations", []))
+
+        return state
+
+    def _encode_snapshot(self, state: dict) -> str:
+        json_str = json.dumps(state, default=self._serialize_decimals)
+        sha256_hash = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+        compressed = gzip.compress(json_str.encode('utf-8'))
+        b64_str = base64.b64encode(compressed).decode('utf-8')
+        return f"v1_gzip_b64:{sha256_hash}:{b64_str}"
+
+    def _decode_snapshot(self, encoded: str) -> dict:
+        if encoded.startswith("{"):
+            return json.loads(encoded)
+        if encoded.startswith("v1_gzip_b64:"):
+            parts = encoded.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError("Invalid encoded snapshot format")
+            _, expected_hash, b64_str = parts
+            compressed = base64.b64decode(b64_str.encode('utf-8'))
+            json_bytes = gzip.decompress(compressed)
+            json_str = json_bytes.decode('utf-8')
+            actual_hash = hashlib.sha256(json_bytes).hexdigest()
+            if actual_hash != expected_hash:
+                raise ValueError("Snapshot integrity check failed: SHA256 hash mismatch")
+            return json.loads(json_str)
+        raise ValueError("Unknown snapshot format")
+
     def _save_state(self):
         state = {
             "schema_version": STATE_SCHEMA_VERSION,
@@ -706,13 +981,33 @@ class EnhancedFuturesWallet:
             "maintenance_margin_ratio": self.maintenance_margin_ratio,
             "positions": {s: p.to_dict() for s, p in self.positions.items()},
             "position_history": self.position_history,
+            "reducer_open_positions": self._runtime_reducer_state.open_positions,
+            "reducer_orders": self._runtime_reducer_state.orders,
+            "reducer_fills": self._runtime_reducer_state.fills,
+            "reducer_violations": self._runtime_reducer_state.violations,
+            "reducer_last_ts": self._runtime_reducer_state.last_ts,
+            "reducer_events_applied": self._runtime_reducer_state.events_applied,
         }
-        self._atomic_write_json(self.state_file, state)
+        json_compatible_state = self._to_json_compatible(state)
+        self._atomic_write_json(self.state_file, json_compatible_state)
+        encoded_state = self._encode_snapshot(json_compatible_state)
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute(
+                "INSERT INTO snapshots (ts, wallet_balance, realized_pnl_total, state_json) VALUES (?, ?, ?, ?)",
+                (self._now_ms(), str(self.wallet_balance), str(self.realized_pnl_total), encoded_state)
+            )
+            # Safe rotation
+            rows = conn.execute("SELECT id FROM snapshots ORDER BY ts DESC LIMIT ?", (self.max_snapshots,)).fetchall()
+            ids_to_keep = [r[0] for r in rows]
+            if ids_to_keep:
+                placeholders = ",".join(["?"] * len(ids_to_keep))
+                conn.execute(f"DELETE FROM snapshots WHERE id NOT IN ({placeholders})", ids_to_keep)
+            conn.commit()
 
     def _atomic_write_json(self, path: Path, state: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
-        payload = json.dumps(state, indent=2, default=self._serialize_decimals)
+        payload = self._encode_snapshot(state)
         with open(temp_path, "w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
@@ -744,6 +1039,65 @@ class EnhancedFuturesWallet:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                filled_quantity TEXT NOT NULL,
+                avg_fill_price TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reduce_only INTEGER NOT NULL DEFAULT 0,
+                trigger_price TEXT,
+                limit_price TEXT,
+                expires_at INTEGER,
+                updated_ts INTEGER NOT NULL
+            )
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                fill_price TEXT NOT NULL,
+                fee TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                sequence INTEGER NOT NULL
+            )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id)")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS funding (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                rate TEXT NOT NULL,
+                notional TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                ts INTEGER NOT NULL
+            )
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS fees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                reason TEXT,
+                amount TEXT NOT NULL,
+                ts INTEGER NOT NULL
+            )
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                wallet_balance TEXT NOT NULL,
+                realized_pnl_total TEXT NOT NULL,
+                state_json TEXT NOT NULL
+            )
+            """)
             conn.commit()
 
     def _append_event_db(self, event: dict):
@@ -778,7 +1132,7 @@ class EnhancedFuturesWallet:
                     if line.strip():
                         yield json.loads(line)
 
-    def _append_event(self, event_type: str, payload: dict):
+    def _append_event(self, event_type: str, payload: dict) -> dict:
         event = {
             "ts": self._now_ms(),
             "event_type": event_type,
@@ -790,20 +1144,25 @@ class EnhancedFuturesWallet:
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=self._serialize_decimals) + "\n")
         self._append_event_db(event)
+        return event
 
     def _emit_event(self, event_type: str, payload: dict):
         """Authoritative runtime transition: append event, then apply reducer-derived runtime updates."""
-        self._append_event(event_type, payload)
-        event = {
-            "ts": self._now_ms(),
-            "event_type": event_type,
-            "symbol": self.symbol,
-            "namespace": self.state_namespace,
-            "payload": payload,
-        }
+        event = self._append_event(event_type, payload)
+        self._persist_domain_event_to_db(event)
         self.reducer.apply(self._runtime_reducer_state, event)
+        if self.event_hook:
+            try:
+                self.event_hook(event)
+            except Exception:
+                pass
         self.wallet_balance = self._runtime_reducer_state.wallet_balance
         self.realized_pnl_total = self._runtime_reducer_state.realized_pnl_total
+        self._sync_positions_from_reducer()
+        self._sync_orders_from_reducer()
+        self._sync_fills_from_reducer()
+        if event_type == "INVARIANT_VIOLATION" and self.halt_on_invariant_violation:
+            self.halted = True
 
     def _sync_positions_from_reducer(self):
         """Align runtime open positions with reducer-authoritative open_positions."""
@@ -815,6 +1174,8 @@ class EnhancedFuturesWallet:
                 existing.original_quantity = max(existing.original_quantity, pdata["quantity"])
                 existing.entry_price = pdata["entry_price"]
                 existing.sl_price = pdata.get("sl_price", existing.sl_price)
+                existing.trailing_active = bool(pdata.get("trailing_active", existing.trailing_active))
+                existing.tp_levels = pdata.get("tp_levels", existing.tp_levels)
                 existing.notional = existing.remaining_quantity * existing.entry_price
                 existing.margin_used = existing.notional / existing.leverage
                 current[symbol] = existing
@@ -838,51 +1199,369 @@ class EnhancedFuturesWallet:
                     leverage=lev,
                     open_time=int(pdata.get("open_time", self._now_ms())),
                     sl_price=pdata.get("sl_price", Decimal("0")),
-                    tp_levels=prior_tp,
+                    tp_levels=pdata.get("tp_levels", []),
+                    trailing_active=bool(pdata.get("trailing_active", False)),
+                    time_stop_hours=int(pdata.get("time_stop_hours", 18)),
                 )
         self.positions = current
 
+    def _sync_orders_from_reducer(self):
+        """Align runtime orders with reducer-authoritative order state."""
+        synced = {}
+        for oid, odata in self._runtime_reducer_state.orders.items():
+            side = PositionSide(odata.get("side", "LONG"))
+            existing = self.orders.get(oid)
+            if existing:
+                existing.side = side
+                existing.quantity = odata.get("quantity", existing.quantity)
+                existing.filled_quantity = odata.get("filled_quantity", existing.filled_quantity)
+                existing.avg_fill_price = odata.get("avg_fill_price", existing.avg_fill_price)
+                existing.status = OrderStatus(odata.get("status", existing.status.value))
+                existing.order_type = OrderType(odata.get("order_type", existing.order_type.value))
+                existing.reduce_only = bool(odata.get("reduce_only", existing.reduce_only))
+                existing.trigger_price = odata.get("trigger_price", existing.trigger_price)
+                existing.limit_price = odata.get("limit_price", existing.limit_price)
+                existing.expires_at = odata.get("expires_at", existing.expires_at)
+                synced[oid] = existing
+            else:
+                synced[oid] = Order(
+                    id=oid,
+                    symbol=odata.get("symbol", self.symbol),
+                    side=side,
+                    order_type=OrderType(odata.get("order_type", OrderType.MARKET.value)),
+                    quantity=odata.get("quantity", Decimal("0")),
+                    status=OrderStatus(odata.get("status", OrderStatus.NEW.value)),
+                    created_at=self._now_ms(),
+                    reduce_only=bool(odata.get("reduce_only", False)),
+                    trigger_price=odata.get("trigger_price"),
+                    limit_price=odata.get("limit_price"),
+                    expires_at=odata.get("expires_at"),
+                    filled_quantity=odata.get("filled_quantity", Decimal("0")),
+                    avg_fill_price=odata.get("avg_fill_price", Decimal("0")),
+                )
+        self.orders = synced
+
+    def _sync_fills_from_reducer(self):
+        """Align runtime fills from reducer-authoritative fill event stream."""
+        converted: List[Fill] = []
+        for f in self._runtime_reducer_state.fills:
+            try:
+                converted.append(
+                    Fill(
+                        order_id=f.get("order_id"),
+                        symbol=f.get("symbol", self.symbol),
+                        side=PositionSide(f.get("side", "LONG")),
+                        quantity=self._to_decimal(f.get("quantity", "0")),
+                        fill_price=self._to_decimal(f.get("fill_price", "0")),
+                        fee=self._to_decimal(f.get("fee", "0")),
+                        timestamp=int(f.get("ts", self._now_ms())),
+                        sequence=int(f.get("sequence", 1)),
+                    )
+                )
+            except Exception:
+                continue
+        self.fills = converted
+
     def _create_order(self, symbol: str, side: PositionSide, quantity: Decimal) -> Order:
-        order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
-        order = Order(
-            id=order_id,
+        return self._create_order_with_type(
             symbol=symbol,
             side=side,
-            order_type=OrderType.MARKET,
             quantity=quantity,
-            status=OrderStatus.NEW,
-            created_at=self._now_ms(),
+            order_type=OrderType.MARKET,
         )
-        self.orders[order_id] = order
-        order.status = OrderStatus.PENDING
-        self._append_event(
+
+    def _create_order_with_type(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        reduce_only: bool = False,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
+        self._emit_event(
             "ORDER_CREATED",
             {
-                "order_id": order.id,
-                "symbol": order.symbol,
-                "side": order.side.value,
-                "quantity": order.quantity,
-                "status": order.status.value,
+                "order_id": order_id,
+                "symbol": symbol,
+                "side": side.value,
+                "quantity": quantity,
+                "status": OrderStatus.PENDING.value,
+                "order_type": order_type.value,
+                "reduce_only": reduce_only,
+                "trigger_price": trigger_price,
+                "limit_price": limit_price,
+                "expires_at": expires_at,
             },
         )
-        return order
+        return self.orders[order_id]
 
-    def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal):
-        fill = Fill(
-            order_id=order.id,
-            symbol=order.symbol,
-            side=order.side,
-            quantity=quantity,
-            fill_price=fill_price,
-            fee=fee,
-            timestamp=self._now_ms(),
-        )
-        self.fills.append(fill)
-        order.filled_quantity += quantity
-        order.avg_fill_price = fill_price if order.filled_quantity > Decimal("0") else Decimal("0")
-        order.status = OrderStatus.FILLED if order.filled_quantity >= order.quantity else OrderStatus.PARTIALLY_FILLED
-        self._append_event(
-            "ORDER_FILLED",
+    def cancel_order(self, order_id: str, reason: str = "USER_CANCEL") -> bool:
+        with self.lock:
+            order = self.orders.get(order_id)
+            if not order:
+                return False
+            if order.status in {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}:
+                return False
+            self._emit_event("ORDER_CANCELLED", {"order_id": order_id, "reason": reason})
+            return True
+
+    def place_pending_order(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        with self.lock:
+            if self.halted:
+                raise ValueError("Cannot place order: Wallet is halted due to invariant violation")
+            return self._create_order_with_type(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                order_type=order_type,
+                reduce_only=reduce_only,
+                trigger_price=trigger_price,
+                limit_price=limit_price,
+                expires_at=expires_at,
+            )
+
+    def evaluate_pending_orders(self, symbol: str, mark_price: float):
+        with self.lock:
+            if self.halted:
+                return
+            price = self._to_decimal(mark_price)
+            for order in list(self.orders.values()):
+                if order.symbol != symbol or order.status != OrderStatus.PENDING:
+                    continue
+                if order.expires_at and self._now_ms() >= order.expires_at:
+                    self._emit_event("ORDER_EXPIRED", {"order_id": order.id})
+                    continue
+                if self._should_trigger_order(order, price):
+                    if order.reduce_only and not self.get_open_position(symbol):
+                        self._emit_event(
+                            "ORDER_REJECTED",
+                            {"order_id": order.id, "reason": "REDUCE_ONLY_WITHOUT_POSITION"},
+                        )
+                        continue
+                    if order.reduce_only:
+                        pos = self.get_open_position(symbol)
+                        if pos and pos.side == order.side:
+                            self._emit_event(
+                                "ORDER_REJECTED",
+                                {"order_id": order.id, "reason": "REDUCE_ONLY_EXPOSURE_INCREASE"},
+                            )
+                            continue
+                    fill_price = self._execution_price(price, order.side, is_entry=True)
+                    remaining = max(Decimal("0"), order.quantity - order.filled_quantity)
+                    if remaining > Decimal("0"):
+                        self._execute_order_in_chunks(
+                            order=order,
+                            total_quantity=remaining,
+                            fill_price=fill_price,
+                            fee_rate=self.taker_fee_rate,
+                            chunk_count=1,
+                        )
+            self._run_invariant_checks()
+
+    def _should_trigger_order(self, order: Order, mark_price: Decimal) -> bool:
+        if order.order_type == OrderType.MARKET:
+            return True
+        if order.order_type == OrderType.LIMIT and order.limit_price is not None:
+            return mark_price <= order.limit_price if order.side == PositionSide.LONG else mark_price >= order.limit_price
+        if order.order_type == OrderType.STOP_MARKET and order.trigger_price is not None:
+            return mark_price >= order.trigger_price if order.side == PositionSide.LONG else mark_price <= order.trigger_price
+        if order.order_type == OrderType.TAKE_PROFIT and order.trigger_price is not None:
+            return mark_price >= order.trigger_price if order.side == PositionSide.LONG else mark_price <= order.trigger_price
+        return False
+
+    def apply_funding(self, symbol: str, funding_rate: Decimal):
+        with self.lock:
+            pos = self.get_open_position(symbol)
+            if not pos:
+                return Decimal("0")
+            funding_rate = self._to_decimal(funding_rate)
+            notional = pos.remaining_quantity * pos.entry_price
+            # Longs usually pay when positive, shorts receive; simplified sign by side.
+            direction = Decimal("-1") if pos.side == PositionSide.LONG else Decimal("1")
+            amount = (notional * funding_rate) * direction
+            self._emit_event(
+                "FUNDING_APPLIED",
+                {"symbol": symbol, "rate": funding_rate, "notional": notional, "amount": amount},
+            )
+            self.assert_runtime_matches_replay()
+            return amount
+
+    def _register_default_invariants(self):
+        self.invariant_rules = [
+            InvariantRule(
+                name="equity_consistency",
+                severity=Severity.FATAL,
+                fn=self._check_equity_consistency
+            ),
+            InvariantRule(
+                name="order_fill_limits",
+                severity=Severity.CRITICAL,
+                fn=self._check_order_fill_limits
+            ),
+            InvariantRule(
+                name="remaining_quantity_non_negative",
+                severity=Severity.CRITICAL,
+                fn=self._check_remaining_quantity_non_negative
+            ),
+            InvariantRule(
+                name="available_margin_non_negative",
+                severity=Severity.CRITICAL,
+                fn=self._check_available_margin_non_negative
+            ),
+            InvariantRule(
+                name="reduce_only_never_increases_exposure",
+                severity=Severity.CRITICAL,
+                fn=self._check_reduce_only_never_increases_exposure
+            ),
+        ]
+
+    def _check_equity_consistency(self) -> Tuple[bool, dict]:
+        expected = self.wallet_balance + self.unrealized_pnl_total
+        actual = Decimal(str(self.margin_balance))
+        diff = abs(actual - expected)
+        if diff > Decimal("0.0001"):
+            return True, {"expected": str(expected), "actual": str(actual), "diff": str(diff)}
+        return False, {}
+
+    def _check_order_fill_limits(self) -> Tuple[bool, dict]:
+        fill_sums = {}
+        for f in self.fills:
+            fill_sums[f.order_id] = fill_sums.get(f.order_id, Decimal("0")) + f.quantity
+        
+        for oid, o in self.orders.items():
+            filled_sum = fill_sums.get(oid, Decimal("0"))
+            if filled_sum > o.quantity:
+                return True, {"order_id": oid, "sum_fills": str(filled_sum), "order_qty": str(o.quantity)}
+            if o.filled_quantity > o.quantity:
+                return True, {"order_id": oid, "filled_quantity": str(o.filled_quantity), "order_qty": str(o.quantity)}
+        return False, {}
+
+    def _check_remaining_quantity_non_negative(self) -> Tuple[bool, dict]:
+        for oid, o in self.orders.items():
+            remaining = o.quantity - o.filled_quantity
+            if remaining < Decimal("0"):
+                return True, {"order_id": oid, "remaining": str(remaining)}
+        for symbol, pos in self.positions.items():
+            if pos.status == "OPEN" and pos.remaining_quantity < Decimal("0"):
+                return True, {"symbol": symbol, "position_remaining": str(pos.remaining_quantity)}
+        return False, {}
+
+    def _check_available_margin_non_negative(self) -> Tuple[bool, dict]:
+        avail = Decimal(str(self.available_balance))
+        if avail < Decimal("0"):
+            return True, {"available_margin": str(avail)}
+        return False, {}
+
+    def _check_reduce_only_never_increases_exposure(self) -> Tuple[bool, dict]:
+        from collections import defaultdict
+        active_reduce_only = defaultdict(list)
+        for o in self.orders.values():
+            if o.status in (OrderStatus.NEW, OrderStatus.PENDING) and o.reduce_only:
+                active_reduce_only[o.symbol].append(o)
+                
+        for symbol, orders in active_reduce_only.items():
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return True, {"symbol": symbol, "reason": "No open position for reduce_only order", "orders": [o.id for o in orders]}
+                
+            expected_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+            total_qty = Decimal("0")
+            for o in orders:
+                if o.side != expected_side:
+                    return True, {"symbol": symbol, "order_id": o.id, "reason": f"reduce_only side {o.side} does not reduce position {pos.side}"}
+                total_qty += o.quantity
+                
+            if total_qty > pos.remaining_quantity:
+                return True, {
+                    "symbol": symbol,
+                    "reason": "Sum of reduce_only orders exceeds position remaining quantity",
+                    "total_reduce_qty": str(total_qty),
+                    "position_qty": str(pos.remaining_quantity),
+                    "orders": [o.id for o in orders]
+                }
+        return False, {}
+
+    def _run_invariant_checks(self):
+        self.run_invariant_sweep()
+
+    def run_invariant_sweep(self) -> List[dict]:
+        """Run all registered invariant rules and apply halt policies on violation."""
+        violations = []
+        with self.lock:
+            for rule in self.invariant_rules:
+                try:
+                    violated, context = rule.fn()
+                    if violated:
+                        violations.append({
+                            "rule_name": rule.name,
+                            "severity": rule.severity.value,
+                            "context": context,
+                        })
+                        self._emit_event(
+                            "INVARIANT_VIOLATION",
+                            {
+                                "rule_name": rule.name,
+                                "severity": rule.severity.value,
+                                "context": context,
+                            }
+                        )
+                        # Check halt policies
+                        if rule.severity == Severity.FATAL and self.halt_on_fatal:
+                            self.halted = True
+                        elif rule.severity == Severity.CRITICAL and self.halt_on_critical:
+                            self.halted = True
+                except Exception as e:
+                    logger.error(f"Error checking invariant rule {rule.name}: {e}")
+        return violations
+
+    def run_funding_scheduler(self, symbol: str, funding_rate: Decimal, interval_ms: int, now_ms: Optional[int] = None) -> Decimal:
+        """Apply funding if interval has elapsed since last application for symbol."""
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with sqlite3.connect(self.db_file) as conn:
+            row = conn.execute("SELECT MAX(ts) FROM funding WHERE symbol = ?", (symbol,)).fetchone()
+            last_ts = int(row[0]) if row and row[0] is not None else 0
+        if now - last_ts < int(interval_ms):
+            return Decimal("0")
+        return self.apply_funding(symbol, self._to_decimal(funding_rate))
+
+    def run_housekeeping(
+        self,
+        symbol: str,
+        mark_price: float,
+        funding_rate: Optional[Decimal] = None,
+        funding_interval_ms: Optional[int] = None,
+    ):
+        """Run operational safety and periodic tasks in one call."""
+        with self.lock:
+            if self.halted:
+                return
+        self.evaluate_pending_orders(symbol, mark_price)
+        if funding_rate is not None and funding_interval_ms is not None:
+            self.run_funding_scheduler(symbol, funding_rate, funding_interval_ms)
+        self.assert_runtime_matches_replay()
+
+    def _record_fill(self, order: Order, quantity: Decimal, fill_price: Decimal, fee: Decimal, sequence: int = 1):
+        prospective_filled = order.filled_quantity + quantity
+        status = OrderStatus.FILLED if prospective_filled >= order.quantity else OrderStatus.PARTIALLY_FILLED
+        event_type = "ORDER_FILLED" if status == OrderStatus.FILLED else "ORDER_PARTIALLY_FILLED"
+        self._emit_event(
+            event_type,
             {
                 "order_id": order.id,
                 "symbol": order.symbol,
@@ -890,9 +1569,32 @@ class EnhancedFuturesWallet:
                 "quantity": quantity,
                 "fill_price": fill_price,
                 "fee": fee,
-                "status": order.status.value,
+                "status": status.value,
+                "sequence": sequence,
             },
         )
+
+    def _execute_order_in_chunks(
+        self,
+        order: Order,
+        total_quantity: Decimal,
+        fill_price: Decimal,
+        fee_rate: Decimal,
+        chunk_count: int = 1,
+    ) -> Decimal:
+        chunk_count = max(1, int(chunk_count))
+        remaining = total_quantity
+        total_fee = Decimal("0")
+        for idx in range(1, chunk_count + 1):
+            if idx == chunk_count:
+                chunk_qty = remaining
+            else:
+                chunk_qty = (total_quantity / Decimal(str(chunk_count))).quantize(Decimal("0.00000001"))
+                remaining -= chunk_qty
+            chunk_fee = abs(chunk_qty * fill_price) * fee_rate
+            total_fee += chunk_fee
+            self._record_fill(order, chunk_qty, fill_price, chunk_fee, sequence=idx)
+        return total_fee
 
     def replay_event_log(self) -> dict:
         if not self.events_file.exists():
@@ -909,10 +1611,269 @@ class EnhancedFuturesWallet:
                 fill_count += 1
         return {"event_count": event_count, "order_count": order_count, "fill_count": fill_count}
 
+    def get_order_timeline(self, order_id: str) -> List[dict]:
+        """Return chronological event timeline for one order id."""
+        timeline: List[dict] = []
+        for event in self._iter_events():
+            payload = event.get("payload", {})
+            if payload.get("order_id") == order_id:
+                timeline.append(event)
+        timeline.sort(key=lambda e: (int(e.get("ts", 0)), e.get("event_type", "")))
+        return timeline
+
+    def get_recent_events(self, limit: int = 100, event_type: Optional[str] = None) -> List[dict]:
+        """Simple event browser helper for observability tooling."""
+        rows: List[dict] = []
+        for event in self._iter_events():
+            if event_type and event.get("event_type") != event_type:
+                continue
+            rows.append(event)
+        rows.sort(key=lambda e: int(e.get("ts", 0)), reverse=True)
+        return rows[: max(1, limit)]
+
+    def get_position_timeline(self, symbol: str) -> List[dict]:
+        """Returns a chronological list of events for the specified symbol."""
+        timeline = []
+        if self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    rows = conn.execute(
+                        "SELECT ts, event_type, symbol, namespace, payload_json FROM events WHERE symbol=? ORDER BY ts ASC, id ASC",
+                        (symbol,)
+                    ).fetchall()
+                for ts, et, sym, ns, payload_json in rows:
+                    timeline.append({
+                        "ts": ts,
+                        "event_type": et,
+                        "symbol": sym,
+                        "namespace": ns,
+                        "payload": json.loads(payload_json)
+                    })
+                return timeline
+            except Exception as e:
+                logger.warning(f"Failed to get position timeline from DB: {e}")
+        
+        # Fallback to events file
+        for event in self._iter_events():
+            if event.get("symbol") == symbol:
+                timeline.append(event)
+        return timeline
+
+    def get_invariant_events(self, limit: int = 100) -> List[dict]:
+        """Returns the list of recent INVARIANT_VIOLATION events."""
+        violations = []
+        if self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    rows = conn.execute(
+                        "SELECT ts, event_type, symbol, namespace, payload_json FROM events WHERE event_type='INVARIANT_VIOLATION' ORDER BY ts DESC LIMIT ?",
+                        (limit,)
+                    ).fetchall()
+                for ts, et, sym, ns, payload_json in rows:
+                    violations.append({
+                        "ts": ts,
+                        "event_type": et,
+                        "symbol": sym,
+                        "namespace": ns,
+                        "payload": json.loads(payload_json)
+                    })
+                violations.reverse()
+                return violations
+            except Exception as e:
+                logger.warning(f"Failed to get invariant events from DB: {e}")
+        
+        for event in self._iter_events():
+            if event.get("event_type") == "INVARIANT_VIOLATION":
+                violations.append(event)
+        return violations[-limit:]
+
+    def get_funding_history(self, symbol: str) -> List[dict]:
+        """Returns chronological list of funding payments/events for a symbol."""
+        history = []
+        if self.db_file.exists():
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    rows = conn.execute(
+                        "SELECT ts, rate, notional, amount FROM funding WHERE symbol=? ORDER BY ts ASC",
+                        (symbol,)
+                    ).fetchall()
+                for ts, rate, notional, amount in rows:
+                    history.append({
+                        "ts": ts,
+                        "symbol": symbol,
+                        "rate": Decimal(rate),
+                        "notional": Decimal(notional),
+                        "amount": Decimal(amount)
+                    })
+                return history
+            except Exception as e:
+                logger.warning(f"Failed to get funding history from DB: {e}")
+        
+        for event in self._iter_events():
+            if event.get("event_type") == "FUNDING_APPLIED":
+                p = event.get("payload", {})
+                if event.get("symbol") == symbol or p.get("symbol") == symbol:
+                    history.append({
+                        "ts": event.get("ts"),
+                        "symbol": symbol,
+                        "rate": Decimal(str(p.get("rate", "0"))),
+                        "notional": Decimal(str(p.get("notional", "0"))),
+                        "amount": Decimal(str(p.get("amount", "0")))
+                    })
+        return history
+
+    def replay_until(self, ts: int) -> PortfolioState:
+        """Replay all events in order up to timestamp `ts` (inclusive) and returns the state."""
+        state = PortfolioState(wallet_balance=self.initial_balance)
+        if not self.events_file.exists() and not self.db_file.exists():
+            return state
+
+        last_ts = -1
+        seen = set()
+        for event in self._iter_events():
+            event_ts = int(event.get("ts", 0))
+            if event_ts > ts:
+                break
+            fingerprint = json.dumps(event, sort_keys=True, default=str)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            if event_ts < last_ts:
+                raise ValueError("Out-of-order event stream detected")
+            last_ts = event_ts
+            self.reducer.apply(state, event)
+        return state
+
+    def compare_runtime_vs_replay(self, ts: Optional[int] = None) -> dict:
+        """Compares runtime state against replayed event state at timestamp `ts` (or current if None).
+        
+        Returns a dictionary summarizing any discrepancies.
+        """
+        with self.lock:
+            if ts is None:
+                replayed = self.replay_portfolio_state()
+            else:
+                replayed = self.replay_until(ts)
+
+            diffs = {}
+            
+            # 1. Balances
+            balance_diff = abs(self.wallet_balance - replayed.wallet_balance)
+            if balance_diff >= Decimal("0.0001"):
+                diffs["wallet_balance"] = {
+                    "runtime": float(self.wallet_balance),
+                    "replay": float(replayed.wallet_balance),
+                    "diff": float(balance_diff)
+                }
+
+            pnl_diff = abs(self.realized_pnl_total - replayed.realized_pnl_total)
+            if pnl_diff >= Decimal("0.0001"):
+                diffs["realized_pnl"] = {
+                    "runtime": float(self.realized_pnl_total),
+                    "replay": float(replayed.realized_pnl_total),
+                    "diff": float(pnl_diff)
+                }
+
+            # 2. Open Positions
+            runtime_open = {s: p for s, p in self.positions.items() if p.status == "OPEN"}
+            if len(runtime_open) != len(replayed.open_positions):
+                diffs["position_count"] = {
+                    "runtime": len(runtime_open),
+                    "replay": len(replayed.open_positions)
+                }
+            
+            position_details = {}
+            for symbol in set(runtime_open.keys()) | set(replayed.open_positions.keys()):
+                run_pos = runtime_open.get(symbol)
+                replay_pos = replayed.open_positions.get(symbol)
+                
+                if not run_pos or not replay_pos:
+                    position_details[symbol] = {
+                        "runtime_exists": run_pos is not None,
+                        "replay_exists": replay_pos is not None
+                    }
+                else:
+                    pos_diff = {}
+                    if abs(run_pos.entry_price - replay_pos["entry_price"]) >= Decimal("0.0001"):
+                        pos_diff["entry_price"] = {"runtime": float(run_pos.entry_price), "replay": float(replay_pos["entry_price"])}
+                    if abs(run_pos.remaining_quantity - replay_pos["quantity"]) >= Decimal("0.0001"):
+                        pos_diff["quantity"] = {"runtime": float(run_pos.remaining_quantity), "replay": float(replay_pos["quantity"])}
+                    if abs(run_pos.sl_price - replay_pos["sl_price"]) >= Decimal("0.0001"):
+                        pos_diff["sl_price"] = {"runtime": float(run_pos.sl_price), "replay": float(replay_pos["sl_price"])}
+                    if run_pos.trailing_active != replay_pos.get("trailing_active", False):
+                        pos_diff["trailing_active"] = {"runtime": run_pos.trailing_active, "replay": replay_pos.get("trailing_active")}
+                    
+                    if pos_diff:
+                        position_details[symbol] = pos_diff
+            
+            if position_details:
+                diffs["positions"] = position_details
+
+            # 3. Orders
+            if len(self.orders) != len(replayed.orders):
+                diffs["order_count"] = {
+                    "runtime": len(self.orders),
+                    "replay": len(replayed.orders)
+                }
+
+            order_details = {}
+            for oid in set(self.orders.keys()) | set(replayed.orders.keys()):
+                run_order = self.orders.get(oid)
+                replay_order = replayed.orders.get(oid)
+                
+                if not run_order or not replay_order:
+                    order_details[oid] = {
+                        "runtime_exists": run_order is not None,
+                        "replay_exists": replay_order is not None
+                    }
+                else:
+                    ord_diff = {}
+                    if run_order.status.value != replay_order["status"]:
+                        ord_diff["status"] = {"runtime": run_order.status.value, "replay": replay_order["status"]}
+                    if abs(run_order.quantity - replay_order["quantity"]) >= Decimal("0.0001"):
+                        ord_diff["quantity"] = {"runtime": float(run_order.quantity), "replay": float(replay_order["quantity"])}
+                    if abs(run_order.filled_quantity - replay_order["filled_quantity"]) >= Decimal("0.0001"):
+                        ord_diff["filled_quantity"] = {"runtime": float(run_order.filled_quantity), "replay": float(replay_order["filled_quantity"])}
+                    
+                    if ord_diff:
+                        order_details[oid] = ord_diff
+            
+            if order_details:
+                diffs["orders"] = order_details
+
+            # 4. Fills
+            if len(self.fills) != len(replayed.fills):
+                diffs["fill_count"] = {
+                    "runtime": len(self.fills),
+                    "replay": len(replayed.fills)
+                }
+            
+            fill_details = []
+            for idx, (run_fill, replay_fill) in enumerate(zip(self.fills, replayed.fills)):
+                fill_diff = {}
+                if run_fill.order_id != replay_fill.get("order_id"):
+                    fill_diff["order_id"] = {"runtime": run_fill.order_id, "replay": replay_fill.get("order_id")}
+                if abs(run_fill.quantity - Decimal(str(replay_fill.get("quantity")))) >= Decimal("0.0001"):
+                    fill_diff["quantity"] = {"runtime": float(run_fill.quantity), "replay": float(replay_fill.get("quantity"))}
+                if abs(run_fill.fee - Decimal(str(replay_fill.get("fee")))) >= Decimal("0.0001"):
+                    fill_diff["fee"] = {"runtime": float(run_fill.fee), "replay": float(replay_fill.get("fee"))}
+                
+                if fill_diff:
+                    fill_details.append({"index": idx, "diffs": fill_diff})
+            
+            if fill_details:
+                diffs["fills"] = fill_details
+
+            return {
+                "in_sync": len(diffs) == 0,
+                "timestamp": self._now_ms() if ts is None else ts,
+                "discrepancies": diffs
+            }
+
     def replay_portfolio_state(self) -> PortfolioState:
         """Rebuild a minimal portfolio view from event log only."""
-        state = PortfolioState()
-        if not self.events_file.exists():
+        state = PortfolioState(wallet_balance=self.initial_balance)
+        if not self.events_file.exists() and not self.db_file.exists():
             return state
 
         last_ts = -1
@@ -929,6 +1890,101 @@ class EnhancedFuturesWallet:
             self.reducer.apply(state, event)
         return state
 
+    def assert_runtime_matches_replay(self):
+        """Assert that all runtime state perfectly matches a full replay from the event log."""
+        with self.lock:
+            replayed = self.replay_portfolio_state()
+            
+            # 1. Compare balances
+            assert abs(self.wallet_balance - replayed.wallet_balance) < Decimal("0.0001"), \
+                f"Balance drift: runtime={self.wallet_balance}, replay={replayed.wallet_balance}"
+            assert abs(self.realized_pnl_total - replayed.realized_pnl_total) < Decimal("0.0001"), \
+                f"Realized PnL drift: runtime={self.realized_pnl_total}, replay={replayed.realized_pnl_total}"
+            
+            # 2. Compare open positions
+            runtime_open = {s: p for s, p in self.positions.items() if p.status == "OPEN"}
+            assert len(runtime_open) == len(replayed.open_positions), \
+                f"Position count mismatch: runtime={len(runtime_open)}, replay={len(replayed.open_positions)}"
+            
+            for symbol, replay_pos in replayed.open_positions.items():
+                run_pos = runtime_open.get(symbol)
+                assert run_pos is not None, f"Position for {symbol} missing in runtime"
+                assert abs(run_pos.entry_price - replay_pos["entry_price"]) < Decimal("0.0001"), \
+                    f"Entry price mismatch for {symbol}: runtime={run_pos.entry_price}, replay={replay_pos['entry_price']}"
+                assert abs(run_pos.remaining_quantity - replay_pos["quantity"]) < Decimal("0.0001"), \
+                    f"Quantity mismatch for {symbol}: runtime={run_pos.remaining_quantity}, replay={replay_pos['quantity']}"
+                assert abs(run_pos.sl_price - replay_pos["sl_price"]) < Decimal("0.0001"), \
+                    f"SL price mismatch for {symbol}: runtime={run_pos.sl_price}, replay={replay_pos['sl_price']}"
+                assert run_pos.trailing_active == replay_pos.get("trailing_active", False), \
+                    f"Trailing active mismatch for {symbol}: runtime={run_pos.trailing_active}, replay={replay_pos.get('trailing_active')}"
+            
+            # 3. Compare orders
+            assert len(self.orders) == len(replayed.orders), \
+                f"Order count mismatch: runtime={len(self.orders)}, replay={len(replayed.orders)}"
+            for oid, replay_order in replayed.orders.items():
+                run_order = self.orders.get(oid)
+                assert run_order is not None, f"Order {oid} missing in runtime"
+                assert run_order.status.value == replay_order["status"], \
+                    f"Order {oid} status mismatch: runtime={run_order.status.value}, replay={replay_order['status']}"
+                assert abs(run_order.quantity - replay_order["quantity"]) < Decimal("0.0001"), \
+                    f"Order {oid} quantity mismatch: runtime={run_order.quantity}, replay={replay_order['quantity']}"
+                assert abs(run_order.filled_quantity - replay_order["filled_quantity"]) < Decimal("0.0001"), \
+                    f"Order {oid} filled quantity mismatch: runtime={run_order.filled_quantity}, replay={replay_order['filled_quantity']}"
+            
+            # 4. Compare fills
+            assert len(self.fills) == len(replayed.fills), \
+                f"Fill count mismatch: runtime={len(self.fills)}, replay={len(replayed.fills)}"
+            for idx, replay_fill in enumerate(replayed.fills):
+                run_fill = self.fills[idx]
+                assert run_fill.order_id == replay_fill.get("order_id"), \
+                    f"Fill {idx} order ID mismatch: runtime={run_fill.order_id}, replay={replay_fill.get('order_id')}"
+                assert abs(run_fill.quantity - Decimal(str(replay_fill.get("quantity")))) < Decimal("0.0001"), \
+                    f"Fill {idx} quantity mismatch"
+                assert abs(run_fill.fee - Decimal(str(replay_fill.get("fee")))) < Decimal("0.0001"), \
+                    f"Fill {idx} fee mismatch"
+
+
+    def _persist_domain_event_to_db(self, event: dict):
+        et = event.get("event_type")
+        payload = event.get("payload", {})
+        ts = int(event.get("ts", self._now_ms()))
+        with sqlite3.connect(self.db_file) as conn:
+            if et == "ORDER_CREATED":
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO orders
+                    (order_id, symbol, side, order_type, quantity, filled_quantity, avg_fill_price, status, reduce_only, trigger_price, limit_price, expires_at, updated_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload.get("order_id"), payload.get("symbol"), payload.get("side"), payload.get("order_type", "MARKET"),
+                        str(payload.get("quantity", "0")), "0", "0", payload.get("status", "NEW"),
+                        1 if payload.get("reduce_only", False) else 0,
+                        str(payload.get("trigger_price")) if payload.get("trigger_price") is not None else None,
+                        str(payload.get("limit_price")) if payload.get("limit_price") is not None else None,
+                        payload.get("expires_at"), ts,
+                    ),
+                )
+            elif et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED", "ORDER_CANCELLED", "ORDER_REJECTED", "ORDER_EXPIRED"):
+                oid = payload.get("order_id")
+                if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+                    conn.execute(
+                        "INSERT INTO fills (order_id, symbol, side, quantity, fill_price, fee, ts, sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (oid, payload.get("symbol"), payload.get("side"), str(payload.get("quantity", "0")), str(payload.get("fill_price", "0")), str(payload.get("fee", "0")), ts, int(payload.get("sequence", 1))),
+                    )
+                row = conn.execute("SELECT quantity, filled_quantity FROM orders WHERE order_id = ?", (oid,)).fetchone()
+                if row:
+                    qty = Decimal(str(row[0])); filled = Decimal(str(row[1]))
+                    if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+                        filled += Decimal(str(payload.get("quantity", "0")))
+                    status = payload.get("status") or ("CANCELLED" if et=="ORDER_CANCELLED" else "REJECTED" if et=="ORDER_REJECTED" else "EXPIRED" if et=="ORDER_EXPIRED" else "FILLED")
+                    conn.execute("UPDATE orders SET filled_quantity=?, avg_fill_price=?, status=?, updated_ts=? WHERE order_id=?", (str(filled), str(payload.get("fill_price", "0")), status, ts, oid))
+            elif et == "FUNDING_APPLIED":
+                conn.execute("INSERT INTO funding (symbol, rate, notional, amount, ts) VALUES (?, ?, ?, ?, ?)", (payload.get("symbol"), str(payload.get("rate", "0")), str(payload.get("notional", "0")), str(payload.get("amount", "0")), ts))
+            elif et == "FEE_CHARGED":
+                conn.execute("INSERT INTO fees (symbol, reason, amount, ts) VALUES (?, ?, ?, ?)", (payload.get("symbol"), payload.get("reason"), str(payload.get("amount", "0")), ts))
+            conn.commit()
+
     @staticmethod
     def _sanitize_path_component(value: str) -> str:
         allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -942,6 +1998,13 @@ class EnhancedFuturesWallet:
             )
 
     def _load_state(self):
+        start_time = time.time()
+        if self._load_from_db_snapshot_and_replay():
+            try:
+                self.assert_runtime_matches_replay()
+            except Exception as e:
+                logger.warning(f"Replay parity check failed after DB restore: {e}")
+            return
         if not self.state_file.exists():
             return
         try:
@@ -957,22 +2020,94 @@ class EnhancedFuturesWallet:
                 if d.get("status") == "OPEN"
             }
             self.position_history = state.get("position_history", [])
+            
+            self._runtime_reducer_state = self._deserialize_reducer_state(state)
+            self._sync_positions_from_reducer()
+            self._sync_orders_from_reducer()
+            self._sync_fills_from_reducer()
             self._sync_unrealized_total()
             logger.info(f"Loaded wallet state from {self.state_file}")
+
+            self.replay_duration_ms = 0.0
+            self.delta_size = 0
+            self.recovery_latency_ms = (time.time() - start_time) * 1000.0
+
+            try:
+                self.assert_runtime_matches_replay()
+            except Exception as e:
+                logger.warning(f"Replay parity check failed after file restore: {e}")
         except Exception as e:
             logger.warning(f"Failed to load state: {e}")
+
+    def _load_from_db_snapshot_and_replay(self) -> bool:
+        if not self.db_file.exists():
+            return False
+        start_time = time.time()
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                row = conn.execute(
+                    "SELECT ts, wallet_balance, realized_pnl_total, state_json FROM snapshots ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+            if not row:
+                return False
+            snap_ts, wallet_balance, realized_pnl_total, state_json = row
+            snap = self._decode_snapshot(state_json)
+            self.wallet_balance = self._to_decimal(wallet_balance)
+            self.realized_pnl_total = self._to_decimal(realized_pnl_total)
+            self.positions = {
+                s: EnhancedPosition.from_dict(d)
+                for s, d in snap.get("positions", {}).items()
+                if d.get("status") == "OPEN"
+            }
+            self.position_history = snap.get("position_history", [])
+            
+            replay_state = self._deserialize_reducer_state(snap)
+            
+            replay_start = time.time()
+            delta_count = 0
+            skip_count = replay_state.events_applied
+            for idx, event in enumerate(self._iter_events()):
+                if skip_count > 0:
+                    if idx >= skip_count:
+                        self.reducer.apply(replay_state, event)
+                        delta_count += 1
+                else:
+                    # Legacy fallback for snapshots without events_applied
+                    if int(event.get("ts", 0)) > int(snap_ts):
+                        self.reducer.apply(replay_state, event)
+                        delta_count += 1
+            replay_end = time.time()
+
+            self._runtime_reducer_state = replay_state
+            self.wallet_balance = replay_state.wallet_balance
+            self.realized_pnl_total = replay_state.realized_pnl_total
+            self._sync_positions_from_reducer()
+            self._sync_orders_from_reducer()
+            self._sync_fills_from_reducer()
+            self._sync_unrealized_total()
+            
+            end_time = time.time()
+            self.replay_duration_ms = (replay_end - replay_start) * 1000.0
+            self.delta_size = delta_count
+            self.recovery_latency_ms = (end_time - start_time) * 1000.0
+
+            return True
+        except Exception as e:
+            logger.warning(f"DB snapshot/replay load failed: {e}")
+            return False
 
     def _load_state_with_recovery(self) -> dict:
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                content = f.read()
+            return self._decode_snapshot(content)
         except Exception as primary_err:
             logger.warning(f"Primary wallet state load failed ({self.state_file}): {primary_err}")
             if self.backup_state_file.exists():
                 with open(self.backup_state_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
+                    content = f.read()
                 logger.warning(f"Recovered wallet state from backup file {self.backup_state_file}")
-                return state
+                return self._decode_snapshot(content)
             raise
 
 
@@ -1008,3 +2143,121 @@ class EnhancedFuturesWallet:
             if self.state_file.exists():
                 self.state_file.unlink()
             logger.info("Wallet state reset")
+
+
+class ExecutionEngine(Protocol):
+    def place_order(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        ...
+
+    def cancel_order(self, order_id: str) -> bool:
+        ...
+
+    def sync_positions(self) -> Dict[str, dict]:
+        ...
+
+
+class PaperExecutionEngine:
+    def __init__(self, wallet: EnhancedFuturesWallet):
+        self.wallet = wallet
+
+    def place_order(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        return self.wallet.place_pending_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            trigger_price=trigger_price,
+            limit_price=limit_price,
+            reduce_only=reduce_only,
+            expires_at=expires_at,
+        )
+
+    def cancel_order(self, order_id: str) -> bool:
+        return self.wallet.cancel_order(order_id)
+
+    def sync_positions(self) -> Dict[str, dict]:
+        with self.wallet.lock:
+            return {
+                s: {
+                    "symbol": p.symbol,
+                    "side": p.side.value,
+                    "quantity": p.remaining_quantity,
+                    "entry_price": p.entry_price,
+                }
+                for s, p in self.wallet.positions.items()
+                if p.status == "OPEN"
+            }
+
+
+class BinanceExecutionEngine:
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+        self.api_key = api_key
+        self.api_secret = api_secret
+
+    def place_order(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        raise NotImplementedError("Binance live execution is not implemented yet.")
+
+    def cancel_order(self, order_id: str) -> bool:
+        raise NotImplementedError("Binance live execution is not implemented yet.")
+
+    def sync_positions(self) -> Dict[str, dict]:
+        raise NotImplementedError("Binance live execution is not implemented yet.")
+
+
+class CoinDCXExecutionEngine:
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+        self.api_key = api_key
+        self.api_secret = api_secret
+
+    def place_order(
+        self,
+        symbol: str,
+        side: PositionSide,
+        quantity: Decimal,
+        order_type: OrderType,
+        *,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        expires_at: Optional[int] = None,
+    ) -> Order:
+        raise NotImplementedError("CoinDCX live execution is not implemented yet.")
+
+    def cancel_order(self, order_id: str) -> bool:
+        raise NotImplementedError("CoinDCX live execution is not implemented yet.")
+
+    def sync_positions(self) -> Dict[str, dict]:
+        raise NotImplementedError("CoinDCX live execution is not implemented yet.")
