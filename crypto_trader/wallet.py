@@ -95,6 +95,7 @@ class PortfolioState:
     funding_total: Decimal = Decimal("0")
     violations: List[dict] = field(default_factory=list)
     last_ts: int = 0
+    events_applied: int = 0
 
 class PortfolioReducer:
     """Canonical event reducer for replay-derived portfolio state."""
@@ -103,6 +104,7 @@ class PortfolioReducer:
         et = event.get("event_type")
         payload = event.get("payload", {})
         state.last_ts = int(event.get("ts", state.last_ts))
+        state.events_applied += 1
 
         if et == "WALLET_INITIALIZED":
             state.wallet_balance = Decimal(str(payload.get("initial_balance", "0")))
@@ -820,7 +822,8 @@ class EnhancedFuturesWallet:
             wallet_balance=self._to_decimal(snap.get("wallet_balance", "0")),
             realized_pnl_total=self._to_decimal(snap.get("realized_pnl_total", "0")),
             funding_total=self._to_decimal(snap.get("funding_total", "0") or "0"),
-            last_ts=int(snap.get("reducer_last_ts") or snap.get("last_ts") or 0)
+            last_ts=int(snap.get("reducer_last_ts") or snap.get("last_ts") or 0),
+            events_applied=int(snap.get("reducer_events_applied", 0))
         )
         
         # open_positions
@@ -952,6 +955,7 @@ class EnhancedFuturesWallet:
             "reducer_fills": self._runtime_reducer_state.fills,
             "reducer_violations": self._runtime_reducer_state.violations,
             "reducer_last_ts": self._runtime_reducer_state.last_ts,
+            "reducer_events_applied": self._runtime_reducer_state.events_applied,
         }
         json_compatible_state = self._to_json_compatible(state)
         self._atomic_write_json(self.state_file, json_compatible_state)
@@ -1097,7 +1101,7 @@ class EnhancedFuturesWallet:
                     if line.strip():
                         yield json.loads(line)
 
-    def _append_event(self, event_type: str, payload: dict):
+    def _append_event(self, event_type: str, payload: dict) -> dict:
         event = {
             "ts": self._now_ms(),
             "event_type": event_type,
@@ -1109,17 +1113,11 @@ class EnhancedFuturesWallet:
         with open(self.events_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, default=self._serialize_decimals) + "\n")
         self._append_event_db(event)
+        return event
 
     def _emit_event(self, event_type: str, payload: dict):
         """Authoritative runtime transition: append event, then apply reducer-derived runtime updates."""
-        self._append_event(event_type, payload)
-        event = {
-            "ts": self._now_ms(),
-            "event_type": event_type,
-            "symbol": self.symbol,
-            "namespace": self.state_namespace,
-            "payload": payload,
-        }
+        event = self._append_event(event_type, payload)
         self._persist_domain_event_to_db(event)
         self.reducer.apply(self._runtime_reducer_state, event)
         if self.event_hook:
@@ -2034,10 +2032,17 @@ class EnhancedFuturesWallet:
             
             replay_start = time.time()
             delta_count = 0
-            for event in self._iter_events():
-                if int(event.get("ts", 0)) > int(snap_ts):
-                    self.reducer.apply(replay_state, event)
-                    delta_count += 1
+            skip_count = replay_state.events_applied
+            for idx, event in enumerate(self._iter_events()):
+                if skip_count > 0:
+                    if idx >= skip_count:
+                        self.reducer.apply(replay_state, event)
+                        delta_count += 1
+                else:
+                    # Legacy fallback for snapshots without events_applied
+                    if int(event.get("ts", 0)) > int(snap_ts):
+                        self.reducer.apply(replay_state, event)
+                        delta_count += 1
             replay_end = time.time()
 
             self._runtime_reducer_state = replay_state
