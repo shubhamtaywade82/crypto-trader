@@ -391,9 +391,11 @@ class WebSocketPositionManager:
         wallet,
         check_interval_ms: int = 1000,  # Check every 1s
         wick_buffer_size: int = 5,       # 5 samples = 5s
+        event_bus = None,
     ):
         self.ws = ws_feed
         self.wallet = wallet
+        self.event_bus = event_bus
         self.symbol = self.ws.symbol.upper()
         self.check_interval_ms = check_interval_ms
         self.wick_buffer = deque(maxlen=wick_buffer_size)
