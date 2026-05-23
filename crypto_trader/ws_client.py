@@ -29,7 +29,7 @@ from collections import deque
 
 import websocket
 
-logger = logging.getLogger("crypto_trader.websocket")
+logger = logging.getLogger("crypto_trader.ws_client")
 
 BINANCE_WS_BASE = "wss://fstream.binance.com"
 BINANCE_WS_TESTNET = "wss://stream.binancefuture.com"

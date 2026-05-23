@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .data_feed import BinanceDataFeed
-from .websocket import BinanceWebSocketFeed, WebSocketPositionManager
+from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB

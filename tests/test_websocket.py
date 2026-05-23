@@ -5,7 +5,7 @@ import uuid
 
 import crypto_trader.wallet
 from crypto_trader.wallet import EnhancedFuturesWallet, Playbook, PositionSide
-from crypto_trader.websocket import WebSocketPositionManager, WSMarketData
+from crypto_trader.ws_client import WebSocketPositionManager, WSMarketData
 
 
 def _setup(playbook=Playbook.INTRADAY, side=PositionSide.LONG):
