@@ -4,4 +4,3 @@ llm_cache/**
 __pycache__/**
 crypto_trader/__pycache__/**
 ./wallet_**.json
-tests/__pycache__/**
