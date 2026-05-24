@@ -64,6 +64,10 @@ class LiveTradingSystem:
             paper_spread_coeff=(self.cfg.paper_cdcx_spread_coeff
                                 if self.cfg.mode == TradingMode.PAPER else None),
             paper_collar_pct=self.cfg.paper_collar_pct,
+            venue_sl_enabled=self.cfg.venue_sl_enabled,
+            venue_tp_enabled=self.cfg.venue_tp_enabled,
+            require_venue_sl=self.cfg.require_venue_sl,
+            software_sl_backup_bps=self.cfg.software_sl_backup_bps,
         )
 
     # ── construction ──────────────────────────────────────────────────────

@@ -2,8 +2,10 @@ import argparse
 import time
 import threading
 import os
+import sys
 from typing import List
 import logging
+import fcntl
 from dotenv import load_dotenv
 
 from crypto_trader.engine_ws import WebSocketTradingEngine
@@ -18,6 +20,21 @@ load_dotenv()
 
 configure_colored_logging()
 logger = logging.getLogger("multi_engine")
+
+def acquire_lock():
+    """Acquire a file lock to prevent multiple instances."""
+    lock_file = "/tmp/crypto_trader_multi_engine.lock"
+    lock_fd = open(lock_file, "w")
+    try:
+        fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Write PID to lock file
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        return lock_fd
+    except IOError:
+        print(f"\nERROR: Another instance of multi_engine is already running (check {lock_file}).")
+        print("Please stop the existing instance before starting a new one.")
+        sys.exit(1)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
@@ -42,6 +59,7 @@ def run_engine(engine: WebSocketTradingEngine):
         engine.stop()
 
 def main():
+    lock_fd = acquire_lock()
     args = parse_args()
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if not symbols:
