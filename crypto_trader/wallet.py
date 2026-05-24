@@ -276,6 +276,12 @@ class EnhancedPosition:
     close_time: Optional[int] = None
     close_price: Optional[Decimal] = None
     close_reason: Optional[str] = None
+    highest_price: Optional[Decimal] = None
+    peak_pnl_pct: Decimal = Decimal("0")
+
+    def __post_init__(self):
+        if self.highest_price is None:
+            self.highest_price = self.entry_price
 
     def update_pnl(self, mark_price: Decimal):
         if self.status != "OPEN" or mark_price <= Decimal("0"):
@@ -287,8 +293,19 @@ class EnhancedPosition:
 
         if self.side == PositionSide.LONG:
             self.unrealized_pnl = (mark_price - self.entry_price) * self.remaining_quantity
+            if self.highest_price is None or mark_price > self.highest_price:
+                self.highest_price = mark_price
         else:
             self.unrealized_pnl = (self.entry_price - mark_price) * self.remaining_quantity
+            if self.highest_price is None or mark_price < self.highest_price:
+                self.highest_price = mark_price
+
+        # Update peak PnL as percentage of entry price (undiluted price change)
+        if self.entry_price > Decimal("0") and self.remaining_quantity > Decimal("0"):
+            current_pnl_pct = self.unrealized_pnl / (self.entry_price * self.remaining_quantity)
+            if current_pnl_pct > self.peak_pnl_pct:
+                self.peak_pnl_pct = current_pnl_pct
+
 
     @property
     def total_realized_pnl(self) -> float:
@@ -323,13 +340,15 @@ class EnhancedPosition:
             "close_time": self.close_time,
             "close_price": self.close_price,
             "close_reason": self.close_reason,
+            "highest_price": self.highest_price,
+            "peak_pnl_pct": self.peak_pnl_pct,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "EnhancedPosition":
         data["side"] = PositionSide(data["side"])
         data["playbook"] = Playbook(data["playbook"])
-        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price"]:
+        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct"]:
             if k in data and data[k] is not None:
                 data[k] = Decimal(str(data[k]))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
@@ -791,6 +810,8 @@ class EnhancedFuturesWallet:
         mark_price: float,
         candle_close_time: int,
         ema9_1h: Optional[float] = None,
+        current_llm_advice: Optional[dict] = None,
+        current_regime: Optional[str] = None,
     ):
         """Update PnL and check all exit conditions."""
         with self.lock:
@@ -806,13 +827,63 @@ class EnhancedFuturesWallet:
             # 1. Catastrophic SL (-50% margin)
             cat_sl = pos.margin_used * self._to_decimal(self.catastrophic_sl_pct)
             if self._is_liquidation_required(pos, mark_price):
-                self._liquidate_position(symbol, mark_price)
+                self._liquidate_position(symbol, float(mark_price))
                 return
             if pnl <= cat_sl:
-                self.close_position(symbol, mark_price, reason=f"CATASTROPHIC_SL ({pnl:.2f})")
+                self.close_position(symbol, float(mark_price), reason=f"CATASTROPHIC_SL ({pnl:.2f})")
                 return
 
-            # 2. Playbook-specific exits
+            # 2. Windfall Return on Margin Exit (ROM >= 40%)
+            if pos.current_margin_pnl_pct >= Decimal("0.40"):
+                self.close_position(symbol, float(mark_price), reason="WINDFALL_RO_MARGIN_EXIT")
+                return
+
+            # 3. Peak PnL Trailing Stop (Triggered at >= 2% undiluted price change, exit if drops by 25% of peak)
+            if pos.peak_pnl_pct >= Decimal("0.02"):
+                if pos.side == PositionSide.LONG:
+                    peak_pnl = (pos.highest_price - pos.entry_price) * pos.remaining_quantity
+                else:
+                    peak_pnl = (pos.entry_price - pos.highest_price) * pos.remaining_quantity
+                
+                if pos.unrealized_pnl <= peak_pnl * Decimal("0.75"):
+                    self.close_position(symbol, float(mark_price), reason="PEAK_TRADING_STOP")
+                    return
+
+            # 4. AI/Regime Reversal Exit
+            if current_llm_advice:
+                bias = current_llm_advice.get("bias") if isinstance(current_llm_advice, dict) else (current_llm_advice.bias.value if hasattr(current_llm_advice.bias, "value") else current_llm_advice.bias)
+                confidence = current_llm_advice.get("confidence", 0.0) if isinstance(current_llm_advice, dict) else getattr(current_llm_advice, "confidence", 0.0)
+                
+                is_reversal = False
+                if pos.side == PositionSide.LONG and bias == "bearish":
+                    is_reversal = True
+                elif pos.side == PositionSide.SHORT and bias == "bullish":
+                    is_reversal = True
+                    
+                if is_reversal and confidence >= 0.70:
+                    if pos.side == PositionSide.LONG and mark_price >= pos.entry_price * Decimal("0.995"):
+                        self.close_position(symbol, float(mark_price), reason="AI_REVERSAL_EXIT")
+                        return
+                    elif pos.side == PositionSide.SHORT and mark_price <= pos.entry_price * Decimal("1.005"):
+                        self.close_position(symbol, float(mark_price), reason="AI_REVERSAL_EXIT")
+                        return
+
+            if current_regime:
+                is_regime_reversal = False
+                if pos.side == PositionSide.LONG and current_regime == "TRENDING_DOWN":
+                    is_regime_reversal = True
+                elif pos.side == PositionSide.SHORT and current_regime == "TRENDING_UP":
+                    is_regime_reversal = True
+                    
+                if is_regime_reversal:
+                    if pos.side == PositionSide.LONG and mark_price >= pos.entry_price * Decimal("0.995"):
+                        self.close_position(symbol, float(mark_price), reason="REGIME_REVERSAL_EXIT")
+                        return
+                    elif pos.side == PositionSide.SHORT and mark_price <= pos.entry_price * Decimal("1.005"):
+                        self.close_position(symbol, float(mark_price), reason="REGIME_REVERSAL_EXIT")
+                        return
+
+            # 5. Playbook-specific exits
             if pos.playbook == Playbook.INTRADAY:
                 self._check_intraday_exits(symbol, pos, mark_price, candle_close_time)
             elif pos.playbook == Playbook.SWING:
@@ -974,6 +1045,8 @@ class EnhancedFuturesWallet:
                     "open_time": int(pdata.get("open_time", 0)),
                     "tp_levels": tp_levels,
                     "trailing_active": bool(pdata.get("trailing_active", False)),
+                    "highest_price": self._to_decimal(pdata.get("highest_price", pdata.get("entry_price", "0"))),
+                    "peak_pnl_pct": self._to_decimal(pdata.get("peak_pnl_pct", "0")),
                 }
         elif "positions" in snap:
             # Fallback for legacy snapshots
@@ -998,6 +1071,8 @@ class EnhancedFuturesWallet:
                         "open_time": int(pdata.get("open_time", 0)),
                         "tp_levels": tp_levels,
                         "trailing_active": bool(pdata.get("trailing_active", False)),
+                        "highest_price": self._to_decimal(pdata.get("highest_price", pdata.get("entry_price", "0"))),
+                        "peak_pnl_pct": self._to_decimal(pdata.get("peak_pnl_pct", "0")),
                     }
 
         # orders
@@ -1063,6 +1138,12 @@ class EnhancedFuturesWallet:
         raise ValueError("Unknown snapshot format")
 
     def _save_state(self):
+        # Sync dynamic peak fields back to reducer open positions before saving
+        for symbol, pos in self.positions.items():
+            if symbol in self._runtime_reducer_state.open_positions:
+                self._runtime_reducer_state.open_positions[symbol]["highest_price"] = pos.highest_price
+                self._runtime_reducer_state.open_positions[symbol]["peak_pnl_pct"] = pos.peak_pnl_pct
+
         state = {
             "schema_version": STATE_SCHEMA_VERSION,
             "saved_at": self._now_ms(),
@@ -1307,6 +1388,8 @@ class EnhancedFuturesWallet:
                     tp_levels=tp_levels,
                     trailing_active=bool(pdata.get("trailing_active", False)),
                     time_stop_hours=int(pdata.get("time_stop_hours", 18)),
+                    highest_price=self._to_decimal(pdata.get("highest_price", entry)),
+                    peak_pnl_pct=self._to_decimal(pdata.get("peak_pnl_pct", Decimal("0"))),
                 )
         self.positions = current
 

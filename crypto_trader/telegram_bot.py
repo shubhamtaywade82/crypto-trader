@@ -22,45 +22,79 @@ class TelegramService:
         self.chat_id = chat_id
         self.event_bus = event_bus
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.app: Optional[ApplicationBuilder] = None
+        self.app: Optional[Any] = None
         self._thread: Optional[threading.Thread] = None
 
+        # Check for placeholder or empty token / chat ID
+        is_placeholder_token = not token or any(p in token.lower() for p in ["placeholder", "your_bot", "your_token"])
+        is_placeholder_chat = not chat_id or any(p in chat_id.lower() for p in ["placeholder", "your_chat"])
+        if is_placeholder_token or is_placeholder_chat:
+            self.enabled = False
+            logger.warning("[Telegram] Credentials missing or set to placeholder. TelegramService will run in mock mode.")
+        else:
+            self.enabled = True
+
     def start(self):
-        """Start the Telegram bot in a background thread with its own event loop."""
+        """Start the Telegram bot. Runs in background thread if enabled, mock mode otherwise."""
+        if not self.enabled:
+            logger.info("[Telegram] Not starting Telegram thread (running in mock mode).")
+            # In mock mode, we still subscribe to log what would be broadcast
+            self.event_bus.subscribe(TradeOpenedEvent, self._handle_event_disabled)
+            self.event_bus.subscribe(TradeClosedEvent, self._handle_event_disabled)
+            self.event_bus.subscribe(RiskHaltEvent, self._handle_event_disabled)
+            self.event_bus.subscribe(SystemFailureEvent, self._handle_event_disabled)
+            self.event_bus.subscribe(SignalRejectedEvent, self._handle_event_disabled)
+            self.event_bus.subscribe(RegimeChangeEvent, self._handle_event_disabled)
+            return
+
         self._thread = threading.Thread(target=self._run_event_loop, daemon=True)
         self._thread.start()
         logger.info("TelegramService thread started")
 
     def _run_event_loop(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        
-        self.app = ApplicationBuilder().token(self.token).build()
-        
-        # Register Command Handlers
-        self.app.add_handler(CommandHandler("start", self._cmd_start))
-        self.app.add_handler(CommandHandler("status", self._cmd_status))
-        self.app.add_handler(CommandHandler("kill", self._cmd_kill))
-        self.app.add_handler(CommandHandler("resume", self._cmd_resume))
-        self.app.add_handler(CommandHandler("pnl", self._cmd_pnl))
+        try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            
+            self.app = ApplicationBuilder().token(self.token).build()
+            
+            # Register Command Handlers
+            self.app.add_handler(CommandHandler("start", self._cmd_start))
+            self.app.add_handler(CommandHandler("status", self._cmd_status))
+            self.app.add_handler(CommandHandler("kill", self._cmd_kill))
+            self.app.add_handler(CommandHandler("resume", self._cmd_resume))
+            self.app.add_handler(CommandHandler("pnl", self._cmd_pnl))
 
-        # Subscribe to EventBus
-        self.event_bus.subscribe(TradeOpenedEvent, self._handle_event)
-        self.event_bus.subscribe(TradeClosedEvent, self._handle_event)
-        self.event_bus.subscribe(RiskHaltEvent, self._handle_event)
-        self.event_bus.subscribe(SystemFailureEvent, self._handle_event)
-        self.event_bus.subscribe(SignalRejectedEvent, self._handle_event)
-        self.event_bus.subscribe(RegimeChangeEvent, self._handle_event)
+            # Subscribe to EventBus
+            self.event_bus.subscribe(TradeOpenedEvent, self._handle_event)
+            self.event_bus.subscribe(TradeClosedEvent, self._handle_event)
+            self.event_bus.subscribe(RiskHaltEvent, self._handle_event)
+            self.event_bus.subscribe(SystemFailureEvent, self._handle_event)
+            self.event_bus.subscribe(SignalRejectedEvent, self._handle_event)
+            self.event_bus.subscribe(RegimeChangeEvent, self._handle_event)
 
-        logger.info("Telegram Bot initialized and subscribed to EventBus")
-        self.app.run_polling(close_loop=False, stop_signals=False)
+            logger.info("Telegram Bot initialized and subscribed to EventBus")
+            self.app.run_polling(close_loop=False, stop_signals=False)
+        except Exception as e:
+            logger.error(f"[Telegram] Failed to initialize/run Telegram Bot: {e}")
+            logger.warning("[Telegram] TelegramService will be disabled due to startup failure.")
+            self.enabled = False
 
     def _handle_event(self, event: Event):
         """Bridge sync EventBus to async Telegram broadcasting."""
-        if self.loop and self.loop.is_running():
+        if self.enabled and self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self._broadcast_event(event), self.loop)
 
+    def _handle_event_disabled(self, event: Event):
+        """Mock handler that prints Telegram messages to logger."""
+        msg = self._format_event(event)
+        if msg:
+            clean_msg = msg.replace("*", "").replace("🟢 ", "").replace("🔴 ", "").replace("⚠️ ", "").replace("🛑 ", "").strip()
+            logger.info(f"[Telegram Mock] Would send message:\n{clean_msg}")
+
     async def _broadcast_event(self, event: Event):
+        if not self.enabled or not self.app:
+            return
         message = self._format_event(event)
         if message:
             try:

@@ -502,6 +502,23 @@ class WebSocketPositionManager:
             self._handle_close(data.mark_price, f"CATASTROPHIC_SL ({pnl:.2f})")
             return
 
+        # 1b. Windfall Return on Margin Exit (ROM >= 40%)
+        if pos.current_margin_pnl_pct >= Decimal("0.40"):
+            self._handle_close(price_for_trail, "WINDFALL_RO_MARGIN_EXIT")
+            return
+
+        # 1c. Peak PnL Trailing Stop (Triggered at >= 2% undiluted price change, exit if drops by 25% of peak)
+        if pos.peak_pnl_pct >= Decimal("0.02"):
+            from .wallet import PositionSide
+            if pos.side == PositionSide.LONG:
+                peak_pnl = (pos.highest_price - pos.entry_price) * pos.remaining_quantity
+            else:
+                peak_pnl = (pos.entry_price - pos.highest_price) * pos.remaining_quantity
+            
+            if pos.unrealized_pnl <= peak_pnl * Decimal("0.75"):
+                self._handle_close(price_for_trail, "PEAK_TRADING_STOP")
+                return
+
         # 2. Playbook-specific exits
         from .wallet import Playbook
         if pos.playbook == Playbook.INTRADAY:

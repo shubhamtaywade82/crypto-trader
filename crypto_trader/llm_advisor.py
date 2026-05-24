@@ -35,7 +35,7 @@ DATA_DIR = Path.home() / ".crypto_trader"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Configuration ──
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 
