@@ -136,6 +136,19 @@ class CoinDCXClient:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         return self._send("POST", url, headers=self._signed_headers(body), data=body, params=None)
 
+    def get_signed(self, endpoint: str, payload: Optional[dict] = None) -> Any:
+        """Authenticated GET with a signed JSON body (CoinDCX wallet/margin reads).
+
+        Several CoinDCX read endpoints (futures wallets, cross_margin_details,
+        wallet transactions) are GETs that still require the HMAC signature over
+        a JSON body containing ``timestamp``.
+        """
+        body_obj = dict(payload or {})
+        body_obj["timestamp"] = self._now_ms()
+        body = json.dumps(body_obj, separators=(",", ":"))
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        return self._send("GET", url, headers=self._signed_headers(body), data=body, params=None)
+
 
 def _safe_json(resp: "requests.Response") -> Any:
     try:

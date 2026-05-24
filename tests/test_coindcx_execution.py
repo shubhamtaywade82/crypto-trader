@@ -72,7 +72,7 @@ def test_validate_order_min_notional():
 class _FakeClient:
     def __init__(self, order_resp=None, positions=None, balances=None, equity=None):
         self.order_resp = order_resp or {"id": "ex-1", "status": "filled",
-                                         "avg_price": "100.5", "filled_quantity": "1.0"}
+                                         "avg_price": "100.5", "total_quantity": "1.0"}
         self.positions = positions if positions is not None else []
         self.balances = balances if balances is not None else [{"currency_short_name": "USDT", "balance": 250.0}]
         self.equity = equity
@@ -91,9 +91,13 @@ class _FakeClient:
             return self.order_resp
         if endpoint.endswith("positions"):
             return self.positions
+        return {}
+
+    def get_signed(self, endpoint, payload=None):
+        self.calls.append((endpoint, payload))
         if endpoint.endswith("cross_margin_details"):
             return {"total_account_equity": self.equity} if self.equity is not None else {}
-        if endpoint.endswith("balances"):
+        if endpoint.endswith("wallets"):
             return self.balances
         return {}
 
@@ -117,8 +121,7 @@ def _engine(fake, ack=True):
 def test_place_order_builds_payload_and_parses_fill(gate_open):
     fake = _FakeClient()
     eng = _engine(fake)
-    order = eng.place_order("SOLUSDT", PositionSide.LONG, Decimal("1.0"), OrderType.MARKET,
-                            client_order_id="ct-test")
+    order = eng.place_order("SOLUSDT", PositionSide.LONG, Decimal("1.0"), OrderType.MARKET)
     endpoint, payload = fake.calls[-1]
     assert endpoint.endswith("orders/create")
     o = payload["order"]
@@ -126,18 +129,24 @@ def test_place_order_builds_payload_and_parses_fill(gate_open):
     assert o["side"] == "buy"
     assert o["order_type"] == "market_order"
     assert o["leverage"] == 2.0
-    assert o["client_order_id"] == "ct-test"
+    assert o["notification"] == "no_notification"
+    assert o["position_margin_type"] == "isolated"
+    assert o["margin_currency_short_name"] == "USDT"
+    # CoinDCX create order supports neither reduce_only nor client_order_id
+    assert "reduce_only" not in o
+    assert "client_order_id" not in o
     assert order.status.value == "FILLED"
     assert order.avg_fill_price == Decimal("100.5")
 
 
-def test_reduce_only_exit_payload(gate_open):
+def test_exit_uses_opposite_side_no_reduce_only(gate_open):
     fake = _FakeClient()
     eng = _engine(fake)
+    # closing a LONG => opposite-side (sell) market order; nets the position
     eng.place_order("SOLUSDT", PositionSide.SHORT, Decimal("1.0"), OrderType.MARKET, reduce_only=True)
     _, payload = fake.calls[-1]
-    assert payload["order"]["reduce_only"] is True
     assert payload["order"]["side"] == "sell"
+    assert "reduce_only" not in payload["order"]
 
 
 def test_place_order_blocked_without_gate(monkeypatch):
