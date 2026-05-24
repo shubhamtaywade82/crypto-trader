@@ -94,6 +94,60 @@ class Reconciler:
                     internal="0", exchange=str(vpos["quantity"]),
                     detail="venue position missing internally",
                 ))
+
+        out.extend(self._reconcile_protective_orders(snap, venue))
+        return out
+
+    # ── protective-order reconciliation (F1) ──────────────────────────────────
+    def _reconcile_protective_orders(self, snap: AccountSnapshot, venue: dict) -> List[ReconciliationMismatchEvent]:
+        """Keep venue-resident protective stops in sync with internal positions.
+
+        * SL order vanished while the venue still holds the position -> re-place it.
+        * Open order tied to no internal position -> cancel it (orphan).
+        Repairs do not trip the kill switch (``repaired=True``).
+        """
+        out: List[ReconciliationMismatchEvent] = []
+        open_ids = {str(o.get("exchange_order_id")) for o in snap.open_orders if o.get("exchange_order_id")}
+        tracked_ids: set = set()
+
+        for sym, pos in self.wallet.positions.items():
+            if getattr(pos, "status", "") != "OPEN":
+                continue
+            protective = getattr(pos, "protective_orders", {}) or {}
+            for oid in protective.values():
+                if oid:
+                    tracked_ids.add(str(oid))
+            sl_id = protective.get("sl")
+            # Re-place only when the venue still holds the position but the stop is
+            # gone (otherwise the stop fired and the position is being closed).
+            if sl_id and sym in venue and str(sl_id) not in open_ids:
+                replaced = self.wallet._place_protective_orders(pos)
+                out.append(ReconciliationMismatchEvent(
+                    symbol=sym, kind="missing_protective_stop",
+                    internal=str(sl_id), exchange="absent",
+                    repaired=bool(replaced),
+                    detail="venue protective stop missing; re-placed" if replaced else "venue protective stop missing; re-place failed",
+                ))
+
+        # Orphan orders: open on the venue, not one of ours, no internal position.
+        internal_syms = {s for s, p in self.wallet.positions.items() if getattr(p, "status", "") == "OPEN"}
+        for o in snap.open_orders:
+            oid = str(o.get("exchange_order_id") or "")
+            osym = o.get("symbol", "")
+            if not oid or oid in tracked_ids:
+                continue
+            if osym and osym not in internal_syms:
+                ok = False
+                try:
+                    ok = self.account_sync.engine.cancel_order(oid)
+                except Exception as e:
+                    logger.warning("Orphan order cancel failed for %s: %s", oid, e)
+                out.append(ReconciliationMismatchEvent(
+                    symbol=osym, kind="orphan_order",
+                    internal="absent", exchange=oid,
+                    repaired=bool(ok),
+                    detail="venue order with no internal position; cancelled" if ok else "orphan order; cancel failed",
+                ))
         return out
 
     def _internal_positions(self) -> dict:

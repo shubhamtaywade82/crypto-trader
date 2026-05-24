@@ -39,6 +39,7 @@ class TradeClosedEvent(Event):
     mae: float = 0.0
     fees: float = 0.0
     slippage: float = 0.0
+    tds: float = 0.0
 
 @dataclass
 class RiskHaltEvent(Event):

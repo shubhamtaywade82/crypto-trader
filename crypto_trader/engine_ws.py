@@ -63,10 +63,15 @@ class WebSocketTradingEngine:
         log_llm: bool = False,
         wallet = None,
         event_bus = None,
+        cfg = None,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
         self.event_bus = event_bus
+        self.cfg = cfg
+        # CoinDCX market data for the cross-venue basis guard (F3). Public, no
+        # creds; built lazily so paper/tests without network stay light.
+        self._coindcx_md = None
 
         rest_logged = log_responses or log_rest
         ws_logged = log_responses or log_ws
@@ -396,6 +401,45 @@ class WebSocketTradingEngine:
                            mark_price, funding_rate, oi_delta, taker_ratio,
                            tech_score, regime, regime_score, advice, dynamic_threshold)
 
+    def _coindcx_market_data(self):
+        if self._coindcx_md is None:
+            from .exchanges.coindcx_market_data import CoinDCXMarketData
+            self._coindcx_md = CoinDCXMarketData()
+        return self._coindcx_md
+
+    def _basis_guard(self, side, binance_mark: float):
+        """Cross-venue basis guard (F3).
+
+        Signals fire on Binance price but fills happen on CoinDCX. Reject the
+        entry when the venues diverge beyond the configured threshold. Returns
+        ``(allowed, basis)``. If CoinDCX data is unavailable, skip the guard
+        (don't block trading on a missing fallback feed).
+        """
+        cfg = self.cfg
+        if cfg is None or not getattr(cfg, "basis_guard_enabled", False) or binance_mark <= 0:
+            return True, 0.0
+        try:
+            cdcx_mark = self._coindcx_market_data().get_mark_price(self.symbol)
+        except Exception as e:
+            logger.warning("[BASIS] CoinDCX mark unavailable (%s); skipping guard", e)
+            return True, 0.0
+        if cdcx_mark <= 0:
+            return True, 0.0
+        basis = (cdcx_mark - binance_mark) / binance_mark
+        if abs(basis) > cfg.max_cross_venue_basis:
+            logger.warning(
+                f"[BASIS BLOCKED] {self.symbol} basis {basis:+.4%} exceeds "
+                f"{cfg.max_cross_venue_basis:.2%} (binance={binance_mark:.4f} coindcx={cdcx_mark:.4f})"
+            )
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(
+                    symbol=self.symbol,
+                    reason=f"cross-venue basis {basis:+.4%} > {cfg.max_cross_venue_basis:.2%}",
+                ))
+            return False, basis
+        return True, basis
+
     def _execute_entry(self, setup, final_score, llm_weight, explanation,
                       mark_price, funding_rate, oi_delta, taker_ratio,
                       tech_score, regime, regime_score, advice, dynamic_threshold):
@@ -415,8 +459,18 @@ class WebSocketTradingEngine:
         if spread_pct > 0.1:
             logger.warning(f"[ENTRY] Wide spread: {spread_pct:.3f}% | bid={self.ws_feed.data.best_bid:.2f} ask={self.ws_feed.data.best_ask:.2f}")
 
-        # Adjust entry price to use mid price (fairer than LTP which can be stale)
+        # F3: cross-venue basis guard — reject if Binance and CoinDCX diverge.
+        allowed, _basis = self._basis_guard(setup["side"], mid if mid > 0 else mark_price)
+        if not allowed:
+            return
+
+        # Adjust entry price to use mid price (fairer than LTP which can be stale).
+        # F3: nudge the trigger toward the fill venue by the basis buffer so risk
+        # sizing reflects the price we'll actually fill on at CoinDCX.
         entry_price = mid
+        buf = self.cfg.entry_basis_buffer if (self.cfg and getattr(self.cfg, "basis_guard_enabled", False)) else 0.0
+        if buf:
+            entry_price = mid * (1 + buf) if setup["side"] == PositionSide.LONG else mid * (1 - buf)
 
         # Recalculate SL/TP based on actual entry price
         if setup["side"] == PositionSide.LONG:
