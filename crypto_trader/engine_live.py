@@ -203,6 +203,11 @@ class LiveTradingSystem:
             use_llm=False if self.cfg.mode == TradingMode.PAPER else True,
         )
         engine.risk_manager = self.risk  # share kill switch with reconciler
+        # AUTO failover for the signal tick: Binance primary, CoinDCX fallback
+        # (klines + mark price + funding) so the loop survives a Binance geo-block.
+        from .exchanges.resilient_data_feed import ResilientDataFeed
+        engine.data_feed = ResilientDataFeed.from_config(self.cfg)
+        logger.info("Signal-tick data feed: resilient (%s primary)", self.cfg.data_source.value)
         engine.run_loop(signal_interval_seconds=signal_interval_seconds, max_iterations=max_iterations)
 
 
