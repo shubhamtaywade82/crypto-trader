@@ -3,7 +3,7 @@ import time
 import threading
 import os
 import sys
-from typing import List
+from typing import List, Optional
 import logging
 import fcntl
 from dotenv import load_dotenv
@@ -36,9 +36,11 @@ def acquire_lock():
         print("Please stop the existing instance before starting a new one.")
         sys.exit(1)
 
+from pathlib import Path
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
-    parser.add_argument("--symbols", type=str, required=True, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
+    parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
     parser.add_argument("--leverage", type=int, default=10, help="Leverage multiplier")
     parser.add_argument("--testnet", action="store_true", help="Use Binance Testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM advisor")
@@ -49,6 +51,41 @@ def parse_args():
     parser.add_argument("--log-ws", action="store_true", help="Log WebSocket messages")
     parser.add_argument("--log-llm", action="store_true", help="Log LLM prompts and raw responses")
     return parser.parse_args()
+
+def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
+    # 1. Command-line argument
+    if symbols_arg:
+        return [s.strip().upper() for s in symbols_arg.split(",") if s.strip()]
+
+    # 2. watchlist.yaml
+    yaml_path = Path("watchlist.yaml")
+    if yaml_path.exists():
+        try:
+            import yaml
+            with open(yaml_path, "r") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict) and "watchlist" in data:
+                    symbols = data["watchlist"]
+                elif isinstance(data, list):
+                    symbols = data
+                else:
+                    symbols = []
+                if symbols:
+                    return [str(s).strip().upper() for s in symbols if s]
+        except Exception as e:
+            logger.warning(f"Failed to read watchlist.yaml: {e}")
+
+    # 3. WATCHLIST env var from .env
+    watchlist_env = os.getenv("WATCHLIST")
+    if watchlist_env:
+        return [s.strip().upper() for s in watchlist_env.split(",") if s.strip()]
+
+    # 4. TRADE_SYMBOL env var from .env
+    trade_symbol = os.getenv("TRADE_SYMBOL")
+    if trade_symbol:
+        return [trade_symbol.strip().upper()]
+
+    return []
 
 def run_engine(engine: WebSocketTradingEngine):
     try:
@@ -61,10 +98,11 @@ def run_engine(engine: WebSocketTradingEngine):
 def main():
     lock_fd = acquire_lock()
     args = parse_args()
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    
+    symbols = load_watchlist(args.symbols)
     if not symbols:
-        logger.error("No valid symbols provided.")
-        return
+        logger.error("No valid symbols found. Provide --symbols, a watchlist.yaml file, or WATCHLIST/TRADE_SYMBOL in .env.")
+        sys.exit(1)
 
     logger.info(f"Starting Multi-Engine for {len(symbols)} symbols: {', '.join(symbols)}")
     engines = []

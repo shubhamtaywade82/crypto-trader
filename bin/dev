@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Development startup script for crypto-trader
+
+set -e
+
+# Ensure we run from the project root directory
+cd "$(dirname "$0")/.."
+
+# Start the multi-symbol trading engine, forwarding any command-line arguments
+# If no arguments are passed, it automatically loads the watchlist from watchlist.yaml, .env, etc.
+exec python3 -m crypto_trader.multi_engine "$@"
