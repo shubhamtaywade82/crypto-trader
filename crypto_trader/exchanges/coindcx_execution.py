@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 
 from ..wallet import Order, OrderStatus, OrderType, PositionSide
+from .. import safe_mode
 from .coindcx_client import CoinDCXClient, CoinDCXError
 from .instrument_mapper import InstrumentMapper, coindcx_to_internal
 
@@ -28,6 +29,7 @@ EP_CANCEL_ORDER = "exchange/v1/derivatives/futures/orders/cancel"
 EP_LIST_ORDERS = "exchange/v1/derivatives/futures/orders"
 EP_POSITIONS = "exchange/v1/derivatives/futures/positions"
 EP_BALANCES = "exchange/v1/users/balances"          # unified wallet (USDT margin)
+EP_CROSS_MARGIN = "exchange/v1/derivatives/futures/positions/cross_margin_details"  # futures equity
 EP_TRADES = "exchange/v1/derivatives/futures/trades"
 EP_LEVERAGE = "exchange/v1/derivatives/futures/positions/edit_leverage"  # best-effort; leverage is also carried per-order
 
@@ -51,7 +53,14 @@ _CDCX_STATUS_TO_WALLET = {
 
 
 class CoinDCXExecutionEngine:
-    """Live execution venue. Conforms to ``wallet.ExecutionEngine``."""
+    """Live execution venue. Conforms to ``wallet.ExecutionEngine``.
+
+    Real-money order ops (place/cancel) are gated by ``safe_mode``: they require
+    the constructor flag ``i_understand_real_money=True`` AND the environment
+    gate (``LIVE_TRADING_ENABLED`` + ``LIVE_TRADING_ACK``) AND no HALT file.
+    """
+
+    VENUE = "CoinDCX"
 
     def __init__(
         self,
@@ -62,11 +71,18 @@ class CoinDCXExecutionEngine:
         client: Optional[CoinDCXClient] = None,
         mapper: Optional[InstrumentMapper] = None,
         margin_mode: str = "isolated",
+        i_understand_real_money: bool = False,
     ):
         self.client = client or CoinDCXClient(api_key=api_key, api_secret=api_secret)
         self.mapper = mapper or InstrumentMapper(self.client)
         self.leverage = leverage
         self.margin_mode = margin_mode
+        self._ack = bool(i_understand_real_money)
+        if self._ack:
+            logger.warning(
+                "CoinDCXExecutionEngine constructed with i_understand_real_money=True. "
+                "Orders still require LIVE_TRADING_ENABLED + LIVE_TRADING_ACK and no HALT file."
+            )
 
     # ── ExecutionEngine Protocol ───────────────────────────────────────────
     def place_order(
@@ -82,6 +98,9 @@ class CoinDCXExecutionEngine:
         expires_at: Optional[int] = None,
         client_order_id: Optional[str] = None,
     ) -> Order:
+        safe_mode.assert_live_allowed(
+            "PLACE", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol
+        )
         spec = self.mapper.get_spec(symbol)
         qty = spec.round_qty(Decimal(str(quantity)))
         ref_price = limit_price or trigger_price
@@ -111,6 +130,9 @@ class CoinDCXExecutionEngine:
         return self._parse_order_response(resp, symbol, side, qty, order_type, reduce_only, client_order_id)
 
     def cancel_order(self, order_id: str) -> bool:
+        safe_mode.assert_live_allowed(
+            "CANCEL", venue=self.VENUE, constructor_ack=self._ack, symbol=order_id
+        )
         try:
             self.client.post_signed(EP_CANCEL_ORDER, {"id": order_id})
             return True
@@ -138,6 +160,19 @@ class CoinDCXExecutionEngine:
             except (TypeError, ValueError):
                 continue
         return balances
+
+    def sync_balance(self) -> float:
+        """Total futures account equity (USDT). Prefers cross-margin details,
+        falls back to the unified wallet's USDT balance."""
+        try:
+            res = self.client.post_signed(EP_CROSS_MARGIN, {})
+            if isinstance(res, dict):
+                for key in ("total_account_equity", "total_wallet_balance"):
+                    if res.get(key) is not None:
+                        return float(res[key])
+        except CoinDCXError as e:
+            logger.debug("cross_margin_details unavailable (%s); using unified balance", e)
+        return float(self.get_balances().get("USDT", 0.0))
 
     def get_positions(self) -> List[dict]:
         resp = self.client.post_signed(EP_POSITIONS, {"margin_currency_short_name": ["USDT"]})

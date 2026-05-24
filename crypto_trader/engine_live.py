@@ -68,6 +68,7 @@ class LiveTradingSystem:
             api_key=self.cfg.coindcx_api_key,
             api_secret=self.cfg.coindcx_api_secret,
             leverage=self.cfg.max_leverage,
+            i_understand_real_money=True,
         )
 
     def _build_market_data(self):
@@ -110,13 +111,23 @@ class LiveTradingSystem:
         return checks
 
     def _live_venue_checks(self) -> List[Check]:
+        from . import safe_mode
         checks: List[Check] = []
-        # Credentials authenticate
+
+        # Safe-mode gate (PR #11 defense-in-depth): env LIVE_TRADING_ENABLED +
+        # LIVE_TRADING_ACK + no HALT file, on top of MODE=live.
+        gate_open = safe_mode.is_live_enabled()
+        gate_detail = "open" if gate_open else (
+            f"need {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', "
+            f"no HALT file"
+        )
+        checks.append(Check("safe_mode_gate", gate_open, gate_detail))
+
+        # Credentials authenticate; futures equity for affordability
         usdt_balance = 0.0
         try:
-            balances = self.execution_engine.get_balances()
-            usdt_balance = float(balances.get("USDT", 0.0))
-            checks.append(Check("coindcx_auth", True, f"USDT={usdt_balance}"))
+            usdt_balance = float(self.execution_engine.sync_balance())
+            checks.append(Check("coindcx_auth", True, f"equity USDT={usdt_balance}"))
         except Exception as e:
             checks.append(Check("coindcx_auth", False, str(e)))
 
