@@ -45,6 +45,8 @@ class Config:
     MAX_DAILY_DRAWDOWN = 0.05      # 5% kill switch
     MAX_CORRELATED_POS = 2         # Max 2 same-direction in correlated group
     MAX_MARGIN_RATIO = 0.30        # 30% max margin allocation per position
+    SL_PCT = 0.015                 # 1.5% stop loss
+    TP_PCT = 0.035                 # 3.5% take profit
 
     # Strategy Parameters
     BB_PERIOD = 20
@@ -188,8 +190,8 @@ class MeanReversionEngine:
             if row['low'] <= row['lower_band'] and row['rsi'] < self.cfg.RSI_OVERSOLD:
                 if prev['close'] > prev['lower_band']:
                     entry = row['close']
-                    sl = entry * 0.985
-                    tp = entry * 1.035
+                    sl = entry * (1.0 - self.cfg.SL_PCT)
+                    tp = entry * (1.0 + self.cfg.TP_PCT)
                     signals.append(Signal(
                         symbol=symbol, direction=Direction.LONG,
                         entry_price=round(entry, 2), stop_loss=round(sl, 2),
@@ -202,8 +204,8 @@ class MeanReversionEngine:
             elif row['high'] >= row['upper_band'] and row['rsi'] > self.cfg.RSI_OVERBOUGHT:
                 if prev['close'] < prev['upper_band']:
                     entry = row['close']
-                    sl = entry * 1.015
-                    tp = entry * 0.965
+                    sl = entry * (1.0 + self.cfg.SL_PCT)
+                    tp = entry * (1.0 - self.cfg.TP_PCT)
                     signals.append(Signal(
                         symbol=symbol, direction=Direction.SHORT,
                         entry_price=round(entry, 2), stop_loss=round(sl, 2),
