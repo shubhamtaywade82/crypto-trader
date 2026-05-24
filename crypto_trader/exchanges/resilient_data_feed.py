@@ -7,8 +7,11 @@ transparently falls back to CoinDCX for klines, mark price, and funding when
 Binance is unavailable (e.g. HTTP 451 geo-block) — so the live signal tick keeps
 working on a region-restricted VPS.
 
-CoinDCX candles: GET https://public.coindcx.com/market_data/candles?pair=&interval=&limit=
-  -> [{"open","high","low","close","volume","time"(ms)}, ...]
+CoinDCX live candles (futures): the TradingView-style candlesticks endpoint
+  GET https://public.coindcx.com/market_data/candlesticks
+      ?pair=B-SOL_USDT&from=<sec>&to=<sec>&resolution=<minutes>&pcode=f
+  -> {"s":"ok","data":[{"open","high","low","close","volume","time"(ms)}, ...]}
+(The older /market_data/candles endpoint serves frozen history and is unused.)
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ from .instrument_mapper import internal_to_coindcx
 
 logger = logging.getLogger("crypto_trader.exchanges.resilient_data_feed")
 
-_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
+_CANDLES_URL = "https://public.coindcx.com/market_data/candlesticks"
 
 # Binance kline DataFrame schema produced by BinanceDataFeed.get_klines
 _KLINE_COLUMNS = [
@@ -37,6 +40,12 @@ _INTERVAL_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
     "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
     "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
+}
+# Binance interval -> CoinDCX candlesticks resolution (minutes; "1D" for daily)
+_RESOLUTION = {
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240", "6h": "360",
+    "8h": "480", "12h": "720", "1d": "1D",
 }
 
 
@@ -61,18 +70,29 @@ class CoinDCXDataFeed:
 
     def get_klines(self, symbol: str, interval: str, limit: int = 150, **_) -> pd.DataFrame:
         pair = internal_to_coindcx(symbol)
+        resolution = _RESOLUTION.get(interval)
+        if resolution is None:
+            raise ValueError(f"Unsupported interval for CoinDCX: {interval}")
+        dur_ms = _INTERVAL_MS.get(interval, 0)
+
+        now_s = int(time.time())
+        # Pull a generous window (2x) so we reliably get >= `limit` candles.
+        span_s = max(1, (dur_ms // 1000)) * limit * 2
         resp = self.session.get(
             _CANDLES_URL,
-            params={"pair": pair, "interval": interval, "limit": limit},
+            params={
+                "pair": pair, "from": now_s - span_s, "to": now_s,
+                "resolution": resolution, "pcode": "f",
+            },
             timeout=self.timeout,
         )
         resp.raise_for_status()
-        rows = resp.json()
-        if not isinstance(rows, list) or not rows:
-            raise ValueError(f"No CoinDCX candles for {pair} {interval}")
+        payload = resp.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not rows:
+            raise ValueError(f"No CoinDCX candles for {pair} {interval}: {str(payload)[:120]}")
 
         # Freshness guard: refuse stale candle history.
-        dur_ms = _INTERVAL_MS.get(interval, 0)
         latest_ms = max(int(r["time"]) for r in rows)
         age_ms = int(time.time() * 1000) - latest_ms
         if dur_ms and age_ms > self.max_staleness_intervals * dur_ms:
@@ -81,7 +101,7 @@ class CoinDCXDataFeed:
                 f"(latest {pd.to_datetime(latest_ms, unit='ms', utc=True)})"
             )
 
-        rows = sorted(rows, key=lambda r: r["time"])  # ascending, like Binance
+        rows = sorted(rows, key=lambda r: r["time"])[-limit:]  # ascending, last `limit`
         dur = dur_ms
         df = pd.DataFrame({
             "open_time": [int(r["time"]) for r in rows],

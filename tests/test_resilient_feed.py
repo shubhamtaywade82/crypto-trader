@@ -72,8 +72,8 @@ def test_coindcx_klines_stale_guard(monkeypatch):
         def json(self):
             # a single 4h candle ~100 days old -> must be rejected
             old_ms = int(time.time() * 1000) - 100 * 86_400_000
-            return [{"open": 1, "high": 2, "low": 0.5, "close": 1.5,
-                     "volume": 10, "time": old_ms}]
+            return {"s": "ok", "data": [{"open": 1, "high": 2, "low": 0.5, "close": 1.5,
+                                         "volume": 10, "time": old_ms}]}
 
     monkeypatch.setattr(feed.session, "get", lambda *a, **k: _Resp())
     with pytest.raises(StaleCandlesError):
@@ -89,10 +89,10 @@ def test_coindcx_klines_fresh_builds_binance_schema(monkeypatch):
 
         def json(self):
             now = int(time.time() * 1000)
-            return [
+            return {"s": "ok", "data": [
                 {"open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10, "time": now - 3_600_000},
                 {"open": 1.5, "high": 2.2, "low": 1.0, "close": 2.0, "volume": 12, "time": now},
-            ]
+            ]}
 
     monkeypatch.setattr(feed.session, "get", lambda *a, **k: _Resp())
     df = feed.get_klines("SOLUSDT", "1h", limit=10)
