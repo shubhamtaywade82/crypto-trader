@@ -6,6 +6,10 @@ set -e
 # Ensure we run from the project root directory
 cd "$(dirname "$0")/.."
 
+# Automatically ensure the PostgreSQL database is up and healthy
+echo "Starting and waiting for PostgreSQL database..."
+docker compose up --wait postgres
+
 # Start the multi-symbol trading engine, forwarding any command-line arguments
 # If no arguments are passed, it automatically loads the watchlist from watchlist.yaml, .env, etc.
 exec python3 -m crypto_trader.multi_engine "$@"
