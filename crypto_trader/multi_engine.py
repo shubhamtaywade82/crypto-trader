@@ -44,7 +44,7 @@ from pathlib import Path
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
-    parser.add_argument("--leverage", type=int, default=10, help="Leverage multiplier")
+    parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier")
     parser.add_argument("--testnet", action="store_true", help="Use Binance Testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM advisor")
     parser.add_argument("--llm-host", type=str, default=None, help="Ollama host URL")

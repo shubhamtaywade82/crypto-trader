@@ -26,7 +26,7 @@ from .data_feed import BinanceDataFeed
 from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
-from .playbooks import PlaybookA, PlaybookB
+from .playbooks import PlaybookA, PlaybookB, PlaybookAres
 from .regime import MarketRegimeAnalyzer, compute_ema
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD
 from .journal import TradeJournal
@@ -35,7 +35,7 @@ from .structure import MarketStructureAnalyzer
 logger = logging.getLogger("crypto_trader.engine_ws")
 
 DEFAULT_SYMBOL = "SOLUSDT"
-LEVERAGE = 10
+LEVERAGE = 5
 FUNDING_EXTREME = 0.0005
 
 
@@ -112,6 +112,7 @@ class WebSocketTradingEngine:
         self.regime_analyzer = MarketRegimeAnalyzer()
         self.playbook_a = PlaybookA()
         self.playbook_b = PlaybookB()
+        self.playbook_ares = PlaybookAres()
 
         # Journal
         self.journal = TradeJournal()
@@ -162,8 +163,14 @@ class WebSocketTradingEngine:
 
         # Command Listeners
         if self.event_bus:
-            from .events import CommandEvent
+            from .events import CommandEvent, TradeClosedEvent
             self.event_bus.subscribe(CommandEvent, self._handle_command)
+            self.event_bus.subscribe(TradeClosedEvent, self._on_trade_closed)
+
+    def _on_trade_closed(self, event):
+        """Update risk manager when a trade is closed."""
+        if event.symbol == self.symbol:
+            self.risk_manager.record_close(event.realized_pnl)
 
     def _handle_command(self, event):
         """Handle incoming commands from EventBus (e.g., Telegram)."""
@@ -303,7 +310,12 @@ class WebSocketTradingEngine:
 
         # 4. Risk check
         self.risk_manager.update_peak_balance(self.wallet.margin_balance)
-        can_trade, risk_reason = self.risk_manager.can_trade(current_balance=self.wallet.margin_balance)
+        # Assuming initial balance for daily drawdown is the wallet balance minus daily PnL
+        initial_daily_balance = float(self.wallet.wallet_balance) - self.risk_manager.daily_pnl
+        can_trade, risk_reason = self.risk_manager.can_trade(
+            current_balance=self.wallet.margin_balance,
+            initial_daily_balance=initial_daily_balance
+        )
         if not can_trade:
             if not getattr(self, "_halt_published", False):
                 if self.event_bus:
@@ -340,29 +352,44 @@ class WebSocketTradingEngine:
 
         # 5. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:
-            self._evaluate_entry(df_1h, df_4h, regime, regime_score, mark_price,
-                                funding_rate, oi_delta, taker_ratio, structure=structure)
+            # Get latest ADX for Ares playbook filter
+            latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
+            self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                                funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
 
         # 6. Print summary
         self.wallet.print_summary()
 
-    def _evaluate_entry(self, df_1h, df_4h, regime, regime_score, mark_price,
-                        funding_rate, oi_delta, taker_ratio, structure=None):
+    def _evaluate_entry(self, df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                        funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None):
         """Evaluate entry signals and execute via WebSocket LTP."""
         setup = None
 
-        # Try Playbook A
-        setup = self.playbook_a.evaluate(df_1h, regime, structure=structure)
+        # 1. Try Playbook Ares (Mean Reversion)
+        setup = self.playbook_ares.evaluate(df_15m, adx_1h=adx_1h)
         if setup:
-            logger.info(f"[PLAYBOOK A] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+            logger.info(f"[PLAYBOOK ARES] Signal: {setup['side'].value} | score={setup['score']:.2f}")
 
-        # Try Playbook B
+        # 2. Try Playbook A
+        if not setup:
+            setup = self.playbook_a.evaluate(df_1h, regime, structure=structure)
+            if setup:
+                logger.info(f"[PLAYBOOK A] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+
+        # 3. Try Playbook B
         if not setup:
             setup = self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure)
             if setup:
                 logger.info(f"[PLAYBOOK B] Signal: {setup['side'].value} | score={setup['score']:.2f}")
 
         if not setup:
+            return
+
+        # Correlation check
+        active_positions = {s: p.to_dict() for s, p in self.wallet.positions.items() if p.status == "OPEN"}
+        allowed, corr_reason = self.risk_manager.check_correlation(self.symbol, setup["side"].value, active_positions)
+        if not allowed:
+            logger.info(f"[BLOCKED] {corr_reason}")
             return
 
         # LLM Fusion
@@ -492,9 +519,9 @@ class WebSocketTradingEngine:
                 else:
                     tp_level["price"] = entry_price * (1 - 0.010 if tp_level["label"] == "TP1" else 0.020)
 
-        # Risk-based sizing from stop distance.
+        # Risk-based sizing from stop distance (2% risk per trade)
         stop_distance = abs(entry_price - setup["sl_price"])
-        risk_budget = self.wallet.margin_balance * Decimal("0.01")
+        risk_budget = self.wallet.margin_balance * Decimal("0.02")
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
         risk_budget *= Decimal(str(size_multiplier))
         stop_distance_dec = Decimal(str(stop_distance))
