@@ -70,6 +70,38 @@ class Config:
         ['DOGE/USDT:USDT', 'SHIB/USDT:USDT'],
     ]
 
+    # Symbol-specific parameter maps
+    SYMBOL_PARAMS = {
+        'BTC/USDT:USDT': {
+            'BB_PERIOD': 15,
+            'BB_STD': 2.5,
+            'ADX_TREND_THRESHOLD': 20,
+            'SL_PCT': 0.015,
+            'TP_PCT': 0.035
+        },
+        'ETH/USDT:USDT': {
+            'BB_PERIOD': 20,
+            'BB_STD': 1.5,
+            'ADX_TREND_THRESHOLD': 30,
+            'SL_PCT': 0.015,
+            'TP_PCT': 0.035
+        },
+        'SOL/USDT:USDT': {
+            'BB_PERIOD': 25,
+            'BB_STD': 1.5,
+            'ADX_TREND_THRESHOLD': 25,
+            'SL_PCT': 0.015,
+            'TP_PCT': 0.035
+        },
+        'XRP/USDT:USDT': {
+            'BB_PERIOD': 25,
+            'BB_STD': 2.0,
+            'ADX_TREND_THRESHOLD': 20,
+            'SL_PCT': 0.015,
+            'TP_PCT': 0.035
+        }
+    }
+
 # ============================================================
 # ENUMS & DATA CLASSES
 # ============================================================
@@ -163,55 +195,90 @@ class MeanReversionEngine:
         self.cfg = config
         self.indicators = Indicators()
 
-    def calculate(self, df: pd.DataFrame) -> pd.DataFrame:
+    def get_symbol_config(self, symbol: str):
+        cfg = self.cfg
+        if hasattr(cfg, 'SYMBOL_PARAMS') and symbol in cfg.SYMBOL_PARAMS:
+            params = cfg.SYMBOL_PARAMS[symbol]
+            class SymbolConfig:
+                def __init__(self, base_cfg, sym_params):
+                    for attr in dir(base_cfg):
+                        if not attr.startswith('__') and not callable(getattr(base_cfg, attr)):
+                            setattr(self, attr, getattr(base_cfg, attr))
+                    for k, v in sym_params.items():
+                        setattr(self, k, v)
+            return SymbolConfig(cfg, params)
+        return cfg
+
+    def calculate(self, df: pd.DataFrame, symbol: str = None) -> pd.DataFrame:
         df = df.copy()
+        cfg = self.get_symbol_config(symbol) if symbol else self.cfg
         df['sma'], df['upper_band'], df['lower_band'] = self.indicators.bollinger_bands(
-            df['close'], self.cfg.BB_PERIOD, self.cfg.BB_STD
+            df['close'], cfg.BB_PERIOD, cfg.BB_STD
         )
-        df['rsi'] = self.indicators.rsi(df['close'], self.cfg.RSI_PERIOD)
-        df['adx'] = self.indicators.adx(df['high'], df['low'], df['close'], self.cfg.ADX_PERIOD)
+        df['rsi'] = self.indicators.rsi(df['close'], cfg.RSI_PERIOD)
+        df['adx'] = self.indicators.adx(df['high'], df['low'], df['close'], cfg.ADX_PERIOD)
         return df
 
     def generate_signals(self, df: pd.DataFrame, symbol: str) -> List[Signal]:
         signals = []
-        if len(df) < self.cfg.BB_PERIOD + 5:
+        cfg = self.get_symbol_config(symbol)
+        if len(df) < cfg.BB_PERIOD + 5:
             return signals
 
-        for i in range(self.cfg.BB_PERIOD + 1, len(df)):
-            row = df.iloc[i]
-            prev = df.iloc[i-1]
+        # Speed up by using numpy arrays to bypass slow pandas series indexing
+        closes = df['close'].values
+        lows = df['low'].values
+        highs = df['high'].values
+        lower_bands = df['lower_band'].values
+        upper_bands = df['upper_band'].values
+        rsis = df['rsi'].values
+        adxs = df['adx'].values
+        timestamps = df.index
 
-            if row['adx'] > self.cfg.ADX_TREND_THRESHOLD:
+        for i in range(cfg.BB_PERIOD + 1, len(df)):
+            adx_val = adxs[i]
+            if adx_val > cfg.ADX_TREND_THRESHOLD:
                 continue
 
-            regime = "ranging" if row['adx'] < 20 else "neutral"
+            regime = "ranging" if adx_val < 20 else "neutral"
+
+            prev_close = closes[i-1]
+            prev_lower = lower_bands[i-1]
+            prev_upper = upper_bands[i-1]
+            
+            close_val = closes[i]
+            low_val = lows[i]
+            high_val = highs[i]
+            lower_band = lower_bands[i]
+            upper_band = upper_bands[i]
+            rsi_val = rsis[i]
 
             # LONG: Price touches lower band + RSI oversold
-            if row['low'] <= row['lower_band'] and row['rsi'] < self.cfg.RSI_OVERSOLD:
-                if prev['close'] > prev['lower_band']:
-                    entry = row['close']
-                    sl = entry * (1.0 - self.cfg.SL_PCT)
-                    tp = entry * (1.0 + self.cfg.TP_PCT)
+            if low_val <= lower_band and rsi_val < cfg.RSI_OVERSOLD:
+                if prev_close > prev_lower:
+                    entry = close_val
+                    sl = entry * (1.0 - cfg.SL_PCT)
+                    tp = entry * (1.0 + cfg.TP_PCT)
                     signals.append(Signal(
                         symbol=symbol, direction=Direction.LONG,
                         entry_price=round(entry, 2), stop_loss=round(sl, 2),
                         take_profit=round(tp, 2),
-                        confidence=(self.cfg.RSI_OVERSOLD - row['rsi']) / self.cfg.RSI_OVERSOLD,
-                        timestamp=row.name, regime=regime
+                        confidence=(cfg.RSI_OVERSOLD - rsi_val) / cfg.RSI_OVERSOLD,
+                        timestamp=timestamps[i], regime=regime
                     ))
 
             # SHORT: Price touches upper band + RSI overbought
-            elif row['high'] >= row['upper_band'] and row['rsi'] > self.cfg.RSI_OVERBOUGHT:
-                if prev['close'] < prev['upper_band']:
-                    entry = row['close']
-                    sl = entry * (1.0 + self.cfg.SL_PCT)
-                    tp = entry * (1.0 - self.cfg.TP_PCT)
+            elif high_val >= upper_band and rsi_val > cfg.RSI_OVERBOUGHT:
+                if prev_close < prev_upper:
+                    entry = close_val
+                    sl = entry * (1.0 + cfg.SL_PCT)
+                    tp = entry * (1.0 - cfg.TP_PCT)
                     signals.append(Signal(
                         symbol=symbol, direction=Direction.SHORT,
                         entry_price=round(entry, 2), stop_loss=round(sl, 2),
                         take_profit=round(tp, 2),
-                        confidence=(row['rsi'] - self.cfg.RSI_OVERBOUGHT) / (100 - self.cfg.RSI_OVERBOUGHT),
-                        timestamp=row.name, regime=regime
+                        confidence=(rsi_val - cfg.RSI_OVERBOUGHT) / (100 - cfg.RSI_OVERBOUGHT),
+                        timestamp=timestamps[i], regime=regime
                     ))
 
         return signals
@@ -317,7 +384,7 @@ class Backtester:
 
     def run_with_data(self, df: pd.DataFrame, symbol: str) -> BacktestResult:
         self.risk = RiskManager(self.cfg)
-        df = self.engine.calculate(df)
+        df = self.engine.calculate(df, symbol)
         signals = self.engine.generate_signals(df, symbol)
 
         trades = []
@@ -567,7 +634,7 @@ class ExecutionManager:
                 df.set_index('timestamp', inplace=True)
                 
                 # Calculate indicators & look for entry signals (exclude current forming candle)
-                df = self.engine.calculate(df)
+                df = self.engine.calculate(df, symbol)
                 signals = self.engine.generate_signals(df.iloc[:-1], symbol)
                 
                 if signals:
