@@ -77,8 +77,10 @@ def main():
         symbol="GLOBAL", 
         initial_balance=total_balance, 
         leverage=args.leverage,
-        execution_engine=execution_engine
     )
+    if execution_engine is not None:
+        global_wallet.attach_execution_engine(execution_engine, live=True)
+
     
     # Initialize Telegram Service if token is available
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")

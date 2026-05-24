@@ -98,7 +98,7 @@ class TradingEngine:
                 resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
                 logger.info(f"[LLM] Mode: CLOUD (Target: {resolved_host})")
             else:
-                resolved_host = llm_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+                resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
                 resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
                 resolved_key = os.getenv("OLLAMA_API_KEY", "")
                 logger.info("[LLM] Mode: LOCAL")
@@ -194,7 +194,16 @@ class TradingEngine:
         candle_close_time = int(df_1h["close_time"].iloc[-1].timestamp() * 1000)
 
         # 7. Update positions (using candle time, not wall clock)
-        self.wallet.update_positions(self.symbol, mark_price, candle_close_time, ema9_1h)
+        advice = self.advisor.get_last_advice() if (self.use_llm and self.advisor) else None
+        current_llm_advice = advice.to_dict() if advice else None
+        self.wallet.update_positions(
+            self.symbol,
+            mark_price,
+            candle_close_time,
+            ema9_1h,
+            current_llm_advice=current_llm_advice,
+            current_regime=regime.value if regime else None,
+        )
 
         # 8. Evaluate entry
         if not self.wallet.get_open_position(self.symbol) and can_trade:

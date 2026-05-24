@@ -195,9 +195,9 @@ class PortfolioReducer:
             symbol = payload.get("symbol")
             pnl_str = payload.get("pnl", payload.get("remaining_pnl", "0"))
             pnl = Decimal(str(pnl_str))
-            # Fee is ignored here as it's handled by ORDER_FILLED to prevent double-charging
-            state.wallet_balance += pnl
-            state.realized_pnl_total += pnl
+            fee = Decimal(str(payload.get("fee", "0")))
+            state.wallet_balance += (pnl - fee)
+            state.realized_pnl_total += (pnl - fee)
             if symbol in state.open_positions:
                 qty_closed = Decimal(str(payload.get("closed_qty", "0")))
                 state.open_positions[symbol]["quantity"] = max(
@@ -227,9 +227,9 @@ class PortfolioReducer:
         if et in ("POSITION_CLOSED", "LIQUIDATION"):
             symbol = payload.get("symbol")
             pnl = Decimal(str(payload.get("remaining_pnl", "0")))
-            # Fee is ignored here as it's handled by ORDER_FILLED to prevent double-charging
-            state.wallet_balance += pnl
-            state.realized_pnl_total += pnl
+            fee = Decimal(str(payload.get("fee", "0")))
+            state.wallet_balance += (pnl - fee)
+            state.realized_pnl_total += (pnl - fee)
             if symbol in state.open_positions:
                 del state.open_positions[symbol]
             return
@@ -276,6 +276,12 @@ class EnhancedPosition:
     close_time: Optional[int] = None
     close_price: Optional[Decimal] = None
     close_reason: Optional[str] = None
+    highest_price: Optional[Decimal] = None
+    peak_pnl_pct: Decimal = Decimal("0")
+
+    def __post_init__(self):
+        if self.highest_price is None:
+            self.highest_price = self.entry_price
 
     def update_pnl(self, mark_price: Decimal):
         if self.status != "OPEN" or mark_price <= Decimal("0"):
@@ -287,8 +293,19 @@ class EnhancedPosition:
 
         if self.side == PositionSide.LONG:
             self.unrealized_pnl = (mark_price - self.entry_price) * self.remaining_quantity
+            if self.highest_price is None or mark_price > self.highest_price:
+                self.highest_price = mark_price
         else:
             self.unrealized_pnl = (self.entry_price - mark_price) * self.remaining_quantity
+            if self.highest_price is None or mark_price < self.highest_price:
+                self.highest_price = mark_price
+
+        # Update peak PnL as percentage of entry price (undiluted price change)
+        if self.entry_price > Decimal("0") and self.remaining_quantity > Decimal("0"):
+            current_pnl_pct = self.unrealized_pnl / (self.entry_price * self.remaining_quantity)
+            if current_pnl_pct > self.peak_pnl_pct:
+                self.peak_pnl_pct = current_pnl_pct
+
 
     @property
     def total_realized_pnl(self) -> float:
@@ -323,13 +340,15 @@ class EnhancedPosition:
             "close_time": self.close_time,
             "close_price": self.close_price,
             "close_reason": self.close_reason,
+            "highest_price": self.highest_price,
+            "peak_pnl_pct": self.peak_pnl_pct,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "EnhancedPosition":
         data["side"] = PositionSide(data["side"])
         data["playbook"] = Playbook(data["playbook"])
-        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price"]:
+        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct"]:
             if k in data and data[k] is not None:
                 data[k] = Decimal(str(data[k]))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
@@ -369,7 +388,6 @@ class EnhancedFuturesWallet:
         halt_on_critical: bool = False,
         halt_on_fatal: bool = True,
         max_snapshots: int = 10,
-        execution_engine: Optional["ExecutionEngine"] = None,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -385,6 +403,10 @@ class EnhancedFuturesWallet:
         self.event_hook = event_hook
         self.halted = False
         self.max_snapshots = max_snapshots
+
+        # Live execution wiring (paper mode leaves these untouched)
+        self.execution_engine = None
+        self.live_execution = False
 
         # Fast bootstrap metrics
         self.replay_duration_ms: float = 0.0
@@ -408,7 +430,6 @@ class EnhancedFuturesWallet:
         self.fills: List[Fill] = []
         self.reducer = PortfolioReducer()
         self.lock = threading.RLock()
-        self.execution_engine = execution_engine
         self._init_db()
 
         self._load_state()
@@ -441,12 +462,6 @@ class EnhancedFuturesWallet:
                 {"initial_balance": str(self.wallet_balance)}
             )
 
-        if self.execution_engine:
-            try:
-                self.sync_with_exchange()
-            except Exception as e:
-                logger.error(f"Failed to sync with exchange on wallet initialization: {e}")
-
     @property
     def margin_balance(self) -> float:
         with self.lock:
@@ -475,6 +490,59 @@ class EnhancedFuturesWallet:
                 return False, "No available balance"
             return True, "OK"
 
+    def attach_execution_engine(self, engine, live: bool = True):
+        """Wire a live execution venue. When ``live`` is True, the orchestrator
+        is expected to pass venue fills into open/close via ``external_fill``."""
+        self.execution_engine = engine
+        self.live_execution = bool(live)
+        logger.info("Execution engine attached (live=%s)", self.live_execution)
+
+    def apply_external_fill(
+        self,
+        symbol: str,
+        side: "PositionSide",
+        fill_price,
+        fill_quantity,
+        order_id: str = "",
+        client_order_id: str = "",
+        reduce_only: bool = False,
+        setup: Optional[dict] = None,
+    ):
+        """Book a venue-reported fill into the event log (live mode).
+
+        Entries (``reduce_only=False``) require ``setup`` (sl/tp/playbook); exits
+        close the existing position at the venue price. This is the bridge the
+        order manager / reconciler use to record real fills without invoking the
+        synchronous paper simulation.
+        """
+        external = {"price": self._to_decimal(fill_price), "fee": self._to_decimal(0), "order_id": order_id}
+        if reduce_only:
+            return self.close_position(symbol, float(fill_price), reason="VENUE_EXIT", external_fill=external)
+        if setup is None:
+            raise ValueError("apply_external_fill entry requires a setup dict")
+        return self.open_position(
+            symbol, setup, float(fill_price),
+            custom_quantity=float(fill_quantity),
+            external_fill=external,
+        )
+
+    def _venue_fill(self, symbol: str, order_side: "PositionSide", quantity: Decimal, reduce_only: bool, intent: str) -> dict:
+        """Place a market order on the live venue and return the realized fill.
+
+        Used by open/close/partial when ``live_execution`` is on and the caller
+        did not supply an ``external_fill`` — turning the wallet into the single
+        live order-submission site without changing the orchestrator.
+        """
+        from .execution.client_order_id import make_client_order_id  # lazy: avoid import cycle
+        coid = make_client_order_id(symbol, intent, nonce=str(self._now_ms()))
+        order = self.execution_engine.place_order(
+            symbol, order_side, quantity, OrderType.MARKET,
+            reduce_only=reduce_only, client_order_id=coid,
+        )
+        price = order.avg_fill_price if order.avg_fill_price and order.avg_fill_price > 0 else Decimal("0")
+        fee = self._calculate_fee(price * quantity, is_taker=True)
+        return {"price": price, "fee": fee, "order_id": order.id, "client_order_id": coid}
+
     def open_position(
         self,
         symbol: str,
@@ -482,8 +550,15 @@ class EnhancedFuturesWallet:
         mark_price: float,
         custom_margin: Optional[float] = None,
         custom_quantity: Optional[float] = None,
+        external_fill: Optional[dict] = None,
     ) -> Optional[EnhancedPosition]:
-        """Open a position. custom_margin overrides equity_utilization for LLM-adjusted sizing."""
+        """Open a position. custom_margin overrides equity_utilization for LLM-adjusted sizing.
+
+        ``external_fill`` (live mode) injects a venue-reported fill
+        ``{"price", "fee", "order_id"}`` so the position is booked at the real
+        CoinDCX fill instead of the simulated price. When ``None`` (paper mode)
+        the original synchronous simulation path runs unchanged.
+        """
         with self.lock:
             can, reason = self.can_open(symbol)
             if not can:
@@ -515,19 +590,15 @@ class EnhancedFuturesWallet:
             if not tp_levels and "tp_price" in setup:
                 tp_levels = [{"price": self._to_decimal(setup["tp_price"]), "pct": 1.0, "hit": False, "label": "TP"}]
 
-            if self.execution_engine:
-                # Live Execution
-                order = self._create_order_with_type(
-                    symbol=symbol,
-                    side=side,
-                    quantity=qty,
-                    order_type=OrderType.MARKET,
-                )
-                execution_price = order.avg_fill_price
-                fee_open = self._calculate_fee(execution_price * qty)
+            if external_fill is None and self.live_execution and self.execution_engine is not None:
+                external_fill = self._venue_fill(symbol, side, qty, reduce_only=False, intent="entry")
+
+            order = self._create_order(symbol=symbol, side=side, quantity=qty)
+            if external_fill is not None:
+                execution_price = self._to_decimal(external_fill["price"])
+                fee_open = self._to_decimal(external_fill.get("fee", 0))
+                self._record_fill(order, qty, execution_price, fee_open, sequence=1)
             else:
-                # Paper Mode
-                order = self._create_order(symbol=symbol, side=side, quantity=qty)
                 execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
                 fill_chunks = int(setup.get("fill_chunks", 1))
                 fee_open = self._execute_order_in_chunks(
@@ -554,12 +625,13 @@ class EnhancedFuturesWallet:
                 time_stop_hours=setup.get("time_stop_hours", 18),
             )
             pos.update_pnl(mark_price)
+            self._emit_event("FEE_CHARGED", {"amount": fee_open, "reason": "OPEN_FEE", "symbol": symbol})
             self.positions[symbol] = pos
             self._sync_unrealized_total()
 
             logger.info(
                 f"[POSITION OPENED] {symbol} {side.value} | Playbook={playbook.value} | "
-                f"Qty={qty:.4f} @ {execution_price:.2f} | Margin={margin:.2f} | "
+                f"Qty={qty:.4f} @ {entry:.2f} | Margin={margin:.2f} | "
                 f"SL={sl_price:.2f} | TP={tp_levels}"
             )
             self._emit_event(
@@ -567,6 +639,7 @@ class EnhancedFuturesWallet:
                 {
                     "symbol": symbol,
                     "side": side.value,
+                    "entry_price": entry,
                     "quantity": qty,
                     "margin": margin,
                     "execution_price": execution_price,
@@ -581,8 +654,11 @@ class EnhancedFuturesWallet:
             self._save_state()
             return pos
 
-    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str, tp_label: Optional[str] = None) -> Decimal:
-        """Close a percentage of the position. Returns realized PnL from this slice."""
+    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str, tp_label: Optional[str] = None, external_fill: Optional[dict] = None) -> Decimal:
+        """Close a percentage of the position. Returns realized PnL from this slice.
+
+        ``external_fill`` (live mode) supplies the venue exit price via ``{"price": ...}``.
+        """
         with self.lock:
             mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
@@ -590,39 +666,23 @@ class EnhancedFuturesWallet:
                 return Decimal("0")
 
             qty_to_close = pos.remaining_quantity * self._to_decimal(pct)
+            if external_fill is None and self.live_execution and self.execution_engine is not None and qty_to_close > Decimal("0"):
+                exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+                external_fill = self._venue_fill(symbol, exit_side, qty_to_close, reduce_only=True, intent="exit-partial")
+
+            if external_fill is not None:
+                execution_price = self._to_decimal(external_fill["price"])
+            else:
+                execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
             if qty_to_close <= Decimal("0"):
                 return Decimal("0")
-
-            close_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
-
-            if self.execution_engine:
-                # Live Execution
-                order = self._create_order_with_type(
-                    symbol=symbol,
-                    side=close_side,
-                    quantity=qty_to_close,
-                    order_type=OrderType.MARKET,
-                    reduce_only=True,
-                )
-                execution_price = order.avg_fill_price
-                fee_close = self._calculate_fee(execution_price * qty_to_close)
-            else:
-                # Paper Mode
-                order = self._create_order_with_type(
-                    symbol=symbol,
-                    side=close_side,
-                    quantity=qty_to_close,
-                    order_type=OrderType.MARKET,
-                    reduce_only=True,
-                )
-                execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
-                fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
-                self._record_fill(order, qty_to_close, execution_price, fee_close)
 
             if pos.side == PositionSide.LONG:
                 pnl_slice = (execution_price - pos.entry_price) * qty_to_close
             else:
                 pnl_slice = (pos.entry_price - execution_price) * qty_to_close
+
+            fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
 
             # Credit the slice immediately (net fees)
             self._emit_event(
@@ -646,47 +706,34 @@ class EnhancedFuturesWallet:
             )
 
             if pos.remaining_quantity <= Decimal("0.0001"):
-                return self.close_position(symbol, float(execution_price), reason="FULL_VIA_PARTIALS")
+                return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
 
             self._save_state()
             return pnl_slice
 
-    def close_position(self, symbol: str, mark_price: float, reason: str) -> Optional[EnhancedPosition]:
-        """Close full position. Only credits remaining unrealized (partials already credited)."""
+    def close_position(self, symbol: str, mark_price: float, reason: str, external_fill: Optional[dict] = None) -> Optional[EnhancedPosition]:
+        """Close full position. Only credits remaining unrealized (partials already credited).
+
+        ``external_fill`` (live mode) supplies the venue exit price via
+        ``{"price": ...}``; when ``None`` the simulated exit price is used.
+        """
         with self.lock:
             mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
                 return None
 
-            close_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+            if external_fill is None and self.live_execution and self.execution_engine is not None:
+                exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+                external_fill = self._venue_fill(symbol, exit_side, pos.remaining_quantity, reduce_only=True, intent="exit")
 
-            if self.execution_engine:
-                # Live Execution
-                order = self._create_order_with_type(
-                    symbol=symbol,
-                    side=close_side,
-                    quantity=pos.remaining_quantity,
-                    order_type=OrderType.MARKET,
-                    reduce_only=True,
-                )
-                execution_price = order.avg_fill_price
-                fee_close = self._calculate_fee(execution_price * pos.remaining_quantity)
+            if external_fill is not None:
+                execution_price = self._to_decimal(external_fill["price"])
             else:
-                # Paper Mode
-                order = self._create_order_with_type(
-                    symbol=symbol,
-                    side=close_side,
-                    quantity=pos.remaining_quantity,
-                    order_type=OrderType.MARKET,
-                    reduce_only=True,
-                )
                 execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
-                fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
-                self._record_fill(order, pos.remaining_quantity, execution_price, fee_close)
-
             pos.update_pnl(execution_price)
             remaining_pnl = pos.unrealized_pnl  # Only the still-open portion
+            fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
 
             # Credit remaining PnL
             self._emit_event(
@@ -715,64 +762,6 @@ class EnhancedFuturesWallet:
             )
             self._save_state()
             return pos
-
-    def sync_with_exchange(self):
-        if not self.execution_engine:
-            return
-        with self.lock:
-            try:
-                # 1. Sync balance
-                real_balance = self.execution_engine.sync_balance()
-                if real_balance > Decimal("0"):
-                    if abs(self.wallet_balance - real_balance) > Decimal("0.01"):
-                        logger.info(f"[EXCHANGE SYNC] Updating wallet balance: local={self.wallet_balance:.2f} -> exchange={real_balance:.2f}")
-                    self.wallet_balance = real_balance
-                    self._runtime_reducer_state.wallet_balance = real_balance
-                    
-                # 2. Sync positions
-                real_positions = self.execution_engine.sync_positions()
-                
-                # Reconcile local positions
-                for symbol, pos in list(self.positions.items()):
-                    if pos.status == "OPEN":
-                        if symbol not in real_positions:
-                            logger.warning(f"[EXCHANGE SYNC] Position for {symbol} not found on exchange! Closing locally as GHOST_POSITION.")
-                            self.close_position(symbol, float(pos.entry_price), "GHOST_POSITION_CLOSED")
-                        else:
-                            exch_pos = real_positions[symbol]
-                            qty_diff = abs(pos.remaining_quantity - Decimal(str(exch_pos["quantity"])))
-                            if qty_diff > Decimal("0.0001"):
-                                logger.warning(f"[EXCHANGE SYNC] Quantity mismatch for {symbol}: local={pos.remaining_quantity:.4f} vs exchange={exch_pos['quantity']:.4f}. Syncing size.")
-                                pos.remaining_quantity = Decimal(str(exch_pos["quantity"]))
-                                pos.notional = pos.remaining_quantity * pos.entry_price
-                                pos.margin_used = pos.notional / pos.leverage
-                                self._runtime_reducer_state.open_positions[symbol]["quantity"] = pos.remaining_quantity
-                            
-                            if pos.side.value != exch_pos["side"]:
-                                logger.error(f"[EXCHANGE SYNC] CRITICAL side mismatch for {symbol}: local={pos.side.value} vs exchange={exch_pos['side']}! Halting trading.")
-                                self.close_position(symbol, float(pos.entry_price), "SIDE_MISMATCH_KILL")
-                                from .safe_mode import trip_halt
-                                trip_halt(f"side mismatch for {symbol}")
-                
-                # Reconcile exchange positions that aren't local
-                for symbol, exch_pos in real_positions.items():
-                    local_pos = self.get_open_position(symbol)
-                    if not local_pos:
-                        logger.warning(f"[EXCHANGE SYNC] Position for {symbol} exists on exchange ({exch_pos['side']} size={exch_pos['quantity']:.4f}) but not locally! Tracking it.")
-                        side = PositionSide.LONG if exch_pos["side"] == "LONG" else PositionSide.SHORT
-                        from .wallet import Playbook
-                        setup = {
-                            "side": side,
-                            "entry_price": float(exch_pos["entry_price"]),
-                            "sl_price": float(exch_pos["entry_price"] * Decimal("0.988" if side == PositionSide.LONG else "1.012")),
-                            "playbook": Playbook.INTRADAY,
-                            "candle_close_time": self._now_ms()
-                        }
-                        self.open_position(symbol, setup, float(exch_pos["entry_price"]), custom_quantity=float(exch_pos["quantity"]))
-                
-                self._save_state()
-            except Exception as e:
-                logger.error(f"[EXCHANGE SYNC] Error during sync: {e}")
 
     def _liquidate_position(self, symbol: str, mark_price: Decimal) -> None:
         """Force-close at maintenance boundary with no additional fee charge."""
@@ -821,6 +810,8 @@ class EnhancedFuturesWallet:
         mark_price: float,
         candle_close_time: int,
         ema9_1h: Optional[float] = None,
+        current_llm_advice: Optional[dict] = None,
+        current_regime: Optional[str] = None,
     ):
         """Update PnL and check all exit conditions."""
         with self.lock:
@@ -836,13 +827,63 @@ class EnhancedFuturesWallet:
             # 1. Catastrophic SL (-50% margin)
             cat_sl = pos.margin_used * self._to_decimal(self.catastrophic_sl_pct)
             if self._is_liquidation_required(pos, mark_price):
-                self._liquidate_position(symbol, mark_price)
+                self._liquidate_position(symbol, float(mark_price))
                 return
             if pnl <= cat_sl:
-                self.close_position(symbol, mark_price, reason=f"CATASTROPHIC_SL ({pnl:.2f})")
+                self.close_position(symbol, float(mark_price), reason=f"CATASTROPHIC_SL ({pnl:.2f})")
                 return
 
-            # 2. Playbook-specific exits
+            # 2. Windfall Return on Margin Exit (ROM >= 40%)
+            if pos.current_margin_pnl_pct >= Decimal("0.40"):
+                self.close_position(symbol, float(mark_price), reason="WINDFALL_RO_MARGIN_EXIT")
+                return
+
+            # 3. Peak PnL Trailing Stop (Triggered at >= 2% undiluted price change, exit if drops by 25% of peak)
+            if pos.peak_pnl_pct >= Decimal("0.02"):
+                if pos.side == PositionSide.LONG:
+                    peak_pnl = (pos.highest_price - pos.entry_price) * pos.remaining_quantity
+                else:
+                    peak_pnl = (pos.entry_price - pos.highest_price) * pos.remaining_quantity
+                
+                if pos.unrealized_pnl <= peak_pnl * Decimal("0.75"):
+                    self.close_position(symbol, float(mark_price), reason="PEAK_TRADING_STOP")
+                    return
+
+            # 4. AI/Regime Reversal Exit
+            if current_llm_advice:
+                bias = current_llm_advice.get("bias") if isinstance(current_llm_advice, dict) else (current_llm_advice.bias.value if hasattr(current_llm_advice.bias, "value") else current_llm_advice.bias)
+                confidence = current_llm_advice.get("confidence", 0.0) if isinstance(current_llm_advice, dict) else getattr(current_llm_advice, "confidence", 0.0)
+                
+                is_reversal = False
+                if pos.side == PositionSide.LONG and bias == "bearish":
+                    is_reversal = True
+                elif pos.side == PositionSide.SHORT and bias == "bullish":
+                    is_reversal = True
+                    
+                if is_reversal and confidence >= 0.70:
+                    if pos.side == PositionSide.LONG and mark_price >= pos.entry_price * Decimal("0.995"):
+                        self.close_position(symbol, float(mark_price), reason="AI_REVERSAL_EXIT")
+                        return
+                    elif pos.side == PositionSide.SHORT and mark_price <= pos.entry_price * Decimal("1.005"):
+                        self.close_position(symbol, float(mark_price), reason="AI_REVERSAL_EXIT")
+                        return
+
+            if current_regime:
+                is_regime_reversal = False
+                if pos.side == PositionSide.LONG and current_regime == "TRENDING_DOWN":
+                    is_regime_reversal = True
+                elif pos.side == PositionSide.SHORT and current_regime == "TRENDING_UP":
+                    is_regime_reversal = True
+                    
+                if is_regime_reversal:
+                    if pos.side == PositionSide.LONG and mark_price >= pos.entry_price * Decimal("0.995"):
+                        self.close_position(symbol, float(mark_price), reason="REGIME_REVERSAL_EXIT")
+                        return
+                    elif pos.side == PositionSide.SHORT and mark_price <= pos.entry_price * Decimal("1.005"):
+                        self.close_position(symbol, float(mark_price), reason="REGIME_REVERSAL_EXIT")
+                        return
+
+            # 5. Playbook-specific exits
             if pos.playbook == Playbook.INTRADAY:
                 self._check_intraday_exits(symbol, pos, mark_price, candle_close_time)
             elif pos.playbook == Playbook.SWING:
@@ -1004,6 +1045,8 @@ class EnhancedFuturesWallet:
                     "open_time": int(pdata.get("open_time", 0)),
                     "tp_levels": tp_levels,
                     "trailing_active": bool(pdata.get("trailing_active", False)),
+                    "highest_price": self._to_decimal(pdata.get("highest_price", pdata.get("entry_price", "0"))),
+                    "peak_pnl_pct": self._to_decimal(pdata.get("peak_pnl_pct", "0")),
                 }
         elif "positions" in snap:
             # Fallback for legacy snapshots
@@ -1028,6 +1071,8 @@ class EnhancedFuturesWallet:
                         "open_time": int(pdata.get("open_time", 0)),
                         "tp_levels": tp_levels,
                         "trailing_active": bool(pdata.get("trailing_active", False)),
+                        "highest_price": self._to_decimal(pdata.get("highest_price", pdata.get("entry_price", "0"))),
+                        "peak_pnl_pct": self._to_decimal(pdata.get("peak_pnl_pct", "0")),
                     }
 
         # orders
@@ -1093,6 +1138,12 @@ class EnhancedFuturesWallet:
         raise ValueError("Unknown snapshot format")
 
     def _save_state(self):
+        # Sync dynamic peak fields back to reducer open positions before saving
+        for symbol, pos in self.positions.items():
+            if symbol in self._runtime_reducer_state.open_positions:
+                self._runtime_reducer_state.open_positions[symbol]["highest_price"] = pos.highest_price
+                self._runtime_reducer_state.open_positions[symbol]["peak_pnl_pct"] = pos.peak_pnl_pct
+
         state = {
             "schema_version": STATE_SCHEMA_VERSION,
             "saved_at": self._now_ms(),
@@ -1337,6 +1388,8 @@ class EnhancedFuturesWallet:
                     tp_levels=tp_levels,
                     trailing_active=bool(pdata.get("trailing_active", False)),
                     time_stop_hours=int(pdata.get("time_stop_hours", 18)),
+                    highest_price=self._to_decimal(pdata.get("highest_price", entry)),
+                    peak_pnl_pct=self._to_decimal(pdata.get("peak_pnl_pct", Decimal("0"))),
                 )
         self.positions = current
 
@@ -1417,49 +1470,6 @@ class EnhancedFuturesWallet:
         limit_price: Optional[Decimal] = None,
         expires_at: Optional[int] = None,
     ) -> Order:
-        if self.execution_engine:
-            # Live execution mode!
-            real_order = self.execution_engine.place_order(
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                order_type=order_type,
-                trigger_price=trigger_price,
-                limit_price=limit_price,
-                reduce_only=reduce_only,
-                expires_at=expires_at,
-            )
-            self._emit_event(
-                "ORDER_CREATED",
-                {
-                    "order_id": real_order.id,
-                    "symbol": real_order.symbol,
-                    "side": real_order.side.value,
-                    "quantity": real_order.quantity,
-                    "status": real_order.status.value,
-                    "order_type": real_order.order_type.value,
-                    "reduce_only": real_order.reduce_only,
-                    "trigger_price": real_order.trigger_price,
-                    "limit_price": real_order.limit_price,
-                    "expires_at": real_order.expires_at,
-                },
-            )
-            if real_order.status == OrderStatus.FILLED:
-                fee = self._calculate_fee(real_order.avg_fill_price * real_order.filled_quantity)
-                self._emit_event(
-                    "ORDER_FILLED",
-                    {
-                        "order_id": real_order.id,
-                        "symbol": real_order.symbol,
-                        "side": real_order.side.value,
-                        "quantity": real_order.filled_quantity,
-                        "fill_price": real_order.avg_fill_price,
-                        "fee": fee,
-                        "status": OrderStatus.FILLED.value,
-                    }
-                )
-            return self.orders[real_order.id]
-
         order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
         self._emit_event(
             "ORDER_CREATED",
@@ -2055,12 +2065,15 @@ class EnhancedFuturesWallet:
             return state
 
         last_ts = -1
+        seen = set()
         for event in self._iter_events():
+            fingerprint = json.dumps(event, sort_keys=True, default=str)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
             ts = int(event.get("ts", 0))
             if ts < last_ts:
-                # Allow same-millisecond events but prevent true back-dating
-                if ts < last_ts - 1000: # 1s grace for minor clock jitter
-                    raise ValueError(f"Out-of-order event stream detected: {ts} < {last_ts}")
+                raise ValueError("Out-of-order event stream detected")
             last_ts = ts
             self.reducer.apply(state, event)
         return state
@@ -2335,23 +2348,10 @@ class ExecutionEngine(Protocol):
     ) -> Order:
         ...
 
-    def modify_order(
-        self,
-        order_id: str,
-        *,
-        quantity: Optional[Decimal] = None,
-        trigger_price: Optional[Decimal] = None,
-        limit_price: Optional[Decimal] = None,
-    ) -> Order:
-        ...
-
     def cancel_order(self, order_id: str) -> bool:
         ...
 
     def sync_positions(self) -> Dict[str, dict]:
-        ...
-
-    def sync_balance(self) -> Decimal:
         ...
 
 
@@ -2398,12 +2398,8 @@ class PaperExecutionEngine:
                 if p.status == "OPEN"
             }
 
-    def sync_balance(self) -> Decimal:
-        return self.wallet.wallet_balance
-
 
 from . import safe_mode
-
 
 class _LiveExecutionEngineBase:
     """Shared gate logic for any real-money venue."""
@@ -2460,6 +2456,7 @@ class BinanceExecutionEngine(_LiveExecutionEngineBase):
         limit_price: Optional[Decimal] = None,
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
+        client_order_id: Optional[str] = None,
     ) -> Order:
         safe_mode.assert_live_allowed(
             "PLACE", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol
@@ -2496,11 +2493,11 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         import hmac
         import json
         import requests
-        
+
         base_url = os.getenv("COINDCX_API_URL", "https://api.coindcx.com").rstrip("/")
         url = f"{base_url}{path}"
         payload_str = json.dumps(payload, separators=(',', ':'))
-        
+
         signature = hmac.new(
             self.api_secret.encode('utf-8'),
             payload_str.encode('utf-8'),
@@ -2514,7 +2511,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         }
 
         logger.debug(f"[CoinDCX API] Request: {method} {url} | payload={payload_str}")
-        
+
         if method.upper() == "POST":
             response = requests.post(url, data=payload_str, headers=headers, timeout=10)
         else:
@@ -2549,6 +2546,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         limit_price: Optional[Decimal] = None,
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
+        client_order_id: Optional[str] = None,
     ) -> Order:
         safe_mode.assert_live_allowed(
             "PLACE", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol
@@ -2556,7 +2554,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
 
         coindcx_pair = self._map_symbol(symbol)
         coindcx_side = "buy" if side == PositionSide.LONG else "sell"
-        
+
         if order_type == OrderType.MARKET:
             coindcx_type = "market_order"
         elif order_type == OrderType.LIMIT:
@@ -2588,11 +2586,11 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         }
 
         res = self._request("POST", "/exchange/v1/derivatives/futures/orders/create", payload)
-        
+
         order_info = res.get("order", res) if isinstance(res, dict) else res
         order_id = order_info.get("id")
         status_str = order_info.get("status", "open").upper()
-        
+
         status_map = {
             "INIT": OrderStatus.PENDING,
             "OPEN": OrderStatus.NEW,
@@ -2602,7 +2600,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
             "UNTRIGGERED": OrderStatus.PENDING
         }
         status = status_map.get(status_str, OrderStatus.NEW)
-        
+
         fill_price = Decimal(str(order_info.get("price", order_info.get("price_per_unit", limit_price or 0))))
         filled_qty = Decimal(str(order_info.get("total_quantity", quantity) if status == OrderStatus.FILLED else 0))
 
@@ -2647,7 +2645,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         try:
             res = self._request("POST", "/exchange/v1/derivatives/futures/positions", payload)
             positions_list = res if isinstance(res, list) else res.get("positions", [])
-            
+
             result = {}
             for pos in positions_list:
                 active_pos = Decimal(str(pos.get("active_pos", "0")))
@@ -2660,7 +2658,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
                 side = "LONG" if active_pos > 0 else "SHORT"
                 quantity = abs(active_pos)
                 avg_price = Decimal(str(pos.get("avg_price", "0")))
-                
+
                 result[binance_symbol] = {
                     "symbol": binance_symbol,
                     "side": side,

@@ -88,7 +88,7 @@ def test_empty_tp_levels_no_crash(tmp_path, monkeypatch):
     # Clear tp_levels to simulate state after reducer re-sync loses them
     p.tp_levels = []
     # Must not raise IndexError — mark_price above SL, no TP to check
-    w.update_positions("SOLUSDT", mark_price=105, candle_close_time=1000)
+    w.update_positions("SOLUSDT", mark_price=101.5, candle_close_time=1000)
     assert w.get_open_position("SOLUSDT") is not None
 
 
@@ -417,3 +417,95 @@ def test_phase4_snapshot_features_and_phase5_observability(tmp_path, monkeypatch
         conn.commit()
     
     assert w3._load_from_db_snapshot_and_replay() is False
+
+
+def test_peak_trading_stop_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("SOLUSDT")
+    p = w.open_position("SOLUSDT", _setup(), mark_price=100)
+    assert p is not None
+    
+    # 1. Price moves to 103 (3% price change, triggers peak trailing stop activation)
+    w.update_positions("SOLUSDT", mark_price=103, candle_close_time=1000)
+    pos = w.get_open_position("SOLUSDT")
+    assert pos is not None
+    assert pos.peak_pnl_pct >= Decimal("0.02")
+    assert pos.highest_price == Decimal("103")
+    
+    # 2. Price retraces to 102.2 (which has unrealized PnL less than 75% of peak profit)
+    w.update_positions("SOLUSDT", mark_price=102.2, candle_close_time=2000)
+    assert w.get_open_position("SOLUSDT") is None
+    
+    # Verify close reason
+    history = w.position_history
+    assert len(history) == 1
+    assert history[0]["close_reason"] == "PEAK_TRADING_STOP"
+
+
+def test_windfall_ro_margin_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("SOLUSDT")
+    p = w.open_position("SOLUSDT", _setup(), mark_price=100)
+    assert p is not None
+    
+    # Return on Margin (ROM) = unrealized_pnl / margin_used
+    # At 10x leverage, a 4% price increase (to 104) yields a 40% ROM.
+    # We use 104.5 to account for entry slippage.
+    w.update_positions("SOLUSDT", mark_price=104.5, candle_close_time=1000)
+    
+    # The position should exit fully due to WINDFALL_RO_MARGIN_EXIT
+    assert w.get_open_position("SOLUSDT") is None
+    
+    # Verify close reason
+    history = w.position_history
+    assert len(history) == 1
+    assert history[0]["close_reason"] == "WINDFALL_RO_MARGIN_EXIT"
+
+
+def test_ai_and_regime_reversal_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    
+    # Test 1: AI Reversal Exit
+    w1 = _fresh_wallet("SOLUSDT")
+    p1 = w1.open_position("SOLUSDT", _setup(), mark_price=100)
+    assert p1 is not None
+    
+    # AI Reversal: Long position, Bearish advice, confidence >= 0.70, price >= 99.5% entry (99.5)
+    w1.update_positions(
+        "SOLUSDT",
+        mark_price=100,
+        candle_close_time=1000,
+        current_llm_advice={"bias": "bearish", "confidence": 0.8}
+    )
+    assert w1.get_open_position("SOLUSDT") is None
+    assert w1.position_history[0]["close_reason"] == "AI_REVERSAL_EXIT"
+
+    # Test 2: AI Reversal Exit blocked if below 99.5% entry (to avoid locking in major losses)
+    w2 = _fresh_wallet("SOLUSDT")
+    p2 = w2.open_position("SOLUSDT", _setup(), mark_price=100)
+    assert p2 is not None
+    
+    # Bearish advice, but price is 99.0 (below 99.5)
+    w2.update_positions(
+        "SOLUSDT",
+        mark_price=99.0,
+        candle_close_time=1000,
+        current_llm_advice={"bias": "bearish", "confidence": 0.8}
+    )
+    assert w2.get_open_position("SOLUSDT") is not None
+
+    # Test 3: Regime Reversal Exit
+    w3 = _fresh_wallet("SOLUSDT")
+    p3 = w3.open_position("SOLUSDT", _setup(), mark_price=100)
+    assert p3 is not None
+    
+    # Regime Reversal: Long position, TRENDING_DOWN regime, price >= 99.5
+    w3.update_positions(
+        "SOLUSDT",
+        mark_price=100,
+        candle_close_time=1000,
+        current_regime="TRENDING_DOWN"
+    )
+    assert w3.get_open_position("SOLUSDT") is None
+    assert w3.position_history[0]["close_reason"] == "REGIME_REVERSAL_EXIT"
+

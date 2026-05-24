@@ -123,7 +123,7 @@ class WebSocketTradingEngine:
                 resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
                 logger.info(f"[LLM] Mode: CLOUD (Target: {resolved_host})")
             else:
-                resolved_host = llm_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+                resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
                 resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
                 resolved_key = os.getenv("OLLAMA_API_KEY", "")
                 logger.info("[LLM] Mode: LOCAL")
@@ -312,6 +312,26 @@ class WebSocketTradingEngine:
             logger.info(f"[RISK] {risk_reason}")
             return
         self._halt_published = False
+
+        # 4.5 Update position if open (to check AI and regime reversal exits)
+        pos = self.wallet.get_open_position(self.symbol)
+        if pos:
+            df_1h["ema9"] = compute_ema(df_1h["close"], 9)
+            ema9_val = df_1h["ema9"].iloc[-1]
+            ema9_1h = float(ema9_val) if pd.notna(ema9_val) else None
+            candle_close_time = int(df_1h["close_time"].iloc[-1].timestamp() * 1000)
+
+            advice = self.advisor.get_last_advice() if (self.use_llm and self.advisor) else None
+            current_llm_advice = advice.to_dict() if advice else None
+
+            self.wallet.update_positions(
+                self.symbol,
+                mark_price,
+                candle_close_time,
+                ema9_1h,
+                current_llm_advice=current_llm_advice,
+                current_regime=regime.value if regime else None,
+            )
 
         # 5. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:

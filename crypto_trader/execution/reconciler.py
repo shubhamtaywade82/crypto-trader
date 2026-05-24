@@ -1,0 +1,114 @@
+"""
+crypto_trader.execution.reconciler — State reconciliation vs CoinDCX
+=====================================================================
+Compares the venue's authoritative account state against the wallet's
+event-sourced internal state and reports drift. CoinDCX is the source of truth.
+
+Detected mismatches:
+* ghost_position    — internal open position the venue doesn't have
+* missing_position  — venue position the internal state is missing
+* position_qty      — quantity disagreement beyond tolerance
+
+On unresolved divergence the reconciler trips the RiskManager kill switch so
+``can_trade()`` refuses new entries until an operator clears it. Run on boot
+(``reconcile``) and periodically.
+"""
+from __future__ import annotations
+
+import logging
+from decimal import Decimal
+from typing import List, Optional
+
+from ..events import EventBus, KillSwitchTriggeredEvent, ReconciliationMismatchEvent
+from .account_sync import AccountSnapshot, AccountSync
+
+logger = logging.getLogger("crypto_trader.execution.reconciler")
+
+_QTY_TOLERANCE = Decimal("0.01")   # relative drift allowed before flagging
+
+
+class Reconciler:
+    def __init__(
+        self,
+        wallet,
+        execution_engine,
+        risk_manager=None,
+        *,
+        bus: Optional[EventBus] = None,
+        qty_tolerance: Decimal = _QTY_TOLERANCE,
+    ):
+        self.wallet = wallet
+        self.account_sync = AccountSync(execution_engine)
+        self.risk = risk_manager
+        self.bus = bus
+        self.qty_tolerance = qty_tolerance
+        # True after a reconcile where the venue snapshot could not be fetched.
+        self.snapshot_failed = False
+
+    def reconcile(self, symbol: Optional[str] = None) -> List[ReconciliationMismatchEvent]:
+        snap = self.account_sync.snapshot(symbol)
+        self.snapshot_failed = not snap.ok
+        if not snap.ok:
+            # Truth unverifiable (transient). Do NOT persist a kill switch — the
+            # caller (gate / runtime loop) pauses trading for now and retries.
+            logger.warning("Reconciliation snapshot unavailable: %s", snap.error)
+            return []
+        mismatches = self._compare(snap)
+        for m in mismatches:
+            if self.bus:
+                self.bus.publish(m)
+            logger.warning("Reconciliation mismatch: %s internal=%s exchange=%s",
+                           m.kind, m.internal, m.exchange)
+        unresolved = [m for m in mismatches if not m.repaired]
+        if unresolved:
+            self._trip(f"{len(unresolved)} unresolved reconciliation mismatch(es)")
+        return mismatches
+
+    # ── comparison ───────────────────────────────────────────────────────────
+    def _compare(self, snap: AccountSnapshot) -> List[ReconciliationMismatchEvent]:
+        out: List[ReconciliationMismatchEvent] = []
+        internal = self._internal_positions()
+        venue = snap.positions
+
+        for sym, ipos in internal.items():
+            if sym not in venue:
+                out.append(ReconciliationMismatchEvent(
+                    symbol=sym, kind="ghost_position",
+                    internal=str(ipos["quantity"]), exchange="0",
+                    detail="internal position not present on venue",
+                ))
+                continue
+            iq = Decimal(str(ipos["quantity"]))
+            vq = Decimal(str(venue[sym]["quantity"]))
+            if iq > 0 and abs(iq - vq) / iq > self.qty_tolerance:
+                out.append(ReconciliationMismatchEvent(
+                    symbol=sym, kind="position_qty",
+                    internal=str(iq), exchange=str(vq),
+                    detail="quantity drift beyond tolerance",
+                ))
+
+        for sym, vpos in venue.items():
+            if sym not in internal and Decimal(str(vpos["quantity"])) > 0:
+                out.append(ReconciliationMismatchEvent(
+                    symbol=sym, kind="missing_position",
+                    internal="0", exchange=str(vpos["quantity"]),
+                    detail="venue position missing internally",
+                ))
+        return out
+
+    def _internal_positions(self) -> dict:
+        result = {}
+        for sym, pos in self.wallet.positions.items():
+            if getattr(pos, "status", "") == "OPEN":
+                result[sym] = {
+                    "quantity": pos.remaining_quantity,
+                    "side": pos.side.value,
+                    "entry_price": pos.entry_price,
+                }
+        return result
+
+    def _trip(self, reason: str):
+        if self.risk:
+            self.risk.trigger_kill_switch(reason)
+        if self.bus:
+            self.bus.publish(KillSwitchTriggeredEvent(reason=reason, source="reconciliation"))

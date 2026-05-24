@@ -75,6 +75,49 @@ class CommandEvent(Event):
     params: Dict[str, Any] = field(default_factory=dict)
     origin: str = "telegram"
 
+@dataclass
+class OrderSubmittedEvent(Event):
+    symbol: str = ""
+    side: str = ""
+    client_order_id: str = ""
+    exchange_order_id: str = ""
+    order_type: str = ""
+    quantity: float = 0.0
+    reduce_only: bool = False
+    venue: str = "coindcx"
+
+@dataclass
+class OrderFilledEvent(Event):
+    symbol: str = ""
+    side: str = ""
+    client_order_id: str = ""
+    exchange_order_id: str = ""
+    fill_price: float = 0.0
+    fill_quantity: float = 0.0
+    fee: float = 0.0
+    partial: bool = False
+    venue: str = "coindcx"
+
+@dataclass
+class ReconciliationMismatchEvent(Event):
+    symbol: str = ""
+    kind: str = ""          # e.g. "position_qty", "ghost_position", "orphan_order", "balance"
+    internal: str = ""
+    exchange: str = ""
+    repaired: bool = False
+    detail: str = ""
+
+@dataclass
+class KillSwitchTriggeredEvent(Event):
+    reason: str = ""
+    source: str = ""        # e.g. "reconciliation", "feed_stale", "manual"
+
+@dataclass
+class FeedStaleEvent(Event):
+    source: str = ""        # "binance" | "coindcx" | "all"
+    age_ms: float = 0.0
+    trading_disabled: bool = False
+
 class EventBus:
     def __init__(self):
         self._subscribers: Dict[type, List[Callable]] = {}
