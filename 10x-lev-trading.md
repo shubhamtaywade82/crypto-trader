@@ -1,4 +1,7 @@
-https://developers.binance.com/docs/derivatives/usds-margined-futures
+# 10x Leverage Trading System Reference
+
+Ref: <https://developers.binance.com/docs/derivatives/usds-margined-futures>
+
 
 Create a trading system using this which fetches ohlcv data, generates signal, creates a position locally with 10x leverage and ustilizess 50% of equity (doesnot if already open postoonsbut check if the signal is in same direction or opposite of open postion) , sets a PnL target of 10% , no sl unless -50% pnl of total positoon and maintains future wallet like a broker/exchange has
 Edit
