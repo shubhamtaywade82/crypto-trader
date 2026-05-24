@@ -7,7 +7,7 @@ import logging
 from dotenv import load_dotenv
 
 from crypto_trader.engine_ws import WebSocketTradingEngine
-from crypto_trader.wallet import EnhancedFuturesWallet
+from crypto_trader.wallet import EnhancedFuturesWallet, CoinDCXExecutionEngine
 from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
@@ -52,8 +52,33 @@ def main():
     threads = []
     
     total_balance = 1000.0
+    
+    # Initialize CoinDCX live execution engine if live trading is enabled
+    live_enabled = os.getenv("LIVE_TRADING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    live_ack = os.getenv("LIVE_TRADING_ACK", "") == "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"
+    
+    execution_engine = None
+    if live_enabled:
+        api_key = os.getenv("COINDCX_API_KEY")
+        api_secret = os.getenv("COINDCX_API_SECRET")
+        if not api_key or not api_secret:
+            logger.error("LIVE_TRADING_ENABLED is true, but COINDCX_API_KEY/SECRET is missing!")
+            raise ValueError("Missing CoinDCX API Key/Secret for live trading.")
+        
+        execution_engine = CoinDCXExecutionEngine(
+            api_key=api_key,
+            api_secret=api_secret,
+            i_understand_real_money=live_ack
+        )
+        logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
+        
     # Create one shared wallet for all engines
-    global_wallet = EnhancedFuturesWallet(symbol="GLOBAL", initial_balance=total_balance, leverage=args.leverage)
+    global_wallet = EnhancedFuturesWallet(
+        symbol="GLOBAL", 
+        initial_balance=total_balance, 
+        leverage=args.leverage,
+        execution_engine=execution_engine
+    )
     
     # Initialize Telegram Service if token is available
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")

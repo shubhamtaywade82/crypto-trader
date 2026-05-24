@@ -195,7 +195,8 @@ class BinanceWebSocketFeed:
                 # Block until connection closes
                 self.ws.run_forever(
                     ping_interval=30,
-                    ping_timeout=15,
+                    ping_timeout=25,
+                    skip_utf8_validation=True,
                 )
             except Exception as e:
                 logger.error(f"[WS] Connection error: {e}")
@@ -277,7 +278,6 @@ class BinanceWebSocketFeed:
             with self._lock:
                 if self.data.last_update_ms == 0:
                     msg = f"[WS] >>> FIRST DATA RECEIVED FOR {self.symbol.upper()} <<<"
-                    print(msg) # Explicit print to bypass logging propagation issues
                     logger.info(msg)
                     # Reset reconnection attempts only when we successfully receive the first live message
                     self._reconnect_attempts = 0
@@ -310,15 +310,18 @@ class BinanceWebSocketFeed:
             self._handle_ticker(data)
 
     def _handle_mark_price(self, data: dict):
-        price = float(data.get("p", 0))
-        if price > 0:
-            self.data.mark_price = price
-            self.data.index_price = float(data.get("i", 0))
-            self.data.funding_rate = float(data.get("r", 0))
-            self.data.next_funding_time = int(data.get("T", 0))
-            self.data.mark_price_time_ms = int(time.time() * 1000)
-            if self.on_mark_price:
-                self.on_mark_price(self.data.mark_price, self.data.funding_rate)
+        with self._lock:
+            price = float(data.get("p", 0))
+            if price > 0:
+                self.data.mark_price = price
+                self.data.index_price = float(data.get("i", 0))
+                self.data.funding_rate = float(data.get("r", 0))
+                self.data.next_funding_time = int(data.get("T", 0))
+                self.data.mark_price_time_ms = int(time.time() * 1000)
+        
+        # Callback outside lock
+        if price > 0 and self.on_mark_price:
+            self.on_mark_price(self.data.mark_price, self.data.funding_rate)
 
     def _handle_kline(self, data: dict):
         k = data.get("k", {})
@@ -334,45 +337,53 @@ class BinanceWebSocketFeed:
             "trades": int(k.get("n", 0)),
             "is_closed": k.get("x", False),
         }
-        if interval == "1h":
-            self.data.kline_1h = candle
-        elif interval == "4h":
-            self.data.kline_4h = candle
+        with self._lock:
+            if interval == "1h":
+                self.data.kline_1h = candle
+            elif interval == "4h":
+                self.data.kline_4h = candle
+        
+        # Callback outside lock
         if self.on_kline:
             self.on_kline(interval, candle)
 
     def _handle_book_ticker(self, data: dict):
-        self.data.best_bid = float(data.get("b", 0))
-        self.data.best_bid_qty = float(data.get("B", 0))
-        self.data.best_ask = float(data.get("a", 0))
-        self.data.best_ask_qty = float(data.get("A", 0))
-        self.data.book_ticker_time_ms = int(time.time() * 1000)
-        
-        # If we don't have a last_price or mark_price yet, initialize them from the book ticker mid-price
-        if self.data.best_bid > 0 and self.data.best_ask > 0:
-            mid = (self.data.best_bid + self.data.best_ask) / 2.0
-            if self.data.last_price == 0.0:
-                self.data.last_price = mid
-                self.data.last_price_time_ms = self.data.book_ticker_time_ms
-            if self.data.mark_price == 0.0:
-                self.data.mark_price = mid
-                self.data.mark_price_time_ms = self.data.book_ticker_time_ms
+        with self._lock:
+            self.data.best_bid = float(data.get("b", 0))
+            self.data.best_bid_qty = float(data.get("B", 0))
+            self.data.best_ask = float(data.get("a", 0))
+            self.data.best_ask_qty = float(data.get("A", 0))
+            self.data.book_ticker_time_ms = int(time.time() * 1000)
+            
+            # If we don't have a last_price or mark_price yet, initialize them from the book ticker mid-price
+            if self.data.best_bid > 0 and self.data.best_ask > 0:
+                mid = (self.data.best_bid + self.data.best_ask) / 2.0
+                if self.data.last_price == 0.0:
+                    self.data.last_price = mid
+                    self.data.last_price_time_ms = self.data.book_ticker_time_ms
+                if self.data.mark_price == 0.0:
+                    self.data.mark_price = mid
+                    self.data.mark_price_time_ms = self.data.book_ticker_time_ms
 
+        # Callback outside lock
         if self.on_book_ticker:
             self.on_book_ticker(self.data.best_bid, self.data.best_ask)
 
     def _handle_agg_trade(self, data: dict):
-        price = float(data.get("p", 0))
-        if price > 0:
-            self.data.last_price = price
-            self.data.last_qty = float(data.get("q", 0))
-            self.data.last_price_time_ms = int(time.time() * 1000)
+        with self._lock:
+            price = float(data.get("p", 0))
+            if price > 0:
+                self.data.last_price = price
+                self.data.last_qty = float(data.get("q", 0))
+                self.data.last_price_time_ms = int(time.time() * 1000)
 
     def _handle_ticker(self, data: dict):
-        self.data.volume_24h = float(data.get("v", 0))
-        self.data.price_change_24h = float(data.get("P", 0))
-        self.data.high_24h = float(data.get("h", 0))
-        self.data.low_24h = float(data.get("l", 0))
+        with self._lock:
+            self.data.volume_24h = float(data.get("v", 0))
+            self.data.price_change_24h = float(data.get("P", 0))
+            self.data.high_24h = float(data.get("h", 0))
+            self.data.low_24h = float(data.get("l", 0))
+
 
 
 class WebSocketPositionManager:

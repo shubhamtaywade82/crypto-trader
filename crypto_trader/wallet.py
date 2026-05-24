@@ -195,9 +195,9 @@ class PortfolioReducer:
             symbol = payload.get("symbol")
             pnl_str = payload.get("pnl", payload.get("remaining_pnl", "0"))
             pnl = Decimal(str(pnl_str))
-            fee = Decimal(str(payload.get("fee", "0")))
-            state.wallet_balance += (pnl - fee)
-            state.realized_pnl_total += (pnl - fee)
+            # Fee is ignored here as it's handled by ORDER_FILLED to prevent double-charging
+            state.wallet_balance += pnl
+            state.realized_pnl_total += pnl
             if symbol in state.open_positions:
                 qty_closed = Decimal(str(payload.get("closed_qty", "0")))
                 state.open_positions[symbol]["quantity"] = max(
@@ -227,9 +227,9 @@ class PortfolioReducer:
         if et in ("POSITION_CLOSED", "LIQUIDATION"):
             symbol = payload.get("symbol")
             pnl = Decimal(str(payload.get("remaining_pnl", "0")))
-            fee = Decimal(str(payload.get("fee", "0")))
-            state.wallet_balance += (pnl - fee)
-            state.realized_pnl_total += (pnl - fee)
+            # Fee is ignored here as it's handled by ORDER_FILLED to prevent double-charging
+            state.wallet_balance += pnl
+            state.realized_pnl_total += pnl
             if symbol in state.open_positions:
                 del state.open_positions[symbol]
             return
@@ -369,6 +369,7 @@ class EnhancedFuturesWallet:
         halt_on_critical: bool = False,
         halt_on_fatal: bool = True,
         max_snapshots: int = 10,
+        execution_engine: Optional["ExecutionEngine"] = None,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -407,6 +408,7 @@ class EnhancedFuturesWallet:
         self.fills: List[Fill] = []
         self.reducer = PortfolioReducer()
         self.lock = threading.RLock()
+        self.execution_engine = execution_engine
         self._init_db()
 
         self._load_state()
@@ -438,6 +440,12 @@ class EnhancedFuturesWallet:
                 "WALLET_INITIALIZED",
                 {"initial_balance": str(self.wallet_balance)}
             )
+
+        if self.execution_engine:
+            try:
+                self.sync_with_exchange()
+            except Exception as e:
+                logger.error(f"Failed to sync with exchange on wallet initialization: {e}")
 
     @property
     def margin_balance(self) -> float:
@@ -507,16 +515,28 @@ class EnhancedFuturesWallet:
             if not tp_levels and "tp_price" in setup:
                 tp_levels = [{"price": self._to_decimal(setup["tp_price"]), "pct": 1.0, "hit": False, "label": "TP"}]
 
-            order = self._create_order(symbol=symbol, side=side, quantity=qty)
-            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
-            fill_chunks = int(setup.get("fill_chunks", 1))
-            fee_open = self._execute_order_in_chunks(
-                order=order,
-                total_quantity=qty,
-                fill_price=execution_price,
-                fee_rate=self.taker_fee_rate,
-                chunk_count=fill_chunks,
-            )
+            if self.execution_engine:
+                # Live Execution
+                order = self._create_order_with_type(
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    order_type=OrderType.MARKET,
+                )
+                execution_price = order.avg_fill_price
+                fee_open = self._calculate_fee(execution_price * qty)
+            else:
+                # Paper Mode
+                order = self._create_order(symbol=symbol, side=side, quantity=qty)
+                execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
+                fill_chunks = int(setup.get("fill_chunks", 1))
+                fee_open = self._execute_order_in_chunks(
+                    order=order,
+                    total_quantity=qty,
+                    fill_price=execution_price,
+                    fee_rate=self.taker_fee_rate,
+                    chunk_count=fill_chunks,
+                )
 
             pos = EnhancedPosition(
                 symbol=symbol,
@@ -534,13 +554,12 @@ class EnhancedFuturesWallet:
                 time_stop_hours=setup.get("time_stop_hours", 18),
             )
             pos.update_pnl(mark_price)
-            self._emit_event("FEE_CHARGED", {"amount": fee_open, "reason": "OPEN_FEE", "symbol": symbol})
             self.positions[symbol] = pos
             self._sync_unrealized_total()
 
             logger.info(
                 f"[POSITION OPENED] {symbol} {side.value} | Playbook={playbook.value} | "
-                f"Qty={qty:.4f} @ {entry:.2f} | Margin={margin:.2f} | "
+                f"Qty={qty:.4f} @ {execution_price:.2f} | Margin={margin:.2f} | "
                 f"SL={sl_price:.2f} | TP={tp_levels}"
             )
             self._emit_event(
@@ -548,7 +567,6 @@ class EnhancedFuturesWallet:
                 {
                     "symbol": symbol,
                     "side": side.value,
-                    "entry_price": entry,
                     "quantity": qty,
                     "margin": margin,
                     "execution_price": execution_price,
@@ -572,16 +590,39 @@ class EnhancedFuturesWallet:
                 return Decimal("0")
 
             qty_to_close = pos.remaining_quantity * self._to_decimal(pct)
-            execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
             if qty_to_close <= Decimal("0"):
                 return Decimal("0")
+
+            close_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+
+            if self.execution_engine:
+                # Live Execution
+                order = self._create_order_with_type(
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=qty_to_close,
+                    order_type=OrderType.MARKET,
+                    reduce_only=True,
+                )
+                execution_price = order.avg_fill_price
+                fee_close = self._calculate_fee(execution_price * qty_to_close)
+            else:
+                # Paper Mode
+                order = self._create_order_with_type(
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=qty_to_close,
+                    order_type=OrderType.MARKET,
+                    reduce_only=True,
+                )
+                execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
+                fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
+                self._record_fill(order, qty_to_close, execution_price, fee_close)
 
             if pos.side == PositionSide.LONG:
                 pnl_slice = (execution_price - pos.entry_price) * qty_to_close
             else:
                 pnl_slice = (pos.entry_price - execution_price) * qty_to_close
-
-            fee_close = self._calculate_fee(execution_price * qty_to_close, is_taker=True)
 
             # Credit the slice immediately (net fees)
             self._emit_event(
@@ -605,7 +646,7 @@ class EnhancedFuturesWallet:
             )
 
             if pos.remaining_quantity <= Decimal("0.0001"):
-                return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
+                return self.close_position(symbol, float(execution_price), reason="FULL_VIA_PARTIALS")
 
             self._save_state()
             return pnl_slice
@@ -618,10 +659,34 @@ class EnhancedFuturesWallet:
             if not pos:
                 return None
 
-            execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
+            close_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+
+            if self.execution_engine:
+                # Live Execution
+                order = self._create_order_with_type(
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=pos.remaining_quantity,
+                    order_type=OrderType.MARKET,
+                    reduce_only=True,
+                )
+                execution_price = order.avg_fill_price
+                fee_close = self._calculate_fee(execution_price * pos.remaining_quantity)
+            else:
+                # Paper Mode
+                order = self._create_order_with_type(
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=pos.remaining_quantity,
+                    order_type=OrderType.MARKET,
+                    reduce_only=True,
+                )
+                execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
+                fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
+                self._record_fill(order, pos.remaining_quantity, execution_price, fee_close)
+
             pos.update_pnl(execution_price)
             remaining_pnl = pos.unrealized_pnl  # Only the still-open portion
-            fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
 
             # Credit remaining PnL
             self._emit_event(
@@ -650,6 +715,64 @@ class EnhancedFuturesWallet:
             )
             self._save_state()
             return pos
+
+    def sync_with_exchange(self):
+        if not self.execution_engine:
+            return
+        with self.lock:
+            try:
+                # 1. Sync balance
+                real_balance = self.execution_engine.sync_balance()
+                if real_balance > Decimal("0"):
+                    if abs(self.wallet_balance - real_balance) > Decimal("0.01"):
+                        logger.info(f"[EXCHANGE SYNC] Updating wallet balance: local={self.wallet_balance:.2f} -> exchange={real_balance:.2f}")
+                    self.wallet_balance = real_balance
+                    self._runtime_reducer_state.wallet_balance = real_balance
+                    
+                # 2. Sync positions
+                real_positions = self.execution_engine.sync_positions()
+                
+                # Reconcile local positions
+                for symbol, pos in list(self.positions.items()):
+                    if pos.status == "OPEN":
+                        if symbol not in real_positions:
+                            logger.warning(f"[EXCHANGE SYNC] Position for {symbol} not found on exchange! Closing locally as GHOST_POSITION.")
+                            self.close_position(symbol, float(pos.entry_price), "GHOST_POSITION_CLOSED")
+                        else:
+                            exch_pos = real_positions[symbol]
+                            qty_diff = abs(pos.remaining_quantity - Decimal(str(exch_pos["quantity"])))
+                            if qty_diff > Decimal("0.0001"):
+                                logger.warning(f"[EXCHANGE SYNC] Quantity mismatch for {symbol}: local={pos.remaining_quantity:.4f} vs exchange={exch_pos['quantity']:.4f}. Syncing size.")
+                                pos.remaining_quantity = Decimal(str(exch_pos["quantity"]))
+                                pos.notional = pos.remaining_quantity * pos.entry_price
+                                pos.margin_used = pos.notional / pos.leverage
+                                self._runtime_reducer_state.open_positions[symbol]["quantity"] = pos.remaining_quantity
+                            
+                            if pos.side.value != exch_pos["side"]:
+                                logger.error(f"[EXCHANGE SYNC] CRITICAL side mismatch for {symbol}: local={pos.side.value} vs exchange={exch_pos['side']}! Halting trading.")
+                                self.close_position(symbol, float(pos.entry_price), "SIDE_MISMATCH_KILL")
+                                from .safe_mode import trip_halt
+                                trip_halt(f"side mismatch for {symbol}")
+                
+                # Reconcile exchange positions that aren't local
+                for symbol, exch_pos in real_positions.items():
+                    local_pos = self.get_open_position(symbol)
+                    if not local_pos:
+                        logger.warning(f"[EXCHANGE SYNC] Position for {symbol} exists on exchange ({exch_pos['side']} size={exch_pos['quantity']:.4f}) but not locally! Tracking it.")
+                        side = PositionSide.LONG if exch_pos["side"] == "LONG" else PositionSide.SHORT
+                        from .wallet import Playbook
+                        setup = {
+                            "side": side,
+                            "entry_price": float(exch_pos["entry_price"]),
+                            "sl_price": float(exch_pos["entry_price"] * Decimal("0.988" if side == PositionSide.LONG else "1.012")),
+                            "playbook": Playbook.INTRADAY,
+                            "candle_close_time": self._now_ms()
+                        }
+                        self.open_position(symbol, setup, float(exch_pos["entry_price"]), custom_quantity=float(exch_pos["quantity"]))
+                
+                self._save_state()
+            except Exception as e:
+                logger.error(f"[EXCHANGE SYNC] Error during sync: {e}")
 
     def _liquidate_position(self, symbol: str, mark_price: Decimal) -> None:
         """Force-close at maintenance boundary with no additional fee charge."""
@@ -1294,6 +1417,49 @@ class EnhancedFuturesWallet:
         limit_price: Optional[Decimal] = None,
         expires_at: Optional[int] = None,
     ) -> Order:
+        if self.execution_engine:
+            # Live execution mode!
+            real_order = self.execution_engine.place_order(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                order_type=order_type,
+                trigger_price=trigger_price,
+                limit_price=limit_price,
+                reduce_only=reduce_only,
+                expires_at=expires_at,
+            )
+            self._emit_event(
+                "ORDER_CREATED",
+                {
+                    "order_id": real_order.id,
+                    "symbol": real_order.symbol,
+                    "side": real_order.side.value,
+                    "quantity": real_order.quantity,
+                    "status": real_order.status.value,
+                    "order_type": real_order.order_type.value,
+                    "reduce_only": real_order.reduce_only,
+                    "trigger_price": real_order.trigger_price,
+                    "limit_price": real_order.limit_price,
+                    "expires_at": real_order.expires_at,
+                },
+            )
+            if real_order.status == OrderStatus.FILLED:
+                fee = self._calculate_fee(real_order.avg_fill_price * real_order.filled_quantity)
+                self._emit_event(
+                    "ORDER_FILLED",
+                    {
+                        "order_id": real_order.id,
+                        "symbol": real_order.symbol,
+                        "side": real_order.side.value,
+                        "quantity": real_order.filled_quantity,
+                        "fill_price": real_order.avg_fill_price,
+                        "fee": fee,
+                        "status": OrderStatus.FILLED.value,
+                    }
+                )
+            return self.orders[real_order.id]
+
         order_id = f"{symbol}-{self._now_ms()}-{len(self.orders)+1}"
         self._emit_event(
             "ORDER_CREATED",
@@ -1889,15 +2055,12 @@ class EnhancedFuturesWallet:
             return state
 
         last_ts = -1
-        seen = set()
         for event in self._iter_events():
-            fingerprint = json.dumps(event, sort_keys=True, default=str)
-            if fingerprint in seen:
-                continue
-            seen.add(fingerprint)
             ts = int(event.get("ts", 0))
             if ts < last_ts:
-                raise ValueError("Out-of-order event stream detected")
+                # Allow same-millisecond events but prevent true back-dating
+                if ts < last_ts - 1000: # 1s grace for minor clock jitter
+                    raise ValueError(f"Out-of-order event stream detected: {ts} < {last_ts}")
             last_ts = ts
             self.reducer.apply(state, event)
         return state
@@ -2172,10 +2335,23 @@ class ExecutionEngine(Protocol):
     ) -> Order:
         ...
 
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        quantity: Optional[Decimal] = None,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+    ) -> Order:
+        ...
+
     def cancel_order(self, order_id: str) -> bool:
         ...
 
     def sync_positions(self) -> Dict[str, dict]:
+        ...
+
+    def sync_balance(self) -> Decimal:
         ...
 
 
@@ -2222,11 +2398,56 @@ class PaperExecutionEngine:
                 if p.status == "OPEN"
             }
 
+    def sync_balance(self) -> Decimal:
+        return self.wallet.wallet_balance
 
-class BinanceExecutionEngine:
-    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+
+from . import safe_mode
+
+
+class _LiveExecutionEngineBase:
+    """Shared gate logic for any real-money venue."""
+
+    VENUE: str = "UNKNOWN"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        *,
+        i_understand_real_money: bool = False,
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
+        self._ack = bool(i_understand_real_money)
+        if self._ack:
+            logger.warning(
+                "%sExecutionEngine constructed with i_understand_real_money=True. "
+                "Orders still require env LIVE_TRADING_ENABLED + LIVE_TRADING_ACK and no HALT file.",
+                self.VENUE,
+            )
+        else:
+            logger.info(
+                "%sExecutionEngine constructed in SAFE mode (no real orders possible).",
+                self.VENUE,
+            )
+
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        quantity: Optional[Decimal] = None,
+        trigger_price: Optional[Decimal] = None,
+        limit_price: Optional[Decimal] = None,
+    ) -> Order:
+        safe_mode.assert_live_allowed(
+            "MODIFY", venue=self.VENUE, constructor_ack=self._ack, symbol=order_id
+        )
+        raise NotImplementedError(f"{self.VENUE} live modify_order not implemented yet.")
+
+
+class BinanceExecutionEngine(_LiveExecutionEngineBase):
+    VENUE = "Binance"
 
     def place_order(
         self,
@@ -2240,19 +2461,82 @@ class BinanceExecutionEngine:
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
     ) -> Order:
+        safe_mode.assert_live_allowed(
+            "PLACE", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol
+        )
         raise NotImplementedError("Binance live execution is not implemented yet.")
 
     def cancel_order(self, order_id: str) -> bool:
+        safe_mode.assert_live_allowed(
+            "CANCEL", venue=self.VENUE, constructor_ack=self._ack, symbol=order_id
+        )
         raise NotImplementedError("Binance live execution is not implemented yet.")
 
     def sync_positions(self) -> Dict[str, dict]:
         raise NotImplementedError("Binance live execution is not implemented yet.")
 
 
-class CoinDCXExecutionEngine:
-    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
-        self.api_key = api_key
-        self.api_secret = api_secret
+class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
+    VENUE = "CoinDCX"
+
+    def _map_symbol(self, symbol: str) -> str:
+        symbol = symbol.upper()
+        if symbol.startswith("B-") and "_" in symbol:
+            return symbol
+        base = symbol.replace("USDT", "")
+        return f"B-{base}_USDT"
+
+    def _map_symbol_back(self, coindcx_symbol: str) -> str:
+        s = coindcx_symbol.upper()
+        if s.startswith("B-"):
+            s = s[2:]
+        return s.replace("_", "")
+
+    def _request(self, method: str, path: str, payload: dict) -> dict:
+        import hmac
+        import json
+        import requests
+        
+        base_url = os.getenv("COINDCX_API_URL", "https://api.coindcx.com").rstrip("/")
+        url = f"{base_url}{path}"
+        payload_str = json.dumps(payload, separators=(',', ':'))
+        
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            payload_str.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-AUTH-APIKEY": self.api_key,
+            "X-AUTH-SIGNATURE": signature
+        }
+
+        logger.debug(f"[CoinDCX API] Request: {method} {url} | payload={payload_str}")
+        
+        if method.upper() == "POST":
+            response = requests.post(url, data=payload_str, headers=headers, timeout=10)
+        else:
+            response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            logger.error(f"[CoinDCX API] Error {response.status_code}: {response.text}")
+            response.raise_for_status()
+
+        return response.json()
+
+    def _get_precision(self, symbol: str) -> Tuple[int, int]:
+        # returns (qty_precision, price_precision)
+        sym = symbol.upper().replace("B-", "").replace("_", "").replace("USDT", "")
+        if "BTC" in sym:
+            return 3, 2
+        elif "ETH" in sym:
+            return 2, 2
+        elif "SOL" in sym:
+            return 2, 2
+        else:
+            return 2, 2  # Standard default for other USD-M futures
 
     def place_order(
         self,
@@ -2266,10 +2550,141 @@ class CoinDCXExecutionEngine:
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
     ) -> Order:
-        raise NotImplementedError("CoinDCX live execution is not implemented yet.")
+        safe_mode.assert_live_allowed(
+            "PLACE", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol
+        )
+
+        coindcx_pair = self._map_symbol(symbol)
+        coindcx_side = "buy" if side == PositionSide.LONG else "sell"
+        
+        if order_type == OrderType.MARKET:
+            coindcx_type = "market_order"
+        elif order_type == OrderType.LIMIT:
+            coindcx_type = "limit_order"
+        else:
+            raise NotImplementedError(f"Order type {order_type} not supported on CoinDCX execution engine.")
+
+        qty_prec, price_prec = self._get_precision(symbol)
+        qty_val = round(float(quantity), qty_prec)
+
+        order_data = {
+            "side": coindcx_side,
+            "pair": coindcx_pair,
+            "order_type": coindcx_type,
+            "total_quantity": qty_val,
+            "leverage": 10,
+            "notification": "no_notification"
+        }
+
+        if order_type == OrderType.LIMIT:
+            if limit_price is None:
+                raise ValueError("Limit price must be provided for limit_order")
+            order_data["price"] = round(float(limit_price), price_prec)
+            order_data["time_in_force"] = "good_till_cancel"
+
+        payload = {
+            "timestamp": int(time.time() * 1000),
+            "order": order_data
+        }
+
+        res = self._request("POST", "/exchange/v1/derivatives/futures/orders/create", payload)
+        
+        order_info = res.get("order", res) if isinstance(res, dict) else res
+        order_id = order_info.get("id")
+        status_str = order_info.get("status", "open").upper()
+        
+        status_map = {
+            "INIT": OrderStatus.PENDING,
+            "OPEN": OrderStatus.NEW,
+            "FILLED": OrderStatus.FILLED,
+            "CANCELLED": OrderStatus.CANCELLED,
+            "REJECTED": OrderStatus.REJECTED,
+            "UNTRIGGERED": OrderStatus.PENDING
+        }
+        status = status_map.get(status_str, OrderStatus.NEW)
+        
+        fill_price = Decimal(str(order_info.get("price", order_info.get("price_per_unit", limit_price or 0))))
+        filled_qty = Decimal(str(order_info.get("total_quantity", quantity) if status == OrderStatus.FILLED else 0))
+
+        return Order(
+            id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            status=status,
+            created_at=int(order_info.get("created_at", time.time() * 1000)),
+            reduce_only=reduce_only,
+            trigger_price=trigger_price,
+            limit_price=limit_price,
+            expires_at=expires_at,
+            filled_quantity=filled_qty,
+            avg_fill_price=fill_price
+        )
 
     def cancel_order(self, order_id: str) -> bool:
-        raise NotImplementedError("CoinDCX live execution is not implemented yet.")
+        safe_mode.assert_live_allowed(
+            "CANCEL", venue=self.VENUE, constructor_ack=self._ack, symbol=order_id
+        )
+        payload = {
+            "timestamp": int(time.time() * 1000),
+            "id": order_id
+        }
+        try:
+            self._request("POST", "/exchange/v1/derivatives/futures/orders/cancel", payload)
+            return True
+        except Exception as e:
+            logger.error(f"[CoinDCX] cancel_order failed for {order_id}: {e}")
+            return False
 
     def sync_positions(self) -> Dict[str, dict]:
-        raise NotImplementedError("CoinDCX live execution is not implemented yet.")
+        payload = {
+            "timestamp": int(time.time() * 1000),
+            "page": "1",
+            "size": "100",
+            "margin_currency_short_name": ["USDT"]
+        }
+        try:
+            res = self._request("POST", "/exchange/v1/derivatives/futures/positions", payload)
+            positions_list = res if isinstance(res, list) else res.get("positions", [])
+            
+            result = {}
+            for pos in positions_list:
+                active_pos = Decimal(str(pos.get("active_pos", "0")))
+                if active_pos == Decimal("0"):
+                    continue
+                coindcx_pair = pos.get("pair")
+                if not coindcx_pair:
+                    continue
+                binance_symbol = self._map_symbol_back(coindcx_pair)
+                side = "LONG" if active_pos > 0 else "SHORT"
+                quantity = abs(active_pos)
+                avg_price = Decimal(str(pos.get("avg_price", "0")))
+                
+                result[binance_symbol] = {
+                    "symbol": binance_symbol,
+                    "side": side,
+                    "quantity": quantity,
+                    "entry_price": avg_price,
+                }
+            return result
+        except Exception as e:
+            logger.error(f"[CoinDCX] sync_positions failed: {e}")
+            return {}
+
+    def sync_balance(self) -> Decimal:
+        payload = {
+            "timestamp": int(time.time() * 1000)
+        }
+        try:
+            res = self._request("POST", "/exchange/v1/derivatives/futures/positions/cross_margin_details", payload)
+            equity = res.get("total_account_equity")
+            if equity is not None:
+                return Decimal(str(equity))
+            wallet_bal = res.get("total_wallet_balance")
+            if wallet_bal is not None:
+                return Decimal(str(wallet_bal))
+            return Decimal("0")
+        except Exception as e:
+            logger.error(f"[CoinDCX] sync_balance failed: {e}")
+            return Decimal("0")
