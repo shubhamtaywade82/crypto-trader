@@ -63,6 +63,9 @@ class TradingConfig:
     coindcx_api_key: str = ""
     coindcx_api_secret: str = ""
     coindcx_base_url: str = "https://api.coindcx.com"
+    # Futures margin currency: "USDT" or "INR" (CoinDCX supports both; the
+    # account's funded futures wallet determines which one to use).
+    coindcx_margin_currency: str = "USDT"
 
     # Persistence
     database_url: str = ""          # postgresql://...; empty => SQLite dev fallback
@@ -93,6 +96,7 @@ class TradingConfig:
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),
             coindcx_base_url=_get("COINDCX_BASE_URL", "https://api.coindcx.com"),
+            coindcx_margin_currency=_get("COINDCX_MARGIN_CURRENCY", "USDT").upper(),
             database_url=_get("DATABASE_URL"),
             feed_stale_ms=_get_int("FEED_STALE_MS", 15_000),
         )
@@ -131,6 +135,7 @@ class TradingConfig:
             "mode": self.mode.value,
             "symbol": self.symbol,
             "data_source": self.data_source.value,
+            "margin_currency": self.coindcx_margin_currency,
             "max_leverage": self.max_leverage,
             "initial_balance": self.initial_balance,
             "coindcx_api_key": mask(self.coindcx_api_key),

@@ -82,8 +82,9 @@ class InstrumentSpec:
 
 
 class InstrumentMapper:
-    def __init__(self, client: Optional[CoinDCXClient] = None):
+    def __init__(self, client: Optional[CoinDCXClient] = None, margin_currency: str = "USDT"):
         self.client = client or CoinDCXClient()
+        self.margin_currency = margin_currency.upper()
         self._cache: Dict[str, InstrumentSpec] = {}
 
     def get_spec(self, symbol: str, *, refresh: bool = False) -> InstrumentSpec:
@@ -91,7 +92,10 @@ class InstrumentMapper:
         if not refresh and internal in self._cache:
             return self._cache[internal]
         pair = internal_to_coindcx(internal)
-        raw = self.client.get_public(_INSTRUMENT_ENDPOINT, params={"pair": pair})
+        raw = self.client.get_public(
+            _INSTRUMENT_ENDPOINT,
+            params={"pair": pair, "margin_currency_short_name": self.margin_currency},
+        )
         inst = raw.get("instrument") if isinstance(raw, dict) else None
         if not inst:
             raise ValueError(f"No instrument data for {pair}: {raw}")

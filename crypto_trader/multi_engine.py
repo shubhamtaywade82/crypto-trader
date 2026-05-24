@@ -7,7 +7,8 @@ import logging
 from dotenv import load_dotenv
 
 from crypto_trader.engine_ws import WebSocketTradingEngine
-from crypto_trader.wallet import EnhancedFuturesWallet, CoinDCXExecutionEngine
+from crypto_trader.wallet import EnhancedFuturesWallet
+from crypto_trader.exchanges.coindcx_execution import CoinDCXExecutionEngine
 from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
@@ -68,6 +69,7 @@ def main():
         execution_engine = CoinDCXExecutionEngine(
             api_key=api_key,
             api_secret=api_secret,
+            leverage=args.leverage,
             i_understand_real_money=live_ack
         )
         logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")

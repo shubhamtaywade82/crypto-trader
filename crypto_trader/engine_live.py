@@ -64,10 +64,16 @@ class LiveTradingSystem:
         if self.cfg.mode == TradingMode.PAPER:
             return PaperExecutionEngine(self.wallet)
         from .exchanges.coindcx_execution import CoinDCXExecutionEngine
+        from .exchanges.coindcx_client import CoinDCXClient
+        from .exchanges.instrument_mapper import InstrumentMapper
+        client = CoinDCXClient(api_key=self.cfg.coindcx_api_key, api_secret=self.cfg.coindcx_api_secret)
+        mapper = InstrumentMapper(client, margin_currency=self.cfg.coindcx_margin_currency)
         return CoinDCXExecutionEngine(
-            api_key=self.cfg.coindcx_api_key,
-            api_secret=self.cfg.coindcx_api_secret,
+            client=client,
+            mapper=mapper,
             leverage=self.cfg.max_leverage,
+            margin_currency=self.cfg.coindcx_margin_currency,
+            i_understand_real_money=True,
         )
 
     def _build_market_data(self):
@@ -110,13 +116,27 @@ class LiveTradingSystem:
         return checks
 
     def _live_venue_checks(self) -> List[Check]:
+        from . import safe_mode
         checks: List[Check] = []
-        # Credentials authenticate
-        usdt_balance = 0.0
+
+        # Safe-mode gate (PR #11 defense-in-depth): env LIVE_TRADING_ENABLED +
+        # LIVE_TRADING_ACK + no HALT file, on top of MODE=live.
+        gate_open = safe_mode.is_live_enabled()
+        gate_detail = "open" if gate_open else (
+            f"need {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', "
+            f"no HALT file"
+        )
+        checks.append(Check("safe_mode_gate", gate_open, gate_detail))
+
+        # Credentials authenticate; available margin (in the wallet's currency)
+        mc = self.cfg.coindcx_margin_currency
+        avail = 0.0
+        usdt_equiv = 0.0
         try:
-            balances = self.execution_engine.get_balances()
-            usdt_balance = float(balances.get("USDT", 0.0))
-            checks.append(Check("coindcx_auth", True, f"USDT={usdt_balance}"))
+            avail = float(self.execution_engine.sync_balance())
+            conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+            usdt_equiv = avail / conv if mc != "USDT" else avail
+            checks.append(Check("coindcx_auth", True, f"avail {avail} {mc} (~{usdt_equiv:.2f} USDT)"))
         except Exception as e:
             checks.append(Check("coindcx_auth", False, str(e)))
 
@@ -128,13 +148,13 @@ class LiveTradingSystem:
                                 f"cfg {self.cfg.max_leverage}x <= venue max {spec.max_leverage}x"))
             price = self.router.get_mark_price(self.cfg.symbol) if self.router else 0.0
             min_qty_notional = float(spec.min_quantity) * price
-            # Affordability uses the REAL venue USDT margin, not the internal balance.
-            affordable = usdt_balance * self.cfg.max_leverage
+            # Affordability uses the REAL venue margin (converted to USDT-equiv).
+            affordable = usdt_equiv * self.cfg.max_leverage
             ok = price > 0 and float(spec.min_notional) <= affordable
-            detail = (f"USDT={usdt_balance}, affordable_notional={affordable:.2f}, "
+            detail = (f"avail~{usdt_equiv:.2f} USDT, affordable_notional={affordable:.2f}, "
                       f"min_notional={spec.min_notional}, min_qty_notional={min_qty_notional:.2f}")
-            if not ok and usdt_balance <= 0:
-                detail += "  [account not funded with USDT margin]"
+            if not ok and usdt_equiv <= 0:
+                detail += f"  [futures wallet not funded with {mc} margin]"
             checks.append(Check("min_notional", ok, detail))
         except Exception as e:
             checks.append(Check("instrument", False, str(e)))
