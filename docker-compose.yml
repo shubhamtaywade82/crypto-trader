@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crypto_trader_pg
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      POSTGRES_DB: crypto_trader
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d crypto_trader"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional: the trading bot itself. Provide a .env with MODE/credentials.
+  # Enable with: docker compose --profile bot up
+  bot:
+    profiles: ["bot"]
+    build: .
+    container_name: crypto_trader_bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
+    command: ["python", "-m", "crypto_trader.engine_live", "--tick", "300"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:

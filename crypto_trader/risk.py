@@ -37,13 +37,35 @@ class RiskManager:
         self.consecutive_losses = 0
         self.last_loss_time: Optional[float] = None
         self.peak_balance: Optional[float] = None
+        # Hard kill switch (e.g. reconciliation desync, stale feed). Requires
+        # explicit clear — never auto-resets.
+        self.kill_switch: bool = False
+        self.kill_switch_reason: Optional[str] = None
         self.state_file = DATA_DIR / "risk_state.json"
         self._load_state()
 
     def _today(self) -> date:
         return datetime.now(timezone.utc).date()
 
+    def trigger_kill_switch(self, reason: str):
+        """Hard-halt trading until explicitly cleared (reconciliation desync, stale feed)."""
+        if not self.kill_switch:
+            logger.critical(f"[KILL SWITCH] Trading halted: {reason}")
+        self.kill_switch = True
+        self.kill_switch_reason = reason
+        self._save_state()
+
+    def clear_kill_switch(self):
+        """Manual reset after the underlying condition is resolved."""
+        self.kill_switch = False
+        self.kill_switch_reason = None
+        self._save_state()
+        logger.info("[KILL SWITCH] Cleared")
+
     def can_trade(self, current_balance: Optional[float] = None) -> Tuple[bool, str]:
+        if self.kill_switch:
+            return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
+
         today = self._today()
         if self.last_trade_date != today:
             self.daily_count = 0
@@ -107,6 +129,8 @@ class RiskManager:
             "consecutive_losses": self.consecutive_losses,
             "last_loss_time": self.last_loss_time,
             "peak_balance": self.peak_balance,
+            "kill_switch": self.kill_switch,
+            "kill_switch_reason": self.kill_switch_reason,
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f)
@@ -123,6 +147,8 @@ class RiskManager:
             self.consecutive_losses = state.get("consecutive_losses", 0)
             self.last_loss_time = state.get("last_loss_time")
             self.peak_balance = state.get("peak_balance")
+            self.kill_switch = bool(state.get("kill_switch", False))
+            self.kill_switch_reason = state.get("kill_switch_reason")
         except Exception as e:
             logger.warning(f"RiskManager load failed: {e}")
 

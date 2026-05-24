@@ -385,6 +385,10 @@ class EnhancedFuturesWallet:
         self.halted = False
         self.max_snapshots = max_snapshots
 
+        # Live execution wiring (paper mode leaves these untouched)
+        self.execution_engine = None
+        self.live_execution = False
+
         # Fast bootstrap metrics
         self.replay_duration_ms: float = 0.0
         self.delta_size: int = 0
@@ -467,6 +471,59 @@ class EnhancedFuturesWallet:
                 return False, "No available balance"
             return True, "OK"
 
+    def attach_execution_engine(self, engine, live: bool = True):
+        """Wire a live execution venue. When ``live`` is True, the orchestrator
+        is expected to pass venue fills into open/close via ``external_fill``."""
+        self.execution_engine = engine
+        self.live_execution = bool(live)
+        logger.info("Execution engine attached (live=%s)", self.live_execution)
+
+    def apply_external_fill(
+        self,
+        symbol: str,
+        side: "PositionSide",
+        fill_price,
+        fill_quantity,
+        order_id: str = "",
+        client_order_id: str = "",
+        reduce_only: bool = False,
+        setup: Optional[dict] = None,
+    ):
+        """Book a venue-reported fill into the event log (live mode).
+
+        Entries (``reduce_only=False``) require ``setup`` (sl/tp/playbook); exits
+        close the existing position at the venue price. This is the bridge the
+        order manager / reconciler use to record real fills without invoking the
+        synchronous paper simulation.
+        """
+        external = {"price": self._to_decimal(fill_price), "fee": self._to_decimal(0), "order_id": order_id}
+        if reduce_only:
+            return self.close_position(symbol, float(fill_price), reason="VENUE_EXIT", external_fill=external)
+        if setup is None:
+            raise ValueError("apply_external_fill entry requires a setup dict")
+        return self.open_position(
+            symbol, setup, float(fill_price),
+            custom_quantity=float(fill_quantity),
+            external_fill=external,
+        )
+
+    def _venue_fill(self, symbol: str, order_side: "PositionSide", quantity: Decimal, reduce_only: bool, intent: str) -> dict:
+        """Place a market order on the live venue and return the realized fill.
+
+        Used by open/close/partial when ``live_execution`` is on and the caller
+        did not supply an ``external_fill`` — turning the wallet into the single
+        live order-submission site without changing the orchestrator.
+        """
+        from .execution.client_order_id import make_client_order_id  # lazy: avoid import cycle
+        coid = make_client_order_id(symbol, intent, nonce=str(self._now_ms()))
+        order = self.execution_engine.place_order(
+            symbol, order_side, quantity, OrderType.MARKET,
+            reduce_only=reduce_only, client_order_id=coid,
+        )
+        price = order.avg_fill_price if order.avg_fill_price and order.avg_fill_price > 0 else Decimal("0")
+        fee = self._calculate_fee(price * quantity, is_taker=True)
+        return {"price": price, "fee": fee, "order_id": order.id, "client_order_id": coid}
+
     def open_position(
         self,
         symbol: str,
@@ -474,8 +531,15 @@ class EnhancedFuturesWallet:
         mark_price: float,
         custom_margin: Optional[float] = None,
         custom_quantity: Optional[float] = None,
+        external_fill: Optional[dict] = None,
     ) -> Optional[EnhancedPosition]:
-        """Open a position. custom_margin overrides equity_utilization for LLM-adjusted sizing."""
+        """Open a position. custom_margin overrides equity_utilization for LLM-adjusted sizing.
+
+        ``external_fill`` (live mode) injects a venue-reported fill
+        ``{"price", "fee", "order_id"}`` so the position is booked at the real
+        CoinDCX fill instead of the simulated price. When ``None`` (paper mode)
+        the original synchronous simulation path runs unchanged.
+        """
         with self.lock:
             can, reason = self.can_open(symbol)
             if not can:
@@ -507,16 +571,24 @@ class EnhancedFuturesWallet:
             if not tp_levels and "tp_price" in setup:
                 tp_levels = [{"price": self._to_decimal(setup["tp_price"]), "pct": 1.0, "hit": False, "label": "TP"}]
 
+            if external_fill is None and self.live_execution and self.execution_engine is not None:
+                external_fill = self._venue_fill(symbol, side, qty, reduce_only=False, intent="entry")
+
             order = self._create_order(symbol=symbol, side=side, quantity=qty)
-            execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
-            fill_chunks = int(setup.get("fill_chunks", 1))
-            fee_open = self._execute_order_in_chunks(
-                order=order,
-                total_quantity=qty,
-                fill_price=execution_price,
-                fee_rate=self.taker_fee_rate,
-                chunk_count=fill_chunks,
-            )
+            if external_fill is not None:
+                execution_price = self._to_decimal(external_fill["price"])
+                fee_open = self._to_decimal(external_fill.get("fee", 0))
+                self._record_fill(order, qty, execution_price, fee_open, sequence=1)
+            else:
+                execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
+                fill_chunks = int(setup.get("fill_chunks", 1))
+                fee_open = self._execute_order_in_chunks(
+                    order=order,
+                    total_quantity=qty,
+                    fill_price=execution_price,
+                    fee_rate=self.taker_fee_rate,
+                    chunk_count=fill_chunks,
+                )
 
             pos = EnhancedPosition(
                 symbol=symbol,
@@ -563,8 +635,11 @@ class EnhancedFuturesWallet:
             self._save_state()
             return pos
 
-    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str, tp_label: Optional[str] = None) -> Decimal:
-        """Close a percentage of the position. Returns realized PnL from this slice."""
+    def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str, tp_label: Optional[str] = None, external_fill: Optional[dict] = None) -> Decimal:
+        """Close a percentage of the position. Returns realized PnL from this slice.
+
+        ``external_fill`` (live mode) supplies the venue exit price via ``{"price": ...}``.
+        """
         with self.lock:
             mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
@@ -572,7 +647,14 @@ class EnhancedFuturesWallet:
                 return Decimal("0")
 
             qty_to_close = pos.remaining_quantity * self._to_decimal(pct)
-            execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
+            if external_fill is None and self.live_execution and self.execution_engine is not None and qty_to_close > Decimal("0"):
+                exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+                external_fill = self._venue_fill(symbol, exit_side, qty_to_close, reduce_only=True, intent="exit-partial")
+
+            if external_fill is not None:
+                execution_price = self._to_decimal(external_fill["price"])
+            else:
+                execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
             if qty_to_close <= Decimal("0"):
                 return Decimal("0")
 
@@ -610,15 +692,26 @@ class EnhancedFuturesWallet:
             self._save_state()
             return pnl_slice
 
-    def close_position(self, symbol: str, mark_price: float, reason: str) -> Optional[EnhancedPosition]:
-        """Close full position. Only credits remaining unrealized (partials already credited)."""
+    def close_position(self, symbol: str, mark_price: float, reason: str, external_fill: Optional[dict] = None) -> Optional[EnhancedPosition]:
+        """Close full position. Only credits remaining unrealized (partials already credited).
+
+        ``external_fill`` (live mode) supplies the venue exit price via
+        ``{"price": ...}``; when ``None`` the simulated exit price is used.
+        """
         with self.lock:
             mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
                 return None
 
-            execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
+            if external_fill is None and self.live_execution and self.execution_engine is not None:
+                exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+                external_fill = self._venue_fill(symbol, exit_side, pos.remaining_quantity, reduce_only=True, intent="exit")
+
+            if external_fill is not None:
+                execution_price = self._to_decimal(external_fill["price"])
+            else:
+                execution_price = self._execution_price(mark_price, pos.side, is_entry=False)
             pos.update_pnl(execution_price)
             remaining_pnl = pos.unrealized_pnl  # Only the still-open portion
             fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
