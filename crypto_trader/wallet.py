@@ -2526,6 +2526,18 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
 
         return response.json()
 
+    def _get_precision(self, symbol: str) -> Tuple[int, int]:
+        # returns (qty_precision, price_precision)
+        sym = symbol.upper().replace("B-", "").replace("_", "").replace("USDT", "")
+        if "BTC" in sym:
+            return 3, 2
+        elif "ETH" in sym:
+            return 2, 2
+        elif "SOL" in sym:
+            return 2, 2
+        else:
+            return 2, 2  # Standard default for other USD-M futures
+
     def place_order(
         self,
         symbol: str,
@@ -2552,11 +2564,14 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         else:
             raise NotImplementedError(f"Order type {order_type} not supported on CoinDCX execution engine.")
 
+        qty_prec, price_prec = self._get_precision(symbol)
+        qty_val = round(float(quantity), qty_prec)
+
         order_data = {
             "side": coindcx_side,
             "pair": coindcx_pair,
             "order_type": coindcx_type,
-            "total_quantity": float(quantity),
+            "total_quantity": qty_val,
             "leverage": 10,
             "notification": "no_notification"
         }
@@ -2564,7 +2579,7 @@ class CoinDCXExecutionEngine(_LiveExecutionEngineBase):
         if order_type == OrderType.LIMIT:
             if limit_price is None:
                 raise ValueError("Limit price must be provided for limit_order")
-            order_data["price"] = float(limit_price)
+            order_data["price"] = round(float(limit_price), price_prec)
             order_data["time_in_force"] = "good_till_cancel"
 
         payload = {

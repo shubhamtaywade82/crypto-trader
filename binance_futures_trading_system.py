@@ -725,7 +725,9 @@ class EnhancedFuturesWallet:
                 "realized_pnl": float(self.realized_pnl_total),
                 "positions": {s: p.to_dict() for s, p in self.positions.items()},
             }
-            self.state_file.write_text(json.dumps(state, indent=2))
+            temp_file = self.state_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(state, indent=2))
+            os.replace(temp_file, self.state_file)
         except Exception:
             pass
 

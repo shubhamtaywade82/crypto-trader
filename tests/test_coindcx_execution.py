@@ -177,3 +177,45 @@ def test_sync_balance(mock_post, execution_engine):
 
     balance = execution_engine.sync_balance()
     assert balance == Decimal("1045.25")
+
+def test_precision_rounding(execution_engine):
+    # Test _get_precision mapping
+    assert execution_engine._get_precision("BTCUSDT") == (3, 2)
+    assert execution_engine._get_precision("ETHUSDT") == (2, 2)
+    assert execution_engine._get_precision("SOLUSDT") == (2, 2)
+    assert execution_engine._get_precision("UNKNOWN") == (2, 2)
+
+@patch("requests.post")
+def test_place_order_precision_rounding(mock_post, execution_engine, monkeypatch):
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_TRADING_ACK", "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST")
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "order": {
+            "id": "order-rounded",
+            "status": "open",
+            "price": 100.55,
+            "total_quantity": 2.55,
+            "created_at": 1716496800000
+        }
+    }
+    mock_post.return_value = mock_response
+
+    # Pass excessive decimals for BTCUSDT (qty 3, price 2)
+    execution_engine.place_order(
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        quantity=Decimal("2.554321"),
+        order_type=OrderType.LIMIT,
+        limit_price=Decimal("100.55999")
+    )
+
+    mock_post.assert_called_once()
+    _, call_kwargs = mock_post.call_args
+    payload = json.loads(call_kwargs["data"])
+    order_payload = payload["order"]
+
+    assert order_payload["total_quantity"] == 2.554
+    assert order_payload["price"] == 100.56
