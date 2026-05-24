@@ -85,8 +85,8 @@ _lazy_map = {
     "OllamaAdvisor": ("llm_advisor", "OllamaAdvisor"),
     "LLMAdvice": ("llm_advisor", "LLMAdvice"),
     "TradeJournal": ("journal", "TradeJournal"),
-    "BinanceWebSocketFeed": ("websocket", "BinanceWebSocketFeed"),
-    "WebSocketPositionManager": ("websocket", "WebSocketPositionManager"),
+    "BinanceWebSocketFeed": ("ws_client", "BinanceWebSocketFeed"),
+    "WebSocketPositionManager": ("ws_client", "WebSocketPositionManager"),
     "WebSocketTradingEngine": ("engine_ws", "WebSocketTradingEngine"),
 }
 
