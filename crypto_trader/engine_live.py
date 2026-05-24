@@ -112,9 +112,11 @@ class LiveTradingSystem:
     def _live_venue_checks(self) -> List[Check]:
         checks: List[Check] = []
         # Credentials authenticate
+        usdt_balance = 0.0
         try:
             balances = self.execution_engine.get_balances()
-            checks.append(Check("coindcx_auth", True, f"balances: {list(balances)[:3]}"))
+            usdt_balance = float(balances.get("USDT", 0.0))
+            checks.append(Check("coindcx_auth", True, f"USDT={usdt_balance}"))
         except Exception as e:
             checks.append(Check("coindcx_auth", False, str(e)))
 
@@ -126,13 +128,14 @@ class LiveTradingSystem:
                                 f"cfg {self.cfg.max_leverage}x <= venue max {spec.max_leverage}x"))
             price = self.router.get_mark_price(self.cfg.symbol) if self.router else 0.0
             min_qty_notional = float(spec.min_quantity) * price
-            affordable = self.wallet.margin_balance * self.cfg.max_leverage
-            ok = price > 0 and float(spec.min_notional) <= float(affordable)
-            checks.append(Check(
-                "min_notional", ok,
-                f"min_notional={spec.min_notional}, affordable_notional={float(affordable):.2f}, "
-                f"min_qty_notional={min_qty_notional:.2f}",
-            ))
+            # Affordability uses the REAL venue USDT margin, not the internal balance.
+            affordable = usdt_balance * self.cfg.max_leverage
+            ok = price > 0 and float(spec.min_notional) <= affordable
+            detail = (f"USDT={usdt_balance}, affordable_notional={affordable:.2f}, "
+                      f"min_notional={spec.min_notional}, min_qty_notional={min_qty_notional:.2f}")
+            if not ok and usdt_balance <= 0:
+                detail += "  [account not funded with USDT margin]"
+            checks.append(Check("min_notional", ok, detail))
         except Exception as e:
             checks.append(Check("instrument", False, str(e)))
 

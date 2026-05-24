@@ -22,14 +22,14 @@ from .instrument_mapper import InstrumentMapper, coindcx_to_internal
 
 logger = logging.getLogger("crypto_trader.exchanges.coindcx_execution")
 
-# ── CoinDCX futures endpoints (verify against live during rollout) ──────────
+# ── CoinDCX futures endpoints (confirmed against the live API) ──────────────
 EP_CREATE_ORDER = "exchange/v1/derivatives/futures/orders/create"
 EP_CANCEL_ORDER = "exchange/v1/derivatives/futures/orders/cancel"
 EP_LIST_ORDERS = "exchange/v1/derivatives/futures/orders"
 EP_POSITIONS = "exchange/v1/derivatives/futures/positions"
-EP_WALLETS = "exchange/v1/derivatives/futures/wallets"
+EP_BALANCES = "exchange/v1/users/balances"          # unified wallet (USDT margin)
 EP_TRADES = "exchange/v1/derivatives/futures/trades"
-EP_LEVERAGE = "exchange/v1/derivatives/futures/positions/edit_leverage"
+EP_LEVERAGE = "exchange/v1/derivatives/futures/positions/edit_leverage"  # best-effort; leverage is also carried per-order
 
 _SIDE_TO_CDCX = {PositionSide.LONG: "buy", PositionSide.SHORT: "sell"}
 _ORDER_TYPE_TO_CDCX = {
@@ -128,7 +128,7 @@ class CoinDCXExecutionEngine:
 
     # ── account-state reads (used by reconciler / account_sync) ─────────────
     def get_balances(self) -> Dict[str, float]:
-        resp = self.client.post_signed(EP_WALLETS, {})
+        resp = self.client.post_signed(EP_BALANCES, {})
         balances: Dict[str, float] = {}
         for w in _as_list(resp):
             cur = w.get("currency_short_name") or w.get("currency") or "USDT"

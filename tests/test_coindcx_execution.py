@@ -93,7 +93,7 @@ class _FakeClient:
             return self.order_resp
         if endpoint.endswith("positions"):
             return self.positions
-        if endpoint.endswith("wallets"):
+        if endpoint.endswith("balances"):
             return self.balances
         return {}
 
