@@ -36,9 +36,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 
 ---
 
-## 🚀 Getting Started (Fast Path)
-
-The system is now unified into a single development orchestrator.
+## 🚀 Getting Started
 
 ### 1. Prerequisites
 
@@ -55,15 +53,14 @@ cp .env.example .env
 pip install -r crypto_trader/requirements.txt
 ```
 
-### 3. Launch Backend Stack
-
-Starts Postgres, Redis, the Execution Consumer, and the Dashboard API.
+### 3. Run (one command, paper-safe)
 
 ```bash
-./bin/dev
+./bin/start                 # infra + API + multi-symbol bot (MODE defaults to paper)
+./bin/start --tick 60       # extra args forwarded to the bot
 ```
 
-### 4. Launch Dashboard UI (Manual)
+### 4. Launch Dashboard UI (separate terminal)
 
 ```bash
 cd ui
@@ -73,20 +70,7 @@ npm run dev -- --port 3030
 
 Access the dashboard at **<http://localhost:3030>**.
 
----
-
-## ▶️ Running the Bot
-
-### Fastest: one command (paper-safe)
-
-```bash
-./bin/start                 # infra + API + multi-symbol bot (MODE defaults to paper)
-./bin/start --tick 60       # extra args forwarded to the bot
-```
-
-Then start the UI (separate terminal): `cd ui && npm run dev -- --port 3030`.
-
-### Manual / split processes
+### Manual / split processes (alternative to `./bin/start`)
 
 ```bash
 ./bin/dev                   # backend only: infra + execution consumer + API (:8088)
@@ -94,11 +78,13 @@ Then start the UI (separate terminal): `cd ui && npm run dev -- --port 3030`.
 python3 bin/test_ui         # fire tiny paper signals to verify the UI/API pipeline
 ```
 
-### Going LIVE (real money)
+---
+
+## ▶️ Going LIVE (real money)
 
 Paper-soak first. Then set in `.env`:
 
-```
+```bash
 MODE=live
 LIVE_TRADING_ENABLED=true
 LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST
