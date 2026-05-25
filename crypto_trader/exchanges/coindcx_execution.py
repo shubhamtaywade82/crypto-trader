@@ -152,8 +152,18 @@ class CoinDCXExecutionEngine:
         if trigger_price is not None:
             order_obj["stop_price"] = float(spec.round_price(Decimal(str(trigger_price))))
 
-        resp = self.client.post_signed(EP_CREATE_ORDER, {"order": order_obj})
-        return self._parse_order_response(resp, symbol, side, qty, order_type, reduce_only)
+        # retry_safe=False: a duplicate create on timeout/5xx would double the
+        # position (CoinDCX has no client_order_id idempotency).
+        resp = self.client.post_signed(EP_CREATE_ORDER, {"order": order_obj}, retry_safe=False)
+        order = self._parse_order_response(resp, symbol, side, qty, order_type, reduce_only)
+        # CoinDCX market-order create responds before the fill settles, so the
+        # avg price is usually absent (0). Booking a position at price 0 would
+        # corrupt PnL/SL/TP/liquidation, so resolve the real fill before
+        # returning. Resting protective orders (stop/TP) are NOT polled — they
+        # fill later, by design.
+        if order_type == OrderType.MARKET:
+            order = self._resolve_market_fill(order, symbol)
+        return order
 
     def cancel_order(self, order_id: str) -> bool:
         safe_mode.assert_live_allowed(
@@ -172,7 +182,7 @@ class CoinDCXExecutionEngine:
             "EXIT", venue=self.VENUE, constructor_ack=self._ack, symbol=position_id
         )
         try:
-            self.client.post_signed(EP_POSITION_EXIT, {"id": position_id})
+            self.client.post_signed(EP_POSITION_EXIT, {"id": position_id}, retry_safe=False)
             return True
         except CoinDCXError as e:
             logger.warning("Exit failed for position %s: %s", position_id, e)
@@ -376,6 +386,50 @@ class CoinDCXExecutionEngine:
             reduce_only=reduce_only,
             filled_quantity=Decimal(str(data.get("total_quantity", "0") if cdcx_status == "filled" else "0")),
             avg_fill_price=Decimal(str(data.get("avg_price", data.get("price", "0")) or "0")),
+        )
+
+    def _resolve_market_fill(self, order: Order, symbol: str, *, attempts: int = 5,
+                             delay_s: float = 0.4) -> Order:
+        """Resolve a market order's real avg fill price + filled qty.
+
+        The create response rarely carries the settled price, so poll recent
+        fills for this order id (with short backoff). Raises ``CoinDCXError`` if
+        the fill can't be confirmed — the caller must NOT book a zero-price
+        position. A confirmed terminal cancel/reject is surfaced too.
+        """
+        import time as _t
+        if order.avg_fill_price and order.avg_fill_price > 0 and order.filled_quantity and order.filled_quantity > 0:
+            return order
+        oid = str(order.id or "")
+        if not oid:
+            raise CoinDCXError("market order create returned no order id — cannot confirm fill")
+        last_status = "unknown"
+        for i in range(attempts):
+            _t.sleep(delay_s)
+            try:
+                fills = [f for f in self.get_fills(symbol, days=1)
+                         if str(f.get("exchange_order_id")) == oid]
+            except CoinDCXError as e:
+                logger.warning("fill lookup failed for %s (attempt %d): %s", oid, i + 1, e)
+                fills = []
+            filled = sum(float(f.get("fill_quantity", 0) or 0) for f in fills)
+            if filled > 0:
+                notional = sum(float(f.get("fill_price", 0) or 0) * float(f.get("fill_quantity", 0) or 0)
+                               for f in fills)
+                avg = notional / filled if filled > 0 else 0.0
+                if avg > 0:
+                    order.avg_fill_price = Decimal(str(avg))
+                    order.filled_quantity = Decimal(str(filled))
+                    order.status = OrderStatus.FILLED
+                    return order
+            # Not yet in fills — check if the order terminally failed.
+            st = self.get_order_status(oid, symbol)
+            last_status = st.get("status", "unknown")
+            if last_status in ("cancelled", "canceled", "rejected"):
+                raise CoinDCXError(f"market order {oid} terminal status '{last_status}' — no fill")
+        raise CoinDCXError(
+            f"market order {oid} fill unconfirmed after {attempts} polls "
+            f"(last status '{last_status}') — refusing to book a zero-price position"
         )
 
     def _normalize_order_dict(self, o: dict) -> dict:

@@ -404,6 +404,8 @@ class WebSocketPositionManager:
         check_interval_ms: int = 1000,  # Check every 1s
         wick_buffer_size: int = 5,       # 5 samples = 5s
         event_bus = None,
+        health_check = None,             # callable(): authoritative margin guard
+        health_interval_s: float = 5.0,  # how often to run it (REST-bound)
     ):
         self.ws = ws_feed
         self.wallet = wallet
@@ -414,6 +416,11 @@ class WebSocketPositionManager:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_log_time = 0
+        # G4: authoritative liquidation guard must run far faster than the 5-min
+        # signal tick. Driven here on the 1s monitor loop (throttled).
+        self._health_check = health_check
+        self._health_interval_s = health_interval_s
+        self._last_health_time = 0.0
 
     def start(self):
         """Start high-frequency position monitoring."""
@@ -447,6 +454,18 @@ class WebSocketPositionManager:
                 data = self.ws.get_data()
                 ltp = self.ws.get_ltp()
                 mid = self.ws.get_mid_price()
+
+                # G4: authoritative margin/liquidation guard (throttled). Runs
+                # independently of price availability so it still fires while a
+                # feed is warming up but a position is live.
+                if self._health_check is not None:
+                    now_h = time.time()
+                    if now_h - self._last_health_time >= self._health_interval_s:
+                        self._last_health_time = now_h
+                        try:
+                            self._health_check()
+                        except Exception as e:
+                            logger.error(f"[WS-PM] health check error: {e}")
 
                 if ltp <= 0:
                     # Still waiting for the first message on a new connection

@@ -82,21 +82,48 @@ class CoinDCXClient:
         }
 
     # ── transport ──────────────────────────────────────────────────────────
-    def _send(self, method: str, url: str, *, headers: dict, data: Optional[str], params: Optional[dict]) -> Any:
+    def _send(self, method: str, url: str, *, headers: dict, data: Optional[str],
+              params: Optional[dict], retry_safe: bool = True) -> Any:
+        """Send a request with bounded retries.
+
+        ``retry_safe`` MUST be False for non-idempotent order mutations
+        (orders/create, positions/exit, orders/edit). CoinDCX has no
+        client_order_id idempotency key, so retrying after a timeout / 5xx where
+        the venue may already have accepted the order would place a DUPLICATE.
+        For those calls a single attempt is made and any ambiguous failure is
+        surfaced to the caller (which reconciles against the venue) instead of
+        being blindly retried.
+        """
+        # Non-idempotent calls get exactly one attempt; 429 is the only safe
+        # retry because it means the request was rejected before processing.
+        max_attempts = self.max_retries if retry_safe else 1
         last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries):
+        for attempt in range(max_attempts):
             try:
                 resp = self.session.request(
                     method, url, headers=headers, data=data, params=params, timeout=self.timeout
                 )
                 if resp.status_code == 429:
-                    # Honour Retry-After when the venue supplies it (G4).
+                    # Honour Retry-After when the venue supplies it (G4). 429 is
+                    # safe to retry even for order mutations (request rejected).
                     retry_after = _parse_float(resp.headers.get("Retry-After"))
                     sleep_s = retry_after if retry_after and retry_after > 0 else 5 * (attempt + 1)
                     logger.warning(f"CoinDCX rate limited; backing off {sleep_s:.1f}s")
+                    if not retry_safe:
+                        # Give the venue its requested cool-off, then one retry is
+                        # still safe because a 429 was never processed.
+                        time.sleep(sleep_s)
+                        raise CoinDCXError("rate limited (429)", 429, resp.text)
                     time.sleep(sleep_s)
                     continue
                 if resp.status_code >= 500:
+                    if not retry_safe:
+                        # Ambiguous: the order may already be live. Do NOT retry.
+                        raise CoinDCXError(
+                            f"CoinDCX {resp.status_code} on non-idempotent call "
+                            f"(not retried — reconcile against venue)",
+                            resp.status_code, resp.text,
+                        )
                     sleep_s = self.backoff_base ** attempt
                     logger.warning(f"CoinDCX {resp.status_code}; retry in {sleep_s}s")
                     time.sleep(sleep_s)
@@ -112,6 +139,13 @@ class CoinDCXClient:
                 self._apply_backpressure(resp)
                 return _safe_json(resp)
             except requests.Timeout:
+                if not retry_safe:
+                    # Ambiguous: the order may have reached the venue. Do NOT
+                    # retry — surface so the caller reconciles.
+                    raise CoinDCXError(
+                        "CoinDCX timeout on non-idempotent call "
+                        "(not retried — reconcile against venue)"
+                    )
                 sleep_s = self.backoff_base ** attempt
                 logger.warning(f"CoinDCX timeout (attempt {attempt+1}); retry in {sleep_s}s")
                 time.sleep(sleep_s)
@@ -119,6 +153,8 @@ class CoinDCXClient:
             except CoinDCXError:
                 raise
             except Exception as e:  # network blip
+                if not retry_safe:
+                    raise
                 sleep_s = self.backoff_base ** attempt
                 logger.warning(f"CoinDCX request error: {e}; retry in {sleep_s}s")
                 time.sleep(sleep_s)
@@ -180,13 +216,19 @@ class CoinDCXClient:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         return self._send("GET", url, headers={}, data=None, params=params)
 
-    def post_signed(self, endpoint: str, payload: Optional[dict] = None) -> Any:
-        """Authenticated POST. A fresh ``timestamp`` is injected per request."""
+    def post_signed(self, endpoint: str, payload: Optional[dict] = None,
+                    *, retry_safe: bool = True) -> Any:
+        """Authenticated POST. A fresh ``timestamp`` is injected per request.
+
+        Pass ``retry_safe=False`` for non-idempotent order mutations so a
+        timeout / 5xx is never blindly retried into a duplicate order.
+        """
         body_obj = dict(payload or {})
         body_obj["timestamp"] = self._now_ms()
         body = json.dumps(body_obj, separators=(",", ":"))
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        return self._send("POST", url, headers=self._signed_headers(body), data=body, params=None)
+        return self._send("POST", url, headers=self._signed_headers(body),
+                          data=body, params=None, retry_safe=retry_safe)
 
     def get_signed(self, endpoint: str, payload: Optional[dict] = None) -> Any:
         """Authenticated GET with a signed JSON body (CoinDCX wallet/margin reads).

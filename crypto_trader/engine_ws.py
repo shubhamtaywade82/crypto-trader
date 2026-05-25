@@ -158,6 +158,9 @@ class WebSocketTradingEngine:
             wallet=self.wallet,
             check_interval_ms=1000,  # Check every 1 second
             event_bus=self.event_bus,
+            # G4: drive the authoritative margin guard on the 1s loop (every ~5s),
+            # not only on the 5-min signal tick — liquidation can't wait 5 min.
+            health_check=self._check_authoritative_health,
         )
 
         # State
@@ -234,6 +237,21 @@ class WebSocketTradingEngine:
                     if self.event_bus:
                         from .events import SystemFailureEvent
                         self.event_bus.publish(SystemFailureEvent(component="margin_guard", error=reason))
+                    # Halting only blocks NEW entries; an open position is still
+                    # racing toward liquidation at this margin ratio. Flatten it.
+                    try:
+                        pos = self.wallet.get_open_position(self.symbol)
+                        if pos:
+                            mark = self.ws_feed.get_ltp() or self.ws_feed.get_mid_price()
+                            if not mark or mark <= 0:
+                                mark = float(pos.entry_price)
+                            self.wallet.close_position(
+                                self.symbol, float(mark),
+                                reason="MARGIN_GUARD_FLATTEN",
+                            )
+                            logger.critical("[AUTHORITATIVE GUARD] flattened %s to avoid liquidation", self.symbol)
+                    except Exception as e:
+                        logger.error("margin-guard flatten failed for %s: %s", self.symbol, e)
         except Exception as e:
             logger.error("Authoritative health check failed: %s", e)
 
@@ -420,8 +438,27 @@ class WebSocketTradingEngine:
         if not self.wallet.get_open_position(self.symbol) and can_trade:
             # Get latest ADX for Ares playbook filter
             latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
-            self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                                funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
+            try:
+                self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                                    funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
+            except Exception as e:
+                # An exception mid-entry (e.g. order placed but booking/SL failed)
+                # could leave an unmanaged live position. Fail safe: HALT, trip
+                # the kill switch, and reconcile against the venue rather than
+                # letting the loop crash and abandon a naked position.
+                logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e)
+                self._halted = True
+                if getattr(self, "risk_manager", None) is not None:
+                    self.risk_manager.trigger_kill_switch(f"entry failure: {e}")
+                if self.cfg and self.cfg.is_live:
+                    try:
+                        from . import safe_mode
+                        safe_mode.trip_halt(f"entry failure for {self.symbol}: {e}")
+                    except Exception:
+                        pass
+                if self.event_bus:
+                    from .events import SystemFailureEvent
+                    self.event_bus.publish(SystemFailureEvent(component="entry", error=str(e)))
 
         # 6. Print summary
         self.wallet.print_summary()

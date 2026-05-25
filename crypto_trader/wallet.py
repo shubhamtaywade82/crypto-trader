@@ -588,6 +588,13 @@ class EnhancedFuturesWallet:
             reduce_only=reduce_only, client_order_id=coid,
         )
         price = order.avg_fill_price if order.avg_fill_price and order.avg_fill_price > 0 else Decimal("0")
+        if price <= Decimal("0"):
+            # Booking at price 0 would corrupt PnL/SL/TP/liquidation. The engine
+            # confirms market fills, so a zero here is a hard failure to surface.
+            raise ValueError(
+                f"venue fill for {symbol} ({intent}) returned no usable price "
+                f"(order_id={order.id}); refusing to book a zero-price fill"
+            )
         fee = self._calculate_fee(price * quantity, is_taker=True)
         return {"price": price, "fee": fee, "order_id": order.id, "client_order_id": coid}
 

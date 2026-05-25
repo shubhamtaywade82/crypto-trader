@@ -85,7 +85,7 @@ class _FakeClient:
             "maker_fee": 0.0236, "taker_fee": 0.059, "status": "active",
         }}
 
-    def post_signed(self, endpoint, payload=None):
+    def post_signed(self, endpoint, payload=None, **kwargs):
         self.calls.append((endpoint, payload))
         if endpoint.endswith("orders/create"):
             return self.order_resp
@@ -93,7 +93,7 @@ class _FakeClient:
             return self.positions
         return {}
 
-    def get_signed(self, endpoint, payload=None):
+    def get_signed(self, endpoint, payload=None, **kwargs):
         self.calls.append((endpoint, payload))
         if endpoint.endswith("cross_margin_details"):
             return {"total_account_equity": self.equity} if self.equity is not None else {}
@@ -190,3 +190,65 @@ def test_sync_balance_falls_back_to_unified_usdt():
     fake = _FakeClient(equity=None, balances=[{"currency_short_name": "USDT", "balance": 77.0}])
     eng = _engine(fake)
     assert eng.sync_balance() == 77.0
+
+
+# ── safety regressions ───────────────────────────────────────────────────────
+def test_order_create_does_not_retry_on_timeout(monkeypatch):
+    """C1: a non-idempotent order create must NOT be retried on timeout — a
+    duplicate could double the position (no client_order_id idempotency)."""
+    import requests
+    from crypto_trader.exchanges import coindcx_client as cc
+
+    client = CoinDCXClient(api_key="k", api_secret="s", max_retries=3, backoff_base=0)
+    attempts = {"n": 0}
+
+    class _Sess:
+        headers = {}
+        def request(self, *a, **k):
+            attempts["n"] += 1
+            raise requests.Timeout("boom")
+    client.session = _Sess()
+    monkeypatch.setattr(cc.time, "sleep", lambda *_: None)
+
+    with pytest.raises(CoinDCXError):
+        client.post_signed("exchange/v1/derivatives/futures/orders/create",
+                           {"order": {}}, retry_safe=False)
+    assert attempts["n"] == 1  # exactly one attempt, no retry
+
+
+def test_read_call_still_retries_on_timeout(monkeypatch):
+    """Idempotent reads keep retrying (regression guard for retry_safe default)."""
+    import requests
+    from crypto_trader.exchanges import coindcx_client as cc
+
+    client = CoinDCXClient(api_key="k", api_secret="s", max_retries=3, backoff_base=0)
+    attempts = {"n": 0}
+
+    class _Sess:
+        headers = {}
+        def request(self, *a, **k):
+            attempts["n"] += 1
+            raise requests.Timeout("boom")
+    client.session = _Sess()
+    monkeypatch.setattr(cc.time, "sleep", lambda *_: None)
+
+    with pytest.raises(requests.Timeout):
+        client.get_signed("exchange/v1/derivatives/futures/wallets", {})
+    assert attempts["n"] == 3  # full retry budget for safe reads
+
+
+def test_market_fill_unconfirmed_raises(gate_open, monkeypatch):
+    """C2: if the venue never confirms the market fill, refuse to book a
+    zero-price position — raise instead."""
+    # create returns no avg price (async fill) and fills never resolve.
+    fake = _FakeClient(order_resp={"id": "ex-9", "status": "open"})
+    eng = _engine(fake)
+    monkeypatch.setattr(eng, "get_fills", lambda *a, **k: [])
+    monkeypatch.setattr(eng, "get_order_status",
+                        lambda *a, **k: {"status": "open", "filled_quantity": 0.0})
+    import crypto_trader.exchanges.coindcx_execution as ce
+    monkeypatch.setattr(ce, "_as_list", ce._as_list)  # no-op guard
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda *_: None)
+    with pytest.raises(CoinDCXError):
+        eng.place_order("SOLUSDT", PositionSide.LONG, Decimal("1.0"), OrderType.MARKET)
