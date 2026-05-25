@@ -124,6 +124,28 @@ function App() {
     onCleanup(() => { clearInterval(t1); clearInterval(t2); es.close(); });
   });
 
+  // Account cards: in LIVE use the real CoinDCX venue snapshot; in paper use the
+  // bot's event-sourced projection.
+  const isLive = () => mode() === "live";
+  const venueBalance = createMemo(() =>
+    venue()?.ok ? Object.values(venue()!.balances || {}).reduce((s, v) => s + Number(v || 0), 0) : null);
+  const venueUnrealized = createMemo(() => {
+    if (!venue()?.ok) return null;
+    let u = 0;
+    Object.values(venue()!.positions || {}).forEach((p: any) => {
+      if (p.unrealized_pnl != null) u += Number(p.unrealized_pnl);
+    });
+    return u;
+  });
+  const balanceDisplay = () => isLive() ? venueBalance() : account()?.balance;
+  const unrealizedDisplay = () => isLive() ? venueUnrealized() : account()?.unrealized_pnl;
+  const equityDisplay = () => {
+    if (!isLive()) return account()?.equity;
+    const b = venueBalance(); const u = venueUnrealized() ?? 0;
+    return b == null ? null : b + u;
+  };
+  const acctSource = () => isLive() ? (venue()?.ok ? "CoinDCX (real)" : "venue unavailable") : "bot model";
+
   const visibleEvents = createMemo(() =>
     events().filter(e => !e.payload?.mode || e.payload.mode === mode()));
 
@@ -208,23 +230,25 @@ function App() {
         <div class="metric-card pnl-card">
           <div class="card-glow" />
           <span class="metric-label">Equity</span>
-          <span class="metric-value">{fmt(account()?.equity)}</span>
+          <span class="metric-value">{fmt(equityDisplay())}</span>
+          <span class="muted">{acctSource()}</span>
         </div>
         <div class="metric-card">
           <span class="metric-label">Balance</span>
-          <span class="metric-value">{fmt(account()?.balance)}</span>
+          <span class="metric-value">{fmt(balanceDisplay())}</span>
+          <span class="muted">{acctSource()}</span>
         </div>
         <div class="metric-card">
-          <span class="metric-label">Realized PnL</span>
+          <span class="metric-label">Realized PnL{isLive() ? ' (bot)' : ''}</span>
           <span class={`metric-value ${signClass(account()?.realized_pnl)}`}>{fmt(account()?.realized_pnl)}</span>
         </div>
         <div class="metric-card">
           <span class="metric-label">Unrealized PnL</span>
-          <span class={`metric-value ${signClass(account()?.unrealized_pnl)}`}>{fmt(account()?.unrealized_pnl)}</span>
+          <span class={`metric-value ${signClass(unrealizedDisplay())}`}>{fmt(unrealizedDisplay())}</span>
         </div>
         <div class="metric-card">
           <span class="metric-label">Open Positions</span>
-          <span class="metric-value">{positions().filter(p => Number(p.qty) > 0).length}</span>
+          <span class="metric-value">{isLive() ? Object.keys(venue()?.positions || {}).length : positions().filter(p => Number(p.qty) > 0).length}</span>
         </div>
       </div>
 
