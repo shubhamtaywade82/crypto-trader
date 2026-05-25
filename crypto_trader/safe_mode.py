@@ -19,6 +19,10 @@ HALT_FILE = DATA_DIR / "HALT"
 LIVE_ENV_VAR = "LIVE_TRADING_ENABLED"
 ACK_ENV_VAR = "LIVE_TRADING_ACK"
 ACK_PHRASE = "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"
+# Read-only switch: PLACE_ORDER=false makes live mode observe-only — all outbound
+# order mutations (place / cancel / exit) are blocked while reads keep working.
+# Unset defaults to true so existing behavior is unchanged.
+PLACE_ORDER_ENV = "PLACE_ORDER"
 
 
 class LiveTradingBlocked(RuntimeError):
@@ -27,6 +31,18 @@ class LiveTradingBlocked(RuntimeError):
 
 def _env_true(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_true_default(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def order_execution_enabled() -> bool:
+    """False when PLACE_ORDER is explicitly disabled (read-only live mode)."""
+    return _env_true_default(PLACE_ORDER_ENV, True)
 
 
 def is_live_enabled() -> bool:
@@ -56,6 +72,8 @@ def assert_live_allowed(
       4. ~/.crypto_trader/HALT file absent
     """
     reasons = []
+    if not order_execution_enabled():
+        reasons.append(f"env {PLACE_ORDER_ENV}=false (read-only live mode — no order execution)")
     if not constructor_ack:
         reasons.append(f"constructor flag i_understand_real_money not set on {venue}ExecutionEngine")
     if not _env_true(LIVE_ENV_VAR):

@@ -29,7 +29,8 @@ interface Risk {
   kill_switch?: boolean; kill_switch_reason?: string | null; peak_balance?: number;
 }
 interface Gate {
-  mode: string; live_enabled: boolean; ack_ok: boolean; halt_file: boolean; live_orders_allowed: boolean;
+  mode: string; live_enabled: boolean; ack_ok: boolean; halt_file: boolean;
+  place_order: boolean; read_only: boolean; live_orders_allowed: boolean;
 }
 
 const fmt = (n: number | null | undefined, d = 2) =>
@@ -48,7 +49,9 @@ async function getJSON<T>(path: string, fallback: T): Promise<T> {
 }
 
 function App() {
-  const [mode, setMode] = createSignal<Mode>("paper");
+  const savedMode = (localStorage.getItem("ct_mode") as Mode) || "paper";
+  const [mode, setModeRaw] = createSignal<Mode>(savedMode === "live" ? "live" : "paper");
+  const setMode = (m: Mode) => { localStorage.setItem("ct_mode", m); setModeRaw(m); };
   const [events, setEvents] = createSignal<any[]>([]);
   const [conn, setConn] = createSignal<ConnState>("connecting");
   const [lastEventTs, setLastEventTs] = createSignal<number | null>(null);
@@ -159,10 +162,10 @@ function App() {
           <div class="metric-card">
             <span class="metric-label">Live Orders</span>
             <span class={`metric-value ${gate()?.live_orders_allowed ? 'neg' : 'pos'}`} style="font-size:1.1rem;">
-              {gate()?.live_orders_allowed ? 'ENABLED' : 'BLOCKED'}
+              {gate()?.live_orders_allowed ? 'ENABLED' : gate()?.read_only ? 'READ-ONLY' : 'BLOCKED'}
             </span>
             <span class="muted">
-              env:{gate()?.live_enabled ? 'on' : 'off'} ack:{gate()?.ack_ok ? 'ok' : 'no'} halt:{gate()?.halt_file ? 'yes' : 'no'}
+              env:{gate()?.live_enabled ? 'on' : 'off'} ack:{gate()?.ack_ok ? 'ok' : 'no'} halt:{gate()?.halt_file ? 'yes' : 'no'} place:{gate()?.place_order ? 'on' : 'off'}
             </span>
           </div>
           <div class="metric-card">
