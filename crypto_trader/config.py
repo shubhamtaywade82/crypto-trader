@@ -121,6 +121,8 @@ class TradingConfig:
     max_orders_per_minute: int = 6
     # G3: supervise WS feed / position-manager threads; HALT if one dies silently.
     thread_supervisor_enabled: bool = True
+    # G2: daily trade limit
+    max_daily_trades: int = 2
     # G5: on an unresolved venue desync, cancel ALL venue orders to protect capital.
     reconcile_strict_cancel: bool = False
 
@@ -175,6 +177,7 @@ class TradingConfig:
             projection_enabled=_get_bool("PROJECTION_ENABLED", False),
             clock_skew_max_ms=_get_int("CLOCK_SKEW_MAX_MS", 2000),
             max_orders_per_minute=_get_int("MAX_ORDERS_PER_MINUTE", 6),
+            max_daily_trades=_get_int("MAX_DAILY_TRADES", 2),
             thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
             reconcile_strict_cancel=_get_bool("RECONCILE_STRICT_CANCEL", False),
         )

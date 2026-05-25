@@ -47,7 +47,10 @@ class LiveTradingSystem:
     def __init__(self, cfg: Optional[TradingConfig] = None, bus: Optional[EventBus] = None):
         self.cfg = cfg or load_config()
         self.bus = bus or global_bus
-        self.risk = RiskManager(max_orders_per_minute=self.cfg.max_orders_per_minute)
+        self.risk = RiskManager(
+            max_orders_per_minute=self.cfg.max_orders_per_minute,
+            max_daily_trades=self.cfg.max_daily_trades
+        )
         self.event_store = None
         self.execution_engine = None
         self.router = None

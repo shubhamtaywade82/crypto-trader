@@ -36,6 +36,32 @@ def build_consumer(cfg=None, *, consumer_name: str = "worker-1") -> SignalConsum
     if cfg.is_live:
         system.wallet.attach_execution_engine(system.execution_engine, live=True)
 
+    if cfg.projection_enabled and cfg.database_url:
+        try:
+            from ..storage.projection import PostgresProjection
+            system.projection = PostgresProjection(cfg.database_url, mode=cfg.mode.value)
+            logger.info("Postgres projection (read-model) enabled in consumer")
+        except Exception as e:
+            logger.error("projection init failed: %s", e)
+            system.projection = None
+
+    if getattr(system, "event_store", None) is not None or getattr(system, "projection", None) is not None or cfg.redis_enabled:
+        prev = system.wallet.event_hook
+        bus = RedisStreamBus.from_url(cfg.redis_url) if cfg.redis_enabled else None
+        
+        def _sink(ev):
+            if getattr(system, "event_store", None) is not None:
+                try: system.event_store.append(ev)
+                except Exception as e: logger.error("event store append failed: %s", e)
+            if getattr(system, "projection", None) is not None:
+                try: system.projection.apply(ev)
+                except Exception as e: logger.error("projection apply failed: %s", e)
+            if bus:
+                try: bus.publish("events:broadcast", ev)
+                except Exception as e: logger.error("redis event broadcast failed: %s", e)
+            if prev: prev(ev)
+        system.wallet.event_hook = _sink
+
     adapter = WalletSignalAdapter(system.wallet)
     adapters = {"paper": adapter, "live": adapter}  # wallet decides paper vs live
     bus = RedisStreamBus.from_url(cfg.redis_url)

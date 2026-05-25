@@ -44,9 +44,18 @@ class RedisStreamBus:
         return cls(redis.Redis.from_url(url, decode_responses=True))
 
     # ── producer ───────────────────────────────────────────────────────────
-    def publish(self, stream: str, payload: dict) -> str:
+    def publish(self, stream: str, payload: Any) -> str:
         """XADD a JSON payload. Returns the message id."""
-        return self.r.xadd(stream, {"payload": json.dumps(payload, default=str)})
+        import dataclasses
+        if dataclasses.is_dataclass(payload):
+            data = dataclasses.asdict(payload)
+            data["event_type"] = type(payload).__name__
+        elif isinstance(payload, dict):
+            data = payload
+        else:
+            data = {"data": payload}
+            
+        return self.r.xadd(stream, {"payload": json.dumps(data, default=str)})
 
     # ── consumer-group plumbing ──────────────────────────────────────────────
     def ensure_group(self, stream: str, group: str) -> None:

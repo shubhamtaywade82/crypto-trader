@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: trader
       POSTGRES_DB: crypto_trader
     ports:
-      - "5434:5432"
+      - "5435:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +21,7 @@ services:
     container_name: crypto_trader_redis
     command: ["redis-server", "--appendonly", "yes"]   # AOF persistence for stream durability
     ports:
-      - "6379:6379"
+      - "6382:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -65,6 +65,24 @@ services:
       REDIS_URL: redis://redis:6379/0
       EXECUTION_BUS: redis
     command: ["python", "-m", "crypto_trader.execution.run_consumer"]
+    restart: unless-stopped
+
+  api:
+    profiles: ["bot"]
+    build: .
+    container_name: crypto_trader_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8088:8088"
+    command: ["python", "-m", "crypto_trader.api", "--port", "8088"]
     restart: unless-stopped
 
 volumes:

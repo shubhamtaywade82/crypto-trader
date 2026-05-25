@@ -1,0 +1,136 @@
+:root {
+  --bg-color: #0f172a;
+  --text-color: #f1f5f9;
+  --card-bg: #1e293b;
+  --primary: #3b82f6;
+  --secondary: #64748b;
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --border: #334155;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 1rem;
+}
+
+.mode-toggle {
+  display: flex;
+  background: var(--card-bg);
+  padding: 0.25rem;
+  border-radius: 0.5rem;
+}
+
+.mode-btn {
+  padding: 0.5rem 1rem;
+  border: none;
+  background: transparent;
+  color: var(--secondary);
+  cursor: pointer;
+  border-radius: 0.25rem;
+  font-weight: 600;
+}
+
+.mode-btn.active {
+  background: var(--primary);
+  color: white;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.card {
+  background: var(--card-bg);
+  padding: 1.5rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+}
+
+.card h3 {
+  margin-top: 0;
+  color: var(--secondary);
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.card .value {
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 1rem;
+}
+
+th {
+  text-align: left;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+td {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.875rem;
+}
+
+.status-tag {
+  padding: 0.25rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.status-open { background: rgba(34, 197, 94, 0.2); color: var(--success); }
+.status-pending { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
+.status-filled { background: rgba(59, 130, 246, 0.2); color: var(--primary); }
+
+.long { color: var(--success); }
+.short { color: var(--danger); }
+
+.event-list {
+  max-height: 400px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.75rem;
+  padding: 1rem;
+  background: #000;
+  border-radius: 0.5rem;
+}
+
+.event-item {
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid #222;
+  padding-bottom: 0.25rem;
+}
+
+.event-ts { color: #666; }
+.event-type { color: var(--primary); font-weight: bold; }

@@ -1,4 +1,21 @@
+# Logs
+*.log
+consumer.log
+api.log
+
+# UI
+ui/node_modules/
+ui/dist/
+ui/.env
+
+# Local state
+wallet_*.json
+wallet_*.db
+wallet_events_*.jsonl
+
+# General
 .antigravitycli/**
+
 llm_cache/**
 .env
 **/__pycache__/
