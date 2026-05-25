@@ -26,13 +26,13 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 
 ## 📂 Project Structure
 
-| Directory / File | Description |
-|:--- | :--- |
-| `crypto_trader/` | Core Python package (Engines, Exchanges, Risk, Storage). |
-| `ui/` | SolidJS + Vite + TypeScript frontend dashboard. |
-| `bin/` | Unified orchestrator scripts (`dev`, `bot`, `test_ui`). |
-| `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382). |
-| `docs/` | Detailed architectural deep-dives. |
+| Directory / File     | Description                                              |
+| :------------------- | :------------------------------------------------------- |
+| `crypto_trader/`     | Core Python package (Engines, Exchanges, Risk, Storage). |
+| `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
+| `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `test_ui`).  |
+| `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382).   |
+| `docs/`              | Detailed architectural deep-dives.                       |
 
 ---
 
@@ -118,12 +118,12 @@ Orders are blocked unless ALL hold: `LIVE_TRADING_ENABLED=true` **and** the exac
 
 ### Emergency controls
 
-| Action | Command |
-|:--- | :--- |
-| Halt all live orders instantly | `touch ~/.crypto_trader/HALT` |
-| Resume | `rm ~/.crypto_trader/HALT` |
-| Clear kill-switch + loss streak (after review) | `./bin/clear_risk` |
-| Telegram (if configured) | `/kill` · `/resume` · `/status` · `/pnl` |
+| Action                                         | Command                                  |
+| :--------------------------------------------- | :--------------------------------------- |
+| Halt all live orders instantly                 | `touch ~/.crypto_trader/HALT`            |
+| Resume                                         | `rm ~/.crypto_trader/HALT`               |
+| Clear kill-switch + loss streak (after review) | `./bin/clear_risk`                       |
+| Telegram (if configured)                       | `/kill` · `/resume` · `/status` · `/pnl` |
 
 > ⚠️ Known gaps before public/live deploy: Telegram `/kill` has **no sender allowlist**;
 > the dashboard API binds `0.0.0.0` with open CORS and no auth; do **not** set
@@ -157,13 +157,13 @@ Antigravity is built for capital preservation through multiple layers of defense
 
 ## 📈 Developer Tools
 
-| Script | Purpose |
-|:--- | :--- |
-| `./bin/start` | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
-| `./bin/dev` | Launches the backend stack (Infra + Consumer + API). |
-| `./bin/bot` | Launches **only** the multi-symbol trading bot. |
-| `./bin/test_ui` | Fires a burst of tiny test signals to verify the UI/API pipeline. |
-| `./bin/clear_risk` | Clears the kill-switch and resets the consecutive-loss counter. |
+| Script             | Purpose                                                                     |
+| :----------------- | :-------------------------------------------------------------------------- |
+| `./bin/start`      | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
+| `./bin/dev`        | Launches the backend stack (Infra + Consumer + API).                        |
+| `./bin/bot`        | Launches **only** the multi-symbol trading bot.                             |
+| `./bin/test_ui`    | Fires a burst of tiny test signals to verify the UI/API pipeline.           |
+| `./bin/clear_risk` | Clears the kill-switch and resets the consecutive-loss counter.             |
 
 ### Sending Test Signals
 
@@ -179,15 +179,15 @@ This will open positions in your paper wallet and you will see them appear insta
 
 ## ⚙️ Configuration (.env)
 
-| Variable | Default | Description |
-|:--- | :--- | :--- |
-| `MODE` | `paper` | `paper` (simulated) or `live` (CoinDCX). |
-| `TRADE_SYMBOL` | `SOLUSDT` | Active symbol for the single-engine runner. |
-| `MAX_LEVERAGE` | `2` | Hard leverage cap (Max 2x for safety). |
-| `MAX_DAILY_TRADES`| `2` | Daily safety limit for trades. |
-| `MAX_MARGIN_RATIO`| `0.80` | Exchange liquidation guard threshold. |
-| `DATABASE_URL` | `:5435` | Postgres connection string. |
-| `REDIS_URL` | `:6382` | Redis connection string. |
+| Variable           | Default   | Description                                 |
+| :----------------- | :-------- | :------------------------------------------ |
+| `MODE`             | `paper`   | `paper` (simulated) or `live` (CoinDCX).    |
+| `TRADE_SYMBOL`     | `SOLUSDT` | Active symbol for the single-engine runner. |
+| `MAX_LEVERAGE`     | `2`       | Hard leverage cap (Max 2x for safety).      |
+| `MAX_DAILY_TRADES` | `2`       | Daily safety limit for trades.              |
+| `MAX_MARGIN_RATIO` | `0.80`    | Exchange liquidation guard threshold.       |
+| `DATABASE_URL`     | `:5435`   | Postgres connection string.                 |
+| `REDIS_URL`        | `:6382`   | Redis connection string.                    |
 
 ---
 
