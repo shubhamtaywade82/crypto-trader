@@ -63,11 +63,17 @@ class WebSocketTradingEngine:
         wallet = None,
         event_bus = None,
         cfg = None,
+        signal_publisher = None,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
         self.event_bus = event_bus
         self.cfg = cfg
+        # When set (live + Redis execution bus), entries are PUBLISHED as signals
+        # and executed by the in-process consumer (shared wallet) — giving the
+        # idempotency lock / DLQ / PEL-recovery / risk-gate safety on the live
+        # entry path. When None, the hardened direct path runs unchanged.
+        self.signal_publisher = signal_publisher
         # CoinDCX market data for the cross-venue basis guard (F3). Public, no
         # creds; built lazily so paper/tests without network stay light.
         self._coindcx_md = None
@@ -656,6 +662,46 @@ class WebSocketTradingEngine:
         quantity = (risk_budget / stop_distance_dec) if stop_distance_dec > 0 else Decimal("0")
 
         trade_id = str(uuid.uuid4())[:8]
+
+        if quantity <= 0:
+            logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
+            return
+
+        # Decoupled path: publish the entry as a signal. The in-process consumer
+        # (shared wallet) executes it with idempotency/DLQ/PEL-recovery + a final
+        # risk-gate veto, then emits TradeOpenedEvent. record_open is performed
+        # exactly once by the consumer's risk gate, so we do NOT record it here.
+        if self.signal_publisher is not None:
+            from .execution.signal_bus import Signal
+            meta = {
+                "sl_price": float(setup["sl_price"]),
+                "regime": regime.value if regime else "",
+                "tech_score": float(tech_score),
+                "llm_decision": "ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
+                "funding_rate": float(funding_rate),
+                "oi_delta": float(oi_delta),
+            }
+            if "time_stop_hours" in setup:
+                meta["time_stop_hours"] = setup["time_stop_hours"]
+            if "tp_price" in setup:
+                meta["tp_price"] = float(setup["tp_price"])
+            else:
+                meta["tp_levels"] = [
+                    {"price": float(t["price"]), "pct": float(t.get("pct", 1.0)),
+                     "label": t.get("label", "TP")}
+                    for t in setup.get("tp_levels", []) if t.get("price")
+                ]
+            mode = self.cfg.mode.value if self.cfg else "paper"
+            self.signal_publisher.emit(Signal(
+                strategy_id=f"engine_ws:{self.symbol}",
+                symbol=self.symbol, side=setup["side"].value,
+                quantity=float(quantity), mode=mode, order_type="market",
+                price=float(entry_price), metadata=meta,
+            ))
+            self.adaptive_threshold.record_trade()
+            logger.info("[EXECUTED→BUS] %s %s qty=%.4f @ %.4f published to execution bus",
+                        self.symbol, setup["side"].value, float(quantity), float(entry_price))
+            return
 
         # Open position
         pos = self.wallet.open_position(

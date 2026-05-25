@@ -176,30 +176,75 @@ class SignalConsumer:
 class WalletSignalAdapter:
     """Executes a :class:`Signal` against an ``EnhancedFuturesWallet`` (paper or
     live, depending on whether an execution engine is attached). Bridges the
-    transport layer to the existing position lifecycle."""
+    transport layer to the existing position lifecycle.
 
-    def __init__(self, wallet, *, default_sl_pct: float = 0.007, default_tp_pct: float = 0.010):
+    The signal carries the full entry setup in ``metadata`` (sl_price, and
+    either tp_levels for scale-outs or a single tp_price, plus time_stop_hours)
+    so the booked position keeps the same risk structure the strategy computed.
+    An optional ``event_bus`` lets the adapter emit ``TradeOpenedEvent`` after a
+    confirmed open so downstream notifiers (Telegram) still fire on the
+    decoupled path.
+    """
+
+    def __init__(self, wallet, *, event_bus=None,
+                 default_sl_pct: float = 0.007, default_tp_pct: float = 0.010):
         self.wallet = wallet
+        self.event_bus = event_bus
         self.default_sl_pct = default_sl_pct
         self.default_tp_pct = default_tp_pct
 
     def execute(self, signal: Signal) -> None:
         from ..wallet import PositionSide, Playbook
         side = PositionSide.LONG if str(signal.side).upper() in ("LONG", "BUY") else PositionSide.SHORT
-        entry = float(signal.price) or float(signal.metadata.get("entry_price", 0) or 0)
+        meta = signal.metadata or {}
+        entry = float(signal.price) or float(meta.get("entry_price", 0) or 0)
         if entry <= 0:
             raise ValueError(f"signal {signal.signal_id} has no usable price")
-        sl = signal.metadata.get("sl_price")
-        tp = signal.metadata.get("tp_price")
+
+        sl = meta.get("sl_price")
         if sl is None:
             sl = entry * (1 - self.default_sl_pct) if side == PositionSide.LONG else entry * (1 + self.default_sl_pct)
-        if tp is None:
-            tp = entry * (1 + self.default_tp_pct) if side == PositionSide.LONG else entry * (1 - self.default_tp_pct)
+
         setup = {
             "entry_price": entry, "side": side, "playbook": Playbook.INTRADAY,
-            "sl_price": float(sl), "tp_price": float(tp),
+            "sl_price": float(sl),
         }
-        self.wallet.open_position(signal.symbol, setup, entry, custom_quantity=float(signal.quantity))
+        if meta.get("time_stop_hours") is not None:
+            setup["time_stop_hours"] = meta["time_stop_hours"]
+        # Prefer multi-level scale-out targets when the strategy supplied them.
+        tp_levels = meta.get("tp_levels")
+        if tp_levels:
+            setup["tp_levels"] = [
+                {"price": float(t["price"]), "pct": float(t.get("pct", 1.0)),
+                 "hit": False, "label": t.get("label", "TP")}
+                for t in tp_levels if t.get("price")
+            ]
+        else:
+            tp = meta.get("tp_price")
+            if tp is None:
+                tp = entry * (1 + self.default_tp_pct) if side == PositionSide.LONG else entry * (1 - self.default_tp_pct)
+            setup["tp_price"] = float(tp)
+
+        pos = self.wallet.open_position(signal.symbol, setup, entry, custom_quantity=float(signal.quantity))
+
+        if pos and self.event_bus is not None:
+            from ..events import TradeOpenedEvent
+            tp_for_event = setup.get("tp_price")
+            if tp_for_event is None and setup.get("tp_levels"):
+                tp_for_event = setup["tp_levels"][0]["price"]
+            self.event_bus.publish(TradeOpenedEvent(
+                symbol=signal.symbol, side=side.value,
+                leverage=int(getattr(self.wallet, "leverage", 1) or 1),
+                entry_price=float(pos.entry_price), stop_loss=float(sl),
+                take_profit=float(tp_for_event or 0),
+                margin=float(pos.margin_used), notional=float(pos.notional),
+                regime=str(meta.get("regime", "")),
+                tech_score=float(meta.get("tech_score", 0) or 0),
+                llm_decision=str(meta.get("llm_decision", "")),
+                funding=float(meta.get("funding_rate", 0) or 0),
+                oi_delta=float(meta.get("oi_delta", 0) or 0),
+                liquidation_price=float(getattr(pos, "liquidation_price", 0) or 0),
+            ))
 
 
 def build_risk_gate(risk_manager) -> Callable[["Signal"], bool]:

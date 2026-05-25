@@ -9,7 +9,15 @@ The system is decoupled using Redis Streams to separate strategy generation from
 1.  **Market Data:** High-fidelity Binance WebSocket (`@bookTicker`, `@markPrice`).
 2.  **Execution Engine:** CoinDCX REST execution with 1% Indian TDS accounting (F2).
 3.  **Persistence:** Event-sourced `EnhancedFuturesWallet` with Postgres Read-Model Projections.
-4.  **Messaging:** Redis Streams (`execution:signals`) for decoupling and idempotency.
+4.  **Messaging:** Redis Streams (`execution:signals`) for decoupled execution
+    with idempotency / DLQ / PEL recovery. **Opt-in** via `EXECUTION_BUS=redis`
+    + `REDIS_URL`. When enabled, `engine_ws` PUBLISHES entries and an
+    **in-process consumer thread shares the same wallet** (so `ws_pm` keeps
+    managing exits). When disabled (default), the engine uses the hardened
+    direct path (`wallet.open_position`). DO NOT run the standalone
+    `run_consumer` on the same stream+group while the in-process consumer is
+    active — a consumer group load-balances and would split entries across two
+    wallets.
 5.  **Dashboard:** FastAPI + SSE bridge powering a real-time SolidJS dashboard (Port 3030).
 
 ## 🛡️ Hard Safety Mandates

@@ -293,6 +293,50 @@ class LiveTradingSystem:
             except Exception as e:
                 logger.warning("post-reconnect reconcile failed: %s", e)
 
+    # ── decoupled execution bus (in-process, shared wallet) ─────────────────
+    def _start_inproc_execution_consumer(self):
+        """Wire the Redis execution bus in-process when enabled.
+
+        Returns a ``SignalPublisher`` the engine uses to emit entries, and spins
+        up a daemon consumer thread that drains ``execution:signals`` and
+        executes against ``self.wallet`` (the same wallet ws_pm manages exits
+        on). Returns ``None`` when the bus is disabled — the engine then uses the
+        hardened direct path.
+
+        NOTE: do NOT also run the standalone ``run_consumer`` process on the same
+        stream+group while this is active — a consumer group load-balances, so
+        entries would be split across two wallets. This in-process consumer is
+        the single owner when EXECUTION_BUS=redis.
+        """
+        if not self.cfg.redis_enabled:
+            return None
+        import threading
+        from .infra.redis_streams import RedisStreamBus
+        from .execution.signal_bus import (
+            SignalPublisher, SignalConsumer, WalletSignalAdapter, build_risk_gate,
+        )
+        bus = RedisStreamBus.from_url(self.cfg.redis_url)
+        bus.ensure_group(self.cfg.signal_stream, self.cfg.consumer_group)
+        adapter = WalletSignalAdapter(self.wallet, event_bus=self.bus)
+        consumer = SignalConsumer(
+            bus, {"paper": adapter, "live": adapter},
+            stream=self.cfg.signal_stream,
+            group=self.cfg.consumer_group,
+            consumer="engine-inproc",
+            max_deliveries=self.cfg.signal_max_deliveries,
+            idempotency_ttl_seconds=self.cfg.idempotency_ttl_seconds,
+            risk_gate=build_risk_gate(self.risk),
+        )
+        consumer.setup()
+        consumer.recover_pending()  # handle orphaned in-flight signals on boot
+        t = threading.Thread(target=consumer.run_forever, name="exec-consumer", daemon=True)
+        t.start()
+        self._exec_consumer = consumer
+        logger.warning(
+            "In-process execution consumer started (stream=%s group=%s) — do NOT run "
+            "a separate run_consumer on the same group.", self.cfg.signal_stream, self.cfg.consumer_group)
+        return SignalPublisher(bus, stream=self.cfg.signal_stream)
+
     # ── run ───────────────────────────────────────────────────────────────
     def start(self, signal_interval_seconds: int = 300, max_iterations: Optional[int] = None):
         logger.info("Starting LiveTradingSystem | %s", self.cfg.redacted())
@@ -342,6 +386,13 @@ class LiveTradingSystem:
                     prev(ev)
             self.wallet.event_hook = _sink
 
+        # Decoupled execution bus (opt-in via EXECUTION_BUS=redis + REDIS_URL):
+        # the engine PUBLISHES entry signals and an in-process consumer thread
+        # executes them against the SAME wallet — so idempotency / DLQ / PEL
+        # recovery / risk-gate apply to live entries while ws_pm keeps managing
+        # exits on the one wallet. When disabled, the hardened direct path runs.
+        signal_publisher = self._start_inproc_execution_consumer()
+
         from .engine_ws import WebSocketTradingEngine
         engine = WebSocketTradingEngine(
             symbol=self.cfg.symbol,
@@ -350,6 +401,7 @@ class LiveTradingSystem:
             event_bus=self.bus,
             use_llm=False if self.cfg.mode == TradingMode.PAPER else True,
             cfg=self.cfg,
+            signal_publisher=signal_publisher,
         )
         engine.risk_manager = self.risk  # share kill switch with reconciler
         # AUTO failover for the signal tick: Binance primary, CoinDCX fallback

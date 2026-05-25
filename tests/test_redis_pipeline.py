@@ -176,6 +176,64 @@ def test_recover_pending_processes_inflight():
     assert n == 1 and len(adapter.executed) == 1
 
 
+# ── WalletSignalAdapter fidelity (shared-wallet in-process path) ─────────────
+class _FakePos:
+    def __init__(self, entry):
+        self.entry_price = entry
+        self.margin_used = 50.0
+        self.notional = 100.0
+        self.liquidation_price = 80.0
+
+
+class _FakeWallet:
+    leverage = 2
+
+    def __init__(self):
+        self.opened = []
+
+    def open_position(self, symbol, setup, entry, custom_quantity=None):
+        self.opened.append((symbol, setup, entry, custom_quantity))
+        return _FakePos(setup["entry_price"])
+
+
+class _FakeBus:
+    def __init__(self):
+        self.events = []
+
+    def publish(self, ev):
+        self.events.append(ev)
+
+
+def test_adapter_preserves_tp_levels_and_emits_open_event():
+    from crypto_trader.execution.signal_bus import WalletSignalAdapter
+    from crypto_trader.events import TradeOpenedEvent
+
+    wallet, bus = _FakeWallet(), _FakeBus()
+    adapter = WalletSignalAdapter(wallet, event_bus=bus)
+    sig = _sig(metadata={
+        "sl_price": 95.0,
+        "tp_levels": [{"price": 110.0, "pct": 0.5, "label": "TP1"},
+                      {"price": 120.0, "pct": 0.5, "label": "TP2"}],
+        "regime": "TREND", "tech_score": 0.8,
+    })
+    adapter.execute(sig)
+
+    assert len(wallet.opened) == 1
+    _, setup, _, qty = wallet.opened[0]
+    assert setup["sl_price"] == 95.0
+    assert [t["price"] for t in setup["tp_levels"]] == [110.0, 120.0]  # scale-outs preserved
+    assert qty == 1.0
+    opened = [e for e in bus.events if isinstance(e, TradeOpenedEvent)]
+    assert len(opened) == 1 and opened[0].stop_loss == 95.0 and opened[0].take_profit == 110.0
+
+
+def test_adapter_rejects_zero_price():
+    from crypto_trader.execution.signal_bus import WalletSignalAdapter
+    adapter = WalletSignalAdapter(_FakeWallet())
+    with pytest.raises(ValueError):
+        adapter.execute(_sig(price=0.0, metadata={}))
+
+
 # ── Postgres projection reducer (pure, no DB) ─────────────────────────────────
 def _ev(t, **payload):
     return {"event_type": t, "ts": 1, "payload": payload}
