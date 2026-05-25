@@ -26,13 +26,18 @@ class RiskManager:
         max_daily_trades: int = 2,
         max_consecutive_losses: int = 2,
         max_drawdown_pct: float = 0.20,
+        max_daily_drawdown_pct: float = 0.05,
         cooldown_after_loss_minutes: int = 30,
+        max_correlated_positions: int = 2,
     ):
         self.max_daily = max_daily_trades
         self.max_consecutive = max_consecutive_losses
         self.max_drawdown_pct = max_drawdown_pct
+        self.max_daily_drawdown_pct = max_daily_drawdown_pct
         self.cooldown_after_loss_seconds = cooldown_after_loss_minutes * 60
+        self.max_correlated_positions = max_correlated_positions
         self.daily_count = 0
+        self.daily_pnl = 0.0
         self.last_trade_date: Optional[date] = None
         self.consecutive_losses = 0
         self.last_loss_time: Optional[float] = None
@@ -62,49 +67,79 @@ class RiskManager:
         self._save_state()
         logger.info("[KILL SWITCH] Cleared")
 
-    def can_trade(self, current_balance: Optional[float] = None) -> Tuple[bool, str]:
+    def can_trade(self, current_balance: Optional[float] = None, initial_daily_balance: Optional[float] = None) -> Tuple[bool, str]:
         if self.kill_switch:
             return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
 
         today = self._today()
         if self.last_trade_date != today:
             self.daily_count = 0
+            self.daily_pnl = 0.0
             self.last_trade_date = today
 
         if self.daily_count >= self.max_daily:
             return False, f"Daily trade limit reached ({self.max_daily})"
+        
+        # Kill switch: 5% daily drawdown
+        if initial_daily_balance and self.daily_pnl <= -initial_daily_balance * self.max_daily_drawdown_pct:
+            return False, f"Daily drawdown limit hit: {self.daily_pnl:.2f} ({self.max_daily_drawdown_pct*100:.1f}%)"
+
         if self.consecutive_losses >= self.max_consecutive:
             return False, f"Consecutive loss halt ({self.max_consecutive}) — manual reset required"
+        
         if self.last_loss_time:
             elapsed = time.time() - self.last_loss_time
             if elapsed < self.cooldown_after_loss_seconds:
                 remaining = int((self.cooldown_after_loss_seconds - elapsed) // 60) + 1
                 return False, f"Cooldown after loss active ({remaining}m remaining)"
+        
         if current_balance is not None and self.peak_balance and self.peak_balance > 0:
             cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
             peak = float(self.peak_balance) if isinstance(self.peak_balance, Decimal) else float(self.peak_balance)
             dd = (peak - cur) / peak
             if dd >= self.max_drawdown_pct:
                 return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
+        
+        return True, "OK"
+
+    def check_correlation(self, symbol: str, side: str, active_positions: dict) -> Tuple[bool, str]:
+        """Prevent taking too many positions in the same direction within correlated groups."""
+        correlated_groups = [
+            ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+            ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT"],
+        ]
+        
+        for group in correlated_groups:
+            if symbol in group:
+                same_direction_count = 0
+                for sym, pos in active_positions.items():
+                    if sym in group and pos.get("side") == side:
+                        same_direction_count += 1
+                
+                if same_direction_count >= self.max_correlated_positions:
+                    return False, f"Correlation block: {same_direction_count} {side} positions already active in {group}"
+        
         return True, "OK"
 
     def record_open(self):
         today = self._today()
         if self.last_trade_date != today:
             self.daily_count = 0
+            self.daily_pnl = 0.0
             self.last_trade_date = today
         self.daily_count += 1
         self._save_state()
 
     def record_close(self, net_pnl: float):
         """Record trade outcome. net_pnl is the FULL trade PnL (including partials)."""
+        self.daily_pnl += float(net_pnl)
         if net_pnl > 0:
             self.consecutive_losses = 0
-            logger.info(f"[RISK] Win recorded. Consecutive losses reset to 0.")
+            logger.info(f"[RISK] Win recorded. Consecutive losses reset to 0. Daily PnL: {self.daily_pnl:.2f}")
         else:
             self.consecutive_losses += 1
             self.last_loss_time = time.time()
-            logger.warning(f"[RISK] Loss recorded. Consecutive losses: {self.consecutive_losses}/{self.max_consecutive}")
+            logger.warning(f"[RISK] Loss recorded. Consecutive losses: {self.consecutive_losses}/{self.max_consecutive}. Daily PnL: {self.daily_pnl:.2f}")
         self._save_state()
 
     def update_peak_balance(self, current_balance: float):
@@ -125,6 +160,7 @@ class RiskManager:
     def _save_state(self):
         state = {
             "daily_count": self.daily_count,
+            "daily_pnl": self.daily_pnl,
             "last_trade_date": self.last_trade_date.isoformat() if self.last_trade_date else None,
             "consecutive_losses": self.consecutive_losses,
             "last_loss_time": self.last_loss_time,
@@ -142,6 +178,7 @@ class RiskManager:
             with open(self.state_file, "r") as f:
                 state = json.load(f)
             self.daily_count = state.get("daily_count", 0)
+            self.daily_pnl = state.get("daily_pnl", 0.0)
             d = state.get("last_trade_date")
             self.last_trade_date = date.fromisoformat(d) if d else None
             self.consecutive_losses = state.get("consecutive_losses", 0)

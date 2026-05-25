@@ -2,8 +2,10 @@ import argparse
 import time
 import threading
 import os
-from typing import List
+import sys
+from typing import List, Optional
 import logging
+import fcntl
 from dotenv import load_dotenv
 
 from crypto_trader.engine_ws import WebSocketTradingEngine
@@ -12,6 +14,9 @@ from crypto_trader.exchanges.coindcx_execution import CoinDCXExecutionEngine
 from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
+from crypto_trader.risk import RiskManager
+from crypto_trader.execution.reconciler import Reconciler
+from crypto_trader import safe_mode
 
 # Load environment variables for Telegram
 load_dotenv()
@@ -19,10 +24,27 @@ load_dotenv()
 configure_colored_logging()
 logger = logging.getLogger("multi_engine")
 
+def acquire_lock():
+    """Acquire a file lock to prevent multiple instances."""
+    lock_file = "/tmp/crypto_trader_multi_engine.lock"
+    lock_fd = open(lock_file, "w")
+    try:
+        fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Write PID to lock file
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        return lock_fd
+    except IOError:
+        print(f"\nERROR: Another instance of multi_engine is already running (check {lock_file}).")
+        print("Please stop the existing instance before starting a new one.")
+        sys.exit(1)
+
+from pathlib import Path
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
-    parser.add_argument("--symbols", type=str, required=True, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
-    parser.add_argument("--leverage", type=int, default=10, help="Leverage multiplier")
+    parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
+    parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier")
     parser.add_argument("--testnet", action="store_true", help="Use Binance Testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM advisor")
     parser.add_argument("--llm-host", type=str, default=None, help="Ollama host URL")
@@ -33,6 +55,98 @@ def parse_args():
     parser.add_argument("--log-llm", action="store_true", help="Log LLM prompts and raw responses")
     return parser.parse_args()
 
+def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
+    # 1. Command-line argument
+    if symbols_arg:
+        return [s.strip().upper() for s in symbols_arg.split(",") if s.strip()]
+
+    # 2. watchlist.yaml
+    yaml_path = Path("watchlist.yaml")
+    if yaml_path.exists():
+        try:
+            import yaml
+            with open(yaml_path, "r") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict) and "watchlist" in data:
+                    symbols = data["watchlist"]
+                elif isinstance(data, list):
+                    symbols = data
+                else:
+                    symbols = []
+                if symbols:
+                    return [str(s).strip().upper() for s in symbols if s]
+        except Exception as e:
+            logger.warning(f"Failed to read watchlist.yaml: {e}")
+
+    # 3. WATCHLIST env var from .env
+    watchlist_env = os.getenv("WATCHLIST")
+    if watchlist_env:
+        return [s.strip().upper() for s in watchlist_env.split(",") if s.strip()]
+
+    # 4. TRADE_SYMBOL env var from .env
+    trade_symbol = os.getenv("TRADE_SYMBOL")
+    if trade_symbol:
+        return [trade_symbol.strip().upper()]
+
+    return []
+
+def run_preflight_checks(symbols: List[str], wallet: EnhancedFuturesWallet, execution_engine: CoinDCXExecutionEngine, risk: RiskManager, bus) -> bool:
+    logger.info("Initializing pre-flight state reconciliation and gate checks...")
+    
+    # 1. Safe-mode gate check
+    if not safe_mode.is_live_enabled():
+        logger.critical(
+            f"LIVE TRADING BLOCKED — Safe-mode gate is closed. "
+            f"Ensure {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', and no active HALT file exists."
+        )
+        return False
+
+    # 2. Authentication and margin check
+    try:
+        margin_currency = os.getenv("COINDCX_MARGIN_CURRENCY", "USDT").upper()
+        avail = float(execution_engine.sync_balance())
+        conv = float(execution_engine.get_usdt_conversion()) or 1.0
+        usdt_equiv = avail / conv if margin_currency != "USDT" else avail
+        logger.info(f"[SELF-TEST] CoinDCX auth OK: available balance {avail} {margin_currency} (~{usdt_equiv:.2f} USDT)")
+    except Exception as e:
+        logger.critical(f"[SELF-TEST] CoinDCX authentication failed: {e}")
+        return False
+
+    # 3. Symbol specific checks (reconciliation & leverage caps)
+    for sym in symbols:
+        # Leverage limit check
+        try:
+            spec = execution_engine.mapper.get_spec(sym)
+            max_lev = int(os.getenv("MAX_LEVERAGE", "2"))
+            if max_lev > spec.max_leverage:
+                logger.critical(f"[SELF-TEST] {sym} leverage limit failed: configured {max_lev}x exceeds venue max {spec.max_leverage}x")
+                return False
+        except Exception as e:
+            logger.critical(f"[SELF-TEST] Failed to fetch instrument spec for {sym}: {e}")
+            return False
+
+        # State reconciliation
+        try:
+            reconciler = Reconciler(wallet, execution_engine, risk, bus=bus)
+            mismatches = reconciler.reconcile(sym)
+            unresolved = [m for m in mismatches if not m.repaired]
+            if reconciler.snapshot_failed:
+                logger.critical(f"[SELF-TEST] {sym} reconciliation failed: venue snapshot unavailable")
+                return False
+            if unresolved:
+                logger.critical(f"[SELF-TEST] {sym} has {len(unresolved)} unresolved reconciliation mismatch(es). Aborting startup.")
+                return False
+        except Exception as e:
+            logger.critical(f"[SELF-TEST] {sym} reconciliation crashed: {e}")
+            return False
+
+    if risk.kill_switch:
+        logger.critical(f"[SELF-TEST] Risk Manager kill switch is active: {risk.kill_switch_reason}. Aborting startup.")
+        return False
+
+    logger.info("All pre-flight checks and reconciliation passed. Ready for trading.")
+    return True
+
 def run_engine(engine: WebSocketTradingEngine):
     try:
         engine.run_loop()
@@ -42,17 +156,20 @@ def run_engine(engine: WebSocketTradingEngine):
         engine.stop()
 
 def main():
+    lock_fd = acquire_lock()
     args = parse_args()
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    
+    symbols = load_watchlist(args.symbols)
     if not symbols:
-        logger.error("No valid symbols provided.")
-        return
+        logger.error("No valid symbols found. Provide --symbols, a watchlist.yaml file, or WATCHLIST/TRADE_SYMBOL in .env.")
+        sys.exit(1)
 
     logger.info(f"Starting Multi-Engine for {len(symbols)} symbols: {', '.join(symbols)}")
     engines = []
     threads = []
     
     total_balance = 1000.0
+    global_risk = RiskManager()
     
     # Initialize CoinDCX live execution engine if live trading is enabled
     live_enabled = os.getenv("LIVE_TRADING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -83,6 +200,11 @@ def main():
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
 
+    # Run pre-flight checks and state reconciliation in live mode
+    if live_enabled and execution_engine is not None:
+        if not run_preflight_checks(symbols, global_wallet, execution_engine, global_risk, bus):
+            logger.critical("Multi-engine startup aborted due to pre-flight self-test or reconciliation failure.")
+            sys.exit(1)
     
     # Initialize Telegram Service if token is available
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -113,6 +235,7 @@ def main():
             log_llm=args.log_llm,
             event_bus=bus,
         )
+        engine.risk_manager = global_risk  # Share the global risk manager
         engines.append(engine)
         
         # Stagger startup to avoid Binance rate limits (max 5 connections per second)

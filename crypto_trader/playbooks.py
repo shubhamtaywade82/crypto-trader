@@ -373,3 +373,90 @@ class PlaybookB:
             "checks": f"{checks_passed}/{total_checks}",
             "reason": f"PlaybookB: 4H breakout + 1H retest | RSI(4H)={rsi_4h:.1f} | score={score:.2f} (smc={smc_bonus:.2f})",
         }
+
+
+# ── Playbook Ares: Mean Reversion ──
+
+class PlaybookAres:
+    """
+    Mean Reversion strategy using Bollinger Bands and RSI.
+    Timeframe: 15m.
+    Entry: Price touches/crosses band + RSI exhaustion.
+    R:R: 1:2.3.
+    """
+
+    def __init__(
+        self,
+        bb_period: int = 20,
+        bb_std: float = 2.0,
+        rsi_period: int = 14,
+        rsi_overbought: float = 70,
+        rsi_oversold: float = 30,
+        sl_pct: float = 0.015,
+        tp_pct: float = 0.0345,  # 1.5% * 2.3 = 3.45%
+        min_score: float = 0.60,
+    ):
+        self.bb_period = bb_period
+        self.bb_std = bb_std
+        self.rsi_period = rsi_period
+        self.rsi_overbought = rsi_overbought
+        self.rsi_oversold = rsi_oversold
+        self.sl_pct = sl_pct
+        self.tp_pct = tp_pct
+        self.min_score = min_score
+
+    def evaluate(self, df_15m: pd.DataFrame, adx_1h: Optional[float] = None) -> Optional[Dict]:
+        if len(df_15m) < self.bb_period + 5:
+            return None
+
+        # Trend filter: Mean reversion works best when ADX is low (< 25)
+        if adx_1h is not None and adx_1h > 25:
+            return None
+
+        df = df_15m.copy()
+        df["sma"] = df["close"].rolling(self.bb_period).mean()
+        df["std"] = df["close"].rolling(self.bb_period).std()
+        df["upper_band"] = df["sma"] + (df["std"] * self.bb_std)
+        df["lower_band"] = df["sma"] - (df["std"] * self.bb_std)
+        df["rsi"] = compute_rsi(df["close"], self.rsi_period)
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        price = latest["close"]
+
+        score = 0.0
+        direction = None
+
+        # LONG: Price touches/crosses lower band + RSI oversold
+        if latest["low"] <= latest["lower_band"] and latest["rsi"] < self.rsi_oversold:
+            if prev["close"] > prev["lower_band"]:  # Confirm crossing into/at band
+                direction = PositionSide.LONG
+                score = (self.rsi_oversold - latest["rsi"]) / self.rsi_oversold + 0.5
+        
+        # SHORT: Price touches/crosses upper band + RSI overbought
+        elif latest["high"] >= latest["upper_band"] and latest["rsi"] > self.rsi_overbought:
+            if prev["close"] < prev["upper_band"]:
+                direction = PositionSide.SHORT
+                score = (latest["rsi"] - self.rsi_overbought) / (100 - self.rsi_overbought) + 0.5
+
+        if not direction or score < self.min_score:
+            return None
+
+        # Stop and target calculations
+        if direction == PositionSide.LONG:
+            sl = price * (1 - self.sl_pct)
+            tp = price * (1 + self.tp_pct)
+        else:
+            sl = price * (1 + self.sl_pct)
+            tp = price * (1 - self.tp_pct)
+
+        return {
+            "playbook": Playbook.INTRADAY,  # Treating Ares as Intraday for wallet logic
+            "side": direction,
+            "entry_price": price,
+            "sl_price": sl,
+            "tp_price": tp,
+            "time_stop_hours": 24,
+            "score": round(min(score, 1.0), 3),
+            "reason": f"PlaybookAres: BB touch + RSI({latest['rsi']:.1f}) | score={score:.2f}",
+        }

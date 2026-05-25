@@ -528,13 +528,15 @@ class WebSocketPositionManager:
 
     def _check_intraday(self, pos, price: float, data: WSMarketData):
         from .wallet import PositionSide
-        # Simple TP/SL using mid price
+        # Simple TP/SL using mid price. SL uses the backup-only level when a venue
+        # stop rests (F1), so the venue stop is primary and we don't double-exit.
+        sl_level = self.wallet._software_sl_level(pos)
         if pos.side == PositionSide.LONG:
             if pos.tp_levels and price >= pos.tp_levels[0]["price"]:
                 reason = f"TP_HIT ({pos.unrealized_pnl:.2f})"
                 self._handle_close(price, reason)
                 return
-            if price <= pos.sl_price:
+            if price <= sl_level:
                 reason = f"SL_HIT ({pos.unrealized_pnl:.2f})"
                 self._handle_close(price, reason)
                 return
@@ -543,7 +545,7 @@ class WebSocketPositionManager:
                 reason = f"TP_HIT ({pos.unrealized_pnl:.2f})"
                 self._handle_close(price, reason)
                 return
-            if price >= pos.sl_price:
+            if price >= sl_level:
                 reason = f"SL_HIT ({pos.unrealized_pnl:.2f})"
                 self._handle_close(price, reason)
                 return
@@ -574,8 +576,8 @@ class WebSocketPositionManager:
                     self.wallet.activate_trailing_stop(self.symbol)
                 return
 
-        # SL check
-        sl_price = Decimal(str(pos.sl_price))
+        # SL check (backup-only level when a venue stop rests; F1)
+        sl_price = self.wallet._software_sl_level(pos)
         if pos.side == PositionSide.LONG and price_sl_tp <= sl_price:
             self._handle_close(price_sl_tp, f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
@@ -622,5 +624,6 @@ class WebSocketPositionManager:
                 pnl_percent=pnl_pct,
                 exit_price=f_price,
                 reason=reason,
-                duration_minutes=duration
+                duration_minutes=duration,
+                tds=float(getattr(closed_pos, "tds_paid", 0) or 0),
             ))

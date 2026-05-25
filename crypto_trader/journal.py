@@ -43,6 +43,7 @@ class TradeJournalEntry:
     oi_delta_at_entry: Optional[float] = None
     taker_ratio_at_entry: Optional[float] = None
     execution_slippage: Optional[float] = None
+    tds_paid: Optional[float] = None
 
 
 class TradeJournal:
@@ -114,6 +115,7 @@ class TradeJournal:
         realized_pnl: float,
         exit_reason: str,
         slippage: Optional[float] = None,
+        tds: Optional[float] = None,
     ):
         """Update the last entry for this trade_id with close data."""
         # In append-only, we write a close record referencing the open
@@ -125,6 +127,7 @@ class TradeJournal:
             "realized_pnl": realized_pnl,
             "exit_reason": exit_reason,
             "slippage": slippage,
+            "tds_paid": tds,
         }
         path = self._get_file()
         with open(path, "a") as f:

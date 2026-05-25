@@ -188,6 +188,7 @@ class PortfolioReducer:
                     "open_time": int(payload.get("open_time", 0)),
                     "tp_levels": tp_levels,
                     "trailing_active": bool(payload.get("trailing_active", False)),
+                    "protective_orders": {},
                 }
             return
 
@@ -247,6 +248,28 @@ class PortfolioReducer:
             state.realized_pnl_total -= amt
             return
 
+        if et == "TDS_CHARGED":
+            amt = Decimal(str(payload.get("amount", "0")))
+            state.wallet_balance -= amt
+            state.realized_pnl_total -= amt
+            return
+
+        if et == "PROTECTIVE_ORDERS_PLACED":
+            symbol = payload.get("symbol")
+            if symbol in state.open_positions:
+                orders = state.open_positions[symbol].setdefault("protective_orders", {})
+                for key in ("sl", "tp"):
+                    oid = payload.get(key)
+                    if oid:
+                        orders[key] = oid
+            return
+
+        if et == "PROTECTIVE_ORDERS_CANCELLED":
+            symbol = payload.get("symbol")
+            if symbol in state.open_positions:
+                state.open_positions[symbol]["protective_orders"] = {}
+            return
+
         if et == "INVARIANT_VIOLATION":
             state.violations.append(payload)
             return
@@ -278,6 +301,10 @@ class EnhancedPosition:
     close_reason: Optional[str] = None
     highest_price: Optional[Decimal] = None
     peak_pnl_pct: Decimal = Decimal("0")
+    # TDS deducted on the sell leg of this trade (F2).
+    tds_paid: Decimal = Decimal("0")
+    # Resting protective orders placed on the venue (F1): {"sl": id, "tp": id}.
+    protective_orders: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.highest_price is None:
@@ -342,13 +369,15 @@ class EnhancedPosition:
             "close_reason": self.close_reason,
             "highest_price": self.highest_price,
             "peak_pnl_pct": self.peak_pnl_pct,
+            "tds_paid": self.tds_paid,
+            "protective_orders": self.protective_orders,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "EnhancedPosition":
         data["side"] = PositionSide(data["side"])
         data["playbook"] = Playbook(data["playbook"])
-        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct"]:
+        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct", "tds_paid"]:
             if k in data and data[k] is not None:
                 data[k] = Decimal(str(data[k]))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
@@ -388,6 +417,14 @@ class EnhancedFuturesWallet:
         halt_on_critical: bool = False,
         halt_on_fatal: bool = True,
         max_snapshots: int = 10,
+        tds_enabled: bool = False,
+        tds_rate: float = 0.01,
+        paper_spread_coeff: Optional[float] = None,
+        paper_collar_pct: float = 0.10,
+        venue_sl_enabled: bool = True,
+        venue_tp_enabled: bool = False,
+        require_venue_sl: bool = False,
+        software_sl_backup_bps: int = 15,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -398,6 +435,17 @@ class EnhancedFuturesWallet:
         self.maker_fee_rate = self._to_decimal(maker_fee_rate)
         self.taker_fee_rate = self._to_decimal(taker_fee_rate)
         self.maintenance_margin_ratio = self._to_decimal(maintenance_margin_ratio)
+        # TDS (F2) — 1% on the sell leg for Indian residents.
+        self.tds_enabled = bool(tds_enabled)
+        self.tds_rate = self._to_decimal(tds_rate)
+        # Paper execution-degradation (F4).
+        self.paper_spread_coeff = self._to_decimal(paper_spread_coeff) if paper_spread_coeff is not None else None
+        self.paper_collar_pct = self._to_decimal(paper_collar_pct)
+        # Venue-resident protective stops (F1).
+        self.venue_sl_enabled = bool(venue_sl_enabled)
+        self.venue_tp_enabled = bool(venue_tp_enabled)
+        self.require_venue_sl = bool(require_venue_sl)
+        self.software_sl_backup_bps = int(software_sl_backup_bps)
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
         self.halt_on_invariant_violation = halt_on_invariant_violation
         self.event_hook = event_hook
@@ -543,6 +591,78 @@ class EnhancedFuturesWallet:
         fee = self._calculate_fee(price * quantity, is_taker=True)
         return {"price": price, "fee": fee, "order_id": order.id, "client_order_id": coid}
 
+    def _place_protective_orders(self, pos: EnhancedPosition) -> dict:
+        """Place resting SL (and optionally TP) on the venue (F1).
+
+        Opposite side, full remaining qty. CoinDCX nets the one-way position, so
+        an opposite-side stop acts as a reduce-only protective order. A placement
+        failure never unwinds the (already open) entry; if ``require_venue_sl`` is
+        set, an SL failure trips HALT — a naked position is the risk we eliminate.
+        """
+        if not (self.live_execution and self.execution_engine is not None and self.venue_sl_enabled):
+            return {}
+        exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+        placed: dict = {}
+        try:
+            sl_order = self.execution_engine.place_order(
+                pos.symbol, exit_side, pos.remaining_quantity, OrderType.STOP_MARKET,
+                trigger_price=pos.sl_price, reduce_only=True,
+            )
+            if sl_order and sl_order.id:
+                placed["sl"] = sl_order.id
+        except Exception as e:
+            logger.critical("[PROTECTIVE SL] venue stop placement failed for %s: %s", pos.symbol, e)
+            if self.require_venue_sl:
+                from . import safe_mode
+                safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
+        if self.venue_tp_enabled and pos.tp_levels:
+            try:
+                tp_price = self._to_decimal(pos.tp_levels[-1]["price"])
+                tp_order = self.execution_engine.place_order(
+                    pos.symbol, exit_side, pos.remaining_quantity, OrderType.TAKE_PROFIT,
+                    trigger_price=tp_price, reduce_only=True,
+                )
+                if tp_order and tp_order.id:
+                    placed["tp"] = tp_order.id
+            except Exception as e:
+                logger.warning("[PROTECTIVE TP] venue TP placement failed for %s: %s", pos.symbol, e)
+        if placed:
+            pos.protective_orders.update(placed)
+            self._emit_event("PROTECTIVE_ORDERS_PLACED", {"symbol": pos.symbol, **placed})
+        return placed
+
+    def _cancel_protective_orders(self, pos: EnhancedPosition) -> None:
+        """Cancel any resting venue protective orders for a position (F1)."""
+        if not (self.live_execution and self.execution_engine is not None):
+            return
+        ids = dict(pos.protective_orders)
+        if not ids:
+            return
+        for oid in ids.values():
+            if not oid:
+                continue
+            try:
+                self.execution_engine.cancel_order(oid)
+            except Exception as e:
+                logger.warning("[PROTECTIVE CANCEL] failed to cancel %s: %s", oid, e)
+        pos.protective_orders = {}
+        self._emit_event("PROTECTIVE_ORDERS_CANCELLED", {"symbol": pos.symbol})
+
+    def _software_sl_level(self, pos: EnhancedPosition) -> Decimal:
+        """SL price the software monitor should act on (F1).
+
+        When a venue SL rests, the software net is a backup: it only fires
+        ``software_sl_backup_bps`` beyond the real SL so the venue stop is primary
+        and the two paths don't double-exit on a normal SL touch.
+        """
+        sl = self._to_decimal(pos.sl_price)
+        if self.live_execution and pos.protective_orders.get("sl"):
+            buf = self._to_decimal(self.software_sl_backup_bps) / Decimal("10000")
+            if pos.side == PositionSide.LONG:
+                return sl * (Decimal("1") - buf)
+            return sl * (Decimal("1") + buf)
+        return sl
+
     def open_position(
         self,
         symbol: str,
@@ -600,6 +720,17 @@ class EnhancedFuturesWallet:
                 self._record_fill(order, qty, execution_price, fee_open, sequence=1)
             else:
                 execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
+                # F4: CoinDCX 10% market-order collar — reject paper fills that
+                # deviate too far from the intended price (replicates the venue).
+                if self.paper_collar_pct > 0 and entry > Decimal("0"):
+                    deviation = abs(execution_price - entry) / entry
+                    if deviation > self.paper_collar_pct:
+                        logger.warning(
+                            f"[PAPER COLLAR] {symbol} fill {execution_price:.4f} deviates "
+                            f"{deviation:.1%} from intended {entry:.4f} (> {self.paper_collar_pct:.0%}); REJECTED"
+                        )
+                        self._emit_event("ORDER_REJECTED", {"order_id": order.id, "symbol": symbol, "reason": "PAPER_COLLAR"})
+                        return None
                 fill_chunks = int(setup.get("fill_chunks", 1))
                 fee_open = self._execute_order_in_chunks(
                     order=order,
@@ -626,6 +757,11 @@ class EnhancedFuturesWallet:
             )
             pos.update_pnl(mark_price)
             self._emit_event("FEE_CHARGED", {"amount": fee_open, "reason": "OPEN_FEE", "symbol": symbol})
+            # F2: TDS on the SELL leg — for a SHORT, the sell happens at open.
+            tds_open = self._calculate_tds(side == PositionSide.SHORT, execution_price * qty)
+            if tds_open > Decimal("0"):
+                pos.tds_paid += tds_open
+                self._emit_event("TDS_CHARGED", {"amount": tds_open, "reason": "OPEN_TDS", "symbol": symbol})
             self.positions[symbol] = pos
             self._sync_unrealized_total()
 
@@ -651,6 +787,8 @@ class EnhancedFuturesWallet:
                     "tp_levels": tp_levels,
                 },
             )
+            # F1: rest a protective SL (+optional TP) on the venue (live only).
+            self._place_protective_orders(pos)
             self._save_state()
             return pos
 
@@ -664,6 +802,11 @@ class EnhancedFuturesWallet:
             pos = self.get_open_position(symbol)
             if not pos:
                 return Decimal("0")
+
+            # F1: the resting venue stop is sized to the full position; drop it
+            # before partially netting so it can't over-sell, then re-place below.
+            had_protective = bool(pos.protective_orders)
+            self._cancel_protective_orders(pos)
 
             qty_to_close = pos.remaining_quantity * self._to_decimal(pct)
             if external_fill is None and self.live_execution and self.execution_engine is not None and qty_to_close > Decimal("0"):
@@ -700,6 +843,12 @@ class EnhancedFuturesWallet:
             )
             pos.partial_realized_pnl += (pnl_slice - fee_close)
 
+            # F2: TDS on the SELL leg — for a LONG, each partial close is a sell.
+            tds_slice = self._calculate_tds(pos.side == PositionSide.LONG, execution_price * qty_to_close)
+            if tds_slice > Decimal("0"):
+                pos.tds_paid += tds_slice
+                self._emit_event("TDS_CHARGED", {"amount": tds_slice, "reason": "PARTIAL_TDS", "symbol": symbol})
+
             logger.info(
                 f"[PARTIAL CLOSE] {symbol} {pos.side.value} | Closed {pct*100:.0f}% | "
                 f"Qty={qty_to_close:.4f} | PnL={pnl_slice:.2f} | Reason={reason}"
@@ -707,6 +856,10 @@ class EnhancedFuturesWallet:
 
             if pos.remaining_quantity <= Decimal("0.0001"):
                 return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
+
+            # F1: restore a resting stop sized to the reduced position.
+            if had_protective:
+                self._place_protective_orders(pos)
 
             self._save_state()
             return pnl_slice
@@ -722,6 +875,10 @@ class EnhancedFuturesWallet:
             pos = self.get_open_position(symbol)
             if not pos:
                 return None
+
+            # F1: drop any resting venue protective orders before the exit fill so
+            # they can't fire against a flat position after we net out.
+            self._cancel_protective_orders(pos)
 
             if external_fill is None and self.live_execution and self.execution_engine is not None:
                 exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
@@ -748,6 +905,12 @@ class EnhancedFuturesWallet:
                 },
             )
 
+            # F2: TDS on the SELL leg — for a LONG, the sell happens at close.
+            tds_close = self._calculate_tds(pos.side == PositionSide.LONG, execution_price * pos.remaining_quantity)
+            if tds_close > Decimal("0"):
+                pos.tds_paid += tds_close
+                self._emit_event("TDS_CHARGED", {"amount": tds_close, "reason": "CLOSE_TDS", "symbol": symbol})
+
             pos.unrealized_pnl = Decimal("0")
             pos.status = "CLOSED"
             pos.close_time = self._now_ms()
@@ -768,6 +931,7 @@ class EnhancedFuturesWallet:
         pos = self.get_open_position(symbol)
         if not pos:
             return
+        self._cancel_protective_orders(pos)
         pos.update_pnl(mark_price)
         self._emit_event(
             "LIQUIDATION",
@@ -901,11 +1065,12 @@ class EnhancedFuturesWallet:
                 self.close_position(symbol, mark_price, reason=f"TP_HIT ({pos.unrealized_pnl:.2f})")
                 return
 
-        # SL check
-        if pos.side == PositionSide.LONG and mark_price <= pos.sl_price:
+        # SL check (backup-only level when a venue stop rests; F1)
+        sl_level = self._software_sl_level(pos)
+        if pos.side == PositionSide.LONG and mark_price <= sl_level:
             self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
-        elif pos.side == PositionSide.SHORT and mark_price >= pos.sl_price:
+        elif pos.side == PositionSide.SHORT and mark_price >= sl_level:
             self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
 
@@ -933,11 +1098,12 @@ class EnhancedFuturesWallet:
                     self.activate_trailing_stop(symbol)
                 return  # Only one TP per tick
 
-        # SL check
-        if pos.side == PositionSide.LONG and mark_price <= pos.sl_price:
+        # SL check (backup-only level when a venue stop rests; F1)
+        sl_level = self._software_sl_level(pos)
+        if pos.side == PositionSide.LONG and mark_price <= sl_level:
             self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
-        elif pos.side == PositionSide.SHORT and mark_price >= pos.sl_price:
+        elif pos.side == PositionSide.SHORT and mark_price >= sl_level:
             self.close_position(symbol, mark_price, reason=f"SL_HIT ({pos.unrealized_pnl:.2f})")
             return
 
@@ -1351,6 +1517,7 @@ class EnhancedFuturesWallet:
                 existing.sl_price = pdata.get("sl_price", existing.sl_price)
                 existing.trailing_active = bool(pdata.get("trailing_active", existing.trailing_active))
                 existing.tp_levels = pdata.get("tp_levels", existing.tp_levels)
+                existing.protective_orders = pdata.get("protective_orders", existing.protective_orders)
                 existing.notional = existing.remaining_quantity * existing.entry_price
                 existing.margin_used = existing.notional / existing.leverage
                 current[symbol] = existing
@@ -1390,6 +1557,7 @@ class EnhancedFuturesWallet:
                     time_stop_hours=int(pdata.get("time_stop_hours", 18)),
                     highest_price=self._to_decimal(pdata.get("highest_price", entry)),
                     peak_pnl_pct=self._to_decimal(pdata.get("peak_pnl_pct", Decimal("0"))),
+                    protective_orders=dict(pdata.get("protective_orders", {})),
                 )
         self.positions = current
 
@@ -2307,11 +2475,25 @@ class EnhancedFuturesWallet:
         rate = self.taker_fee_rate if is_taker else self.maker_fee_rate
         return abs(notional) * rate
 
+    def _calculate_tds(self, is_sell_leg: bool, gross_value: Decimal) -> Decimal:
+        """TDS is deducted only on the SELL leg of a trade (F2).
+
+        LONG: the sell happens at close. SHORT: the sell happens at open.
+        Returns the deductible amount (0 when disabled or not a sell leg).
+        """
+        if not self.tds_enabled or not is_sell_leg:
+            return Decimal("0")
+        return abs(self._to_decimal(gross_value)) * self.tds_rate
+
     def _execution_price(self, mark_price: Decimal, side: PositionSide, is_entry: bool, setup: Optional[dict] = None) -> Decimal:
         setup = setup or {}
-        spread_bps = self._to_decimal(setup.get("spread_bps", 2.0))
-        slippage_bps = self._to_decimal(setup.get("slippage_bps", 3.0))
-        bump = (spread_bps + slippage_bps) / Decimal("10000")
+        if self.paper_spread_coeff is not None:
+            # F4: model CoinDCX's wider spread per side instead of the small fixed bump.
+            bump = self.paper_spread_coeff
+        else:
+            spread_bps = self._to_decimal(setup.get("spread_bps", 2.0))
+            slippage_bps = self._to_decimal(setup.get("slippage_bps", 3.0))
+            bump = (spread_bps + slippage_bps) / Decimal("10000")
         if is_entry:
             return mark_price * (1 + bump) if side == PositionSide.LONG else mark_price * (1 - bump)
         return mark_price * (1 - bump) if side == PositionSide.LONG else mark_price * (1 + bump)

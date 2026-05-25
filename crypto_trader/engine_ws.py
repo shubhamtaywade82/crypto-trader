@@ -26,7 +26,7 @@ from .data_feed import BinanceDataFeed
 from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
-from .playbooks import PlaybookA, PlaybookB
+from .playbooks import PlaybookA, PlaybookB, PlaybookAres
 from .regime import MarketRegimeAnalyzer, compute_ema
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD
 from .journal import TradeJournal
@@ -35,7 +35,7 @@ from .structure import MarketStructureAnalyzer
 logger = logging.getLogger("crypto_trader.engine_ws")
 
 DEFAULT_SYMBOL = "SOLUSDT"
-LEVERAGE = 10
+LEVERAGE = 5
 FUNDING_EXTREME = 0.0005
 
 
@@ -63,10 +63,15 @@ class WebSocketTradingEngine:
         log_llm: bool = False,
         wallet = None,
         event_bus = None,
+        cfg = None,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
         self.event_bus = event_bus
+        self.cfg = cfg
+        # CoinDCX market data for the cross-venue basis guard (F3). Public, no
+        # creds; built lazily so paper/tests without network stay light.
+        self._coindcx_md = None
 
         rest_logged = log_responses or log_rest
         ws_logged = log_responses or log_ws
@@ -107,6 +112,7 @@ class WebSocketTradingEngine:
         self.regime_analyzer = MarketRegimeAnalyzer()
         self.playbook_a = PlaybookA()
         self.playbook_b = PlaybookB()
+        self.playbook_ares = PlaybookAres()
 
         # Journal
         self.journal = TradeJournal()
@@ -157,8 +163,14 @@ class WebSocketTradingEngine:
 
         # Command Listeners
         if self.event_bus:
-            from .events import CommandEvent
+            from .events import CommandEvent, TradeClosedEvent
             self.event_bus.subscribe(CommandEvent, self._handle_command)
+            self.event_bus.subscribe(TradeClosedEvent, self._on_trade_closed)
+
+    def _on_trade_closed(self, event):
+        """Update risk manager when a trade is closed."""
+        if event.symbol == self.symbol:
+            self.risk_manager.record_close(event.realized_pnl)
 
     def _handle_command(self, event):
         """Handle incoming commands from EventBus (e.g., Telegram)."""
@@ -298,7 +310,12 @@ class WebSocketTradingEngine:
 
         # 4. Risk check
         self.risk_manager.update_peak_balance(self.wallet.margin_balance)
-        can_trade, risk_reason = self.risk_manager.can_trade(current_balance=self.wallet.margin_balance)
+        # Assuming initial balance for daily drawdown is the wallet balance minus daily PnL
+        initial_daily_balance = float(self.wallet.wallet_balance) - self.risk_manager.daily_pnl
+        can_trade, risk_reason = self.risk_manager.can_trade(
+            current_balance=self.wallet.margin_balance,
+            initial_daily_balance=initial_daily_balance
+        )
         if not can_trade:
             if not getattr(self, "_halt_published", False):
                 if self.event_bus:
@@ -335,29 +352,44 @@ class WebSocketTradingEngine:
 
         # 5. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:
-            self._evaluate_entry(df_1h, df_4h, regime, regime_score, mark_price,
-                                funding_rate, oi_delta, taker_ratio, structure=structure)
+            # Get latest ADX for Ares playbook filter
+            latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
+            self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                                funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
 
         # 6. Print summary
         self.wallet.print_summary()
 
-    def _evaluate_entry(self, df_1h, df_4h, regime, regime_score, mark_price,
-                        funding_rate, oi_delta, taker_ratio, structure=None):
+    def _evaluate_entry(self, df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                        funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None):
         """Evaluate entry signals and execute via WebSocket LTP."""
         setup = None
 
-        # Try Playbook A
-        setup = self.playbook_a.evaluate(df_1h, regime, structure=structure)
+        # 1. Try Playbook Ares (Mean Reversion)
+        setup = self.playbook_ares.evaluate(df_15m, adx_1h=adx_1h)
         if setup:
-            logger.info(f"[PLAYBOOK A] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+            logger.info(f"[PLAYBOOK ARES] Signal: {setup['side'].value} | score={setup['score']:.2f}")
 
-        # Try Playbook B
+        # 2. Try Playbook A
+        if not setup:
+            setup = self.playbook_a.evaluate(df_1h, regime, structure=structure)
+            if setup:
+                logger.info(f"[PLAYBOOK A] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+
+        # 3. Try Playbook B
         if not setup:
             setup = self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure)
             if setup:
                 logger.info(f"[PLAYBOOK B] Signal: {setup['side'].value} | score={setup['score']:.2f}")
 
         if not setup:
+            return
+
+        # Correlation check
+        active_positions = {s: p.to_dict() for s, p in self.wallet.positions.items() if p.status == "OPEN"}
+        allowed, corr_reason = self.risk_manager.check_correlation(self.symbol, setup["side"].value, active_positions)
+        if not allowed:
+            logger.info(f"[BLOCKED] {corr_reason}")
             return
 
         # LLM Fusion
@@ -396,6 +428,45 @@ class WebSocketTradingEngine:
                            mark_price, funding_rate, oi_delta, taker_ratio,
                            tech_score, regime, regime_score, advice, dynamic_threshold)
 
+    def _coindcx_market_data(self):
+        if self._coindcx_md is None:
+            from .exchanges.coindcx_market_data import CoinDCXMarketData
+            self._coindcx_md = CoinDCXMarketData()
+        return self._coindcx_md
+
+    def _basis_guard(self, side, binance_mark: float):
+        """Cross-venue basis guard (F3).
+
+        Signals fire on Binance price but fills happen on CoinDCX. Reject the
+        entry when the venues diverge beyond the configured threshold. Returns
+        ``(allowed, basis)``. If CoinDCX data is unavailable, skip the guard
+        (don't block trading on a missing fallback feed).
+        """
+        cfg = self.cfg
+        if cfg is None or not getattr(cfg, "basis_guard_enabled", False) or binance_mark <= 0:
+            return True, 0.0
+        try:
+            cdcx_mark = self._coindcx_market_data().get_mark_price(self.symbol)
+        except Exception as e:
+            logger.warning("[BASIS] CoinDCX mark unavailable (%s); skipping guard", e)
+            return True, 0.0
+        if cdcx_mark <= 0:
+            return True, 0.0
+        basis = (cdcx_mark - binance_mark) / binance_mark
+        if abs(basis) > cfg.max_cross_venue_basis:
+            logger.warning(
+                f"[BASIS BLOCKED] {self.symbol} basis {basis:+.4%} exceeds "
+                f"{cfg.max_cross_venue_basis:.2%} (binance={binance_mark:.4f} coindcx={cdcx_mark:.4f})"
+            )
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(
+                    symbol=self.symbol,
+                    reason=f"cross-venue basis {basis:+.4%} > {cfg.max_cross_venue_basis:.2%}",
+                ))
+            return False, basis
+        return True, basis
+
     def _execute_entry(self, setup, final_score, llm_weight, explanation,
                       mark_price, funding_rate, oi_delta, taker_ratio,
                       tech_score, regime, regime_score, advice, dynamic_threshold):
@@ -415,8 +486,18 @@ class WebSocketTradingEngine:
         if spread_pct > 0.1:
             logger.warning(f"[ENTRY] Wide spread: {spread_pct:.3f}% | bid={self.ws_feed.data.best_bid:.2f} ask={self.ws_feed.data.best_ask:.2f}")
 
-        # Adjust entry price to use mid price (fairer than LTP which can be stale)
+        # F3: cross-venue basis guard — reject if Binance and CoinDCX diverge.
+        allowed, _basis = self._basis_guard(setup["side"], mid if mid > 0 else mark_price)
+        if not allowed:
+            return
+
+        # Adjust entry price to use mid price (fairer than LTP which can be stale).
+        # F3: nudge the trigger toward the fill venue by the basis buffer so risk
+        # sizing reflects the price we'll actually fill on at CoinDCX.
         entry_price = mid
+        buf = self.cfg.entry_basis_buffer if (self.cfg and getattr(self.cfg, "basis_guard_enabled", False)) else 0.0
+        if buf:
+            entry_price = mid * (1 + buf) if setup["side"] == PositionSide.LONG else mid * (1 - buf)
 
         # Recalculate SL/TP based on actual entry price
         if setup["side"] == PositionSide.LONG:
@@ -438,9 +519,9 @@ class WebSocketTradingEngine:
                 else:
                     tp_level["price"] = entry_price * (1 - 0.010 if tp_level["label"] == "TP1" else 0.020)
 
-        # Risk-based sizing from stop distance.
+        # Risk-based sizing from stop distance (2% risk per trade)
         stop_distance = abs(entry_price - setup["sl_price"])
-        risk_budget = self.wallet.margin_balance * Decimal("0.01")
+        risk_budget = self.wallet.margin_balance * Decimal("0.02")
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
         risk_budget *= Decimal(str(size_multiplier))
         stop_distance_dec = Decimal(str(stop_distance))

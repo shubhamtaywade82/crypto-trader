@@ -52,11 +52,22 @@ class LiveTradingSystem:
         self.execution_engine = None
         self.router = None
         self.reconciler = None
+        self.user_stream = None
 
         self.wallet = EnhancedFuturesWallet(
             symbol=self.cfg.symbol,
             initial_balance=self.cfg.initial_balance,
             leverage=self.cfg.max_leverage,
+            tds_enabled=self.cfg.tds_enabled,
+            tds_rate=self.cfg.tds_rate,
+            # Paper degradation only applies to simulated fills.
+            paper_spread_coeff=(self.cfg.paper_cdcx_spread_coeff
+                                if self.cfg.mode == TradingMode.PAPER else None),
+            paper_collar_pct=self.cfg.paper_collar_pct,
+            venue_sl_enabled=self.cfg.venue_sl_enabled,
+            venue_tp_enabled=self.cfg.venue_tp_enabled,
+            require_venue_sl=self.cfg.require_venue_sl,
+            software_sl_backup_bps=self.cfg.software_sl_backup_bps,
         )
 
     # ── construction ──────────────────────────────────────────────────────
@@ -196,6 +207,51 @@ class LiveTradingSystem:
             )
         return passed, checks
 
+    # ── CoinDCX private/user stream (F5, optional) ──────────────────────────
+    def _maybe_start_user_stream(self):
+        if not self.cfg.coindcx_user_stream_enabled:
+            return
+        from .exchanges.coindcx_user_stream import CoinDCXUserStream
+        self.user_stream = CoinDCXUserStream(
+            api_key=self.cfg.coindcx_api_key,
+            api_secret=self.cfg.coindcx_api_secret,
+            bus=self.bus,
+            url=self.cfg.coindcx_stream_url,
+            channel=self.cfg.coindcx_stream_channel,
+            on_fill=self._on_stream_fill,
+            on_reconnect=self._safe_reconcile,
+        )
+        started = self.user_stream.start()
+        logger.info("CoinDCX user stream: %s", "started" if started else "unavailable (REST fallback)")
+
+    def _on_stream_fill(self, fill: dict):
+        """Book an exit instantly when a resting venue protective order fills.
+
+        Only acts on fills that match a tracked protective order id; entries are
+        already booked at placement time. ``close_position`` is idempotent, so a
+        later REST reconcile that sees the same exit is a no-op.
+        """
+        sym = fill.get("symbol")
+        oid = str(fill.get("exchange_order_id") or "")
+        if not sym or not oid:
+            return
+        pos = self.wallet.get_open_position(sym)
+        if not pos:
+            return
+        protective_ids = {str(v) for v in (pos.protective_orders or {}).values() if v}
+        if oid in protective_ids:
+            self.wallet.apply_external_fill(
+                sym, pos.side, fill.get("fill_price", 0), fill.get("fill_quantity", 0),
+                order_id=oid, reduce_only=True,
+            )
+
+    def _safe_reconcile(self):
+        if self.reconciler is not None:
+            try:
+                self.reconciler.reconcile(self.cfg.symbol)
+            except Exception as e:
+                logger.warning("post-reconnect reconcile failed: %s", e)
+
     # ── run ───────────────────────────────────────────────────────────────
     def start(self, signal_interval_seconds: int = 300, max_iterations: Optional[int] = None):
         logger.info("Starting LiveTradingSystem | %s", self.cfg.redacted())
@@ -203,6 +259,7 @@ class LiveTradingSystem:
 
         if self.cfg.is_live:
             self.wallet.attach_execution_engine(self.execution_engine, live=True)
+            self._maybe_start_user_stream()
         if self.event_store is not None:
             prev = self.wallet.event_hook
             def _sink(ev):
@@ -221,6 +278,7 @@ class LiveTradingSystem:
             wallet=self.wallet,
             event_bus=self.bus,
             use_llm=False if self.cfg.mode == TradingMode.PAPER else True,
+            cfg=self.cfg,
         )
         engine.risk_manager = self.risk  # share kill switch with reconciler
         # AUTO failover for the signal tick: Binance primary, CoinDCX fallback
