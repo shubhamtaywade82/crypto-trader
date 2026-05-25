@@ -81,3 +81,28 @@ def test_start_without_socketio_returns_false(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     s = _stream()
     assert s.start() is False
+
+
+def test_balance_update_parses_list_correctly():
+    balances = []
+    s = CoinDCXUserStream(
+        api_key="k", api_secret="secret123",
+        on_balance=lambda b: balances.append(b)
+    )
+    
+    # Payload matches the CoinDCX community balance update response shape
+    payload = [
+       {
+          "id":"026ef0f2-b5d8-11ee-b182-570ad79469a2",
+          "balance":"1.0221449",
+          "locked_balance":"0.99478995",
+          "currency_id":"c19c38d1-3ebb-47ab-9207-62d043be7447",
+          "currency_short_name":"USDT"
+       }
+    ]
+    
+    s._on_balance_update(payload)
+    
+    assert len(balances) == 1
+    assert balances[0]["currency_short_name"] == "USDT"
+    assert float(balances[0]["balance"]) == 1.0221449

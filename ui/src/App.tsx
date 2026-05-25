@@ -89,6 +89,7 @@ function App() {
   const [pnl, setPnl] = createSignal<Pnl>({ mode: "paper", fills: 0, total_fees: 0, total_qty: 0, realized_pnl: 0 });
   const [events, setEvents] = createSignal<any[]>([]);
   const [health, setHealth] = createSignal<Health | null>(null);
+  const [accountBalance, setAccountBalance] = createSignal<number>(1000.0);
 
   // Active terminal context
   const [selectedSymbol, setSelectedSymbol] = createSignal<string>("BTCUSDT");
@@ -188,39 +189,8 @@ function App() {
         setOrderPrice(lastCandle.close.toString());
       }
     } catch (e) {
-      console.warn("[Chart] Fetching binance klines failed, generating simulated data:", e);
-      // Fallback: Generate simulated candles
-      const activeItem = watchlist().find(w => w.symbol === sym);
-      const basePrice = activeItem ? activeItem.price : 100;
-      
-      let price = basePrice * 0.95;
-      let time = Date.now() - 80 * 5 * 60 * 1000;
-      const parsed: Candle[] = [];
-      
-      for (let i = 0; i < 80; i++) {
-        const open = price;
-        const change = (Math.random() - 0.495) * (price * 0.006);
-        const close = price + change;
-        const high = Math.max(open, close) + Math.random() * (price * 0.003);
-        const low = Math.min(open, close) - Math.random() * (price * 0.003);
-        const volume = Math.random() * 450 + 50;
-        
-        parsed.push({ time, open, high, low, close, volume });
-        price = close;
-        time += 5 * 60 * 1000;
-      }
-
-      // Calculate SMA 20
-      for (let i = 0; i < parsed.length; i++) {
-        if (i >= 19) {
-          const sum = parsed.slice(i - 19, i + 1).reduce((acc, c) => acc + c.close, 0);
-          parsed[i].ma = sum / 20;
-        }
-      }
-      setChartData(parsed);
-      if (orderPrice() === "") {
-        setOrderPrice(basePrice.toString());
-      }
+      console.warn("[Chart] Fetching binance klines failed:", e);
+      setChartData([]);
     }
   };
 
@@ -261,14 +231,13 @@ function App() {
             last.close = newPrice;
             if (newPrice > last.high) last.high = newPrice;
             if (newPrice < last.low) last.low = newPrice;
-            last.volume += Math.random() * 5;
             
             updated[updated.length - 1] = last;
             return updated;
           });
 
-          // Re-render order book
-          updateOrderBook(newPrice);
+          // Fetch actual live order book
+          fetchLiveOrderBook(activeSym);
         }
 
         return {
@@ -285,32 +254,61 @@ function App() {
     }
   };
 
-  // Generate real-time Order Book and tick feeds
-  const updateOrderBook = (midPrice: number) => {
-    const spreadPercent = 0.0003;
-    const stepPercent = 0.0002;
-    const decimalPlaces = midPrice > 10 ? 2 : 4;
-    
-    const bidList = [];
-    const askList = [];
-    
-    let bidAccum = 0;
-    let askAccum = 0;
+  const fetchWatchlistSparklines = async () => {
+    const symbols = watchlist().map(w => w.symbol);
+    try {
+      const results = await Promise.all(
+        symbols.map(sym => 
+          fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=1h&limit=10`)
+            .then(r => {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(data => data.map((k: any) => Number(k[4])))
+            .catch(() => [])
+        )
+      );
 
-    for (let i = 1; i <= 8; i++) {
-      const bidPrice = Number((midPrice * (1 - spreadPercent - (i - 1) * stepPercent)).toFixed(decimalPlaces));
-      const bidQty = Number((Math.random() * 2.5 + 0.1).toFixed(3));
-      bidAccum += bidQty;
-      bidList.push({ price: bidPrice, qty: bidQty, total: Number(bidAccum.toFixed(3)) });
-
-      const askPrice = Number((midPrice * (1 + spreadPercent + (i - 1) * stepPercent)).toFixed(decimalPlaces));
-      const askQty = Number((Math.random() * 2.5 + 0.1).toFixed(3));
-      askAccum += askQty;
-      askList.push({ price: askPrice, qty: askQty, total: Number(askAccum.toFixed(3)) });
+      setWatchlist(prev => prev.map((w, idx) => {
+        const spark = results[idx];
+        return {
+          ...w,
+          sparkline: spark && spark.length > 0 ? spark : w.sparkline
+        };
+      }));
+    } catch (e) {
+      console.warn("Failed to fetch watchlist sparklines from Binance:", e);
     }
+  };
 
-    setBids(bidList);
-    setAsks(askList.reverse()); // Asks shown from highest price on top to lowest at spread
+  // Fetch real-time Order Book depth from Binance
+  const fetchLiveOrderBook = async (sym: string) => {
+    try {
+      const response = await fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${sym}&limit=10`);
+      if (!response.ok) throw new Error();
+      const data = await response.json();
+      
+      let bidAccum = 0;
+      const parsedBids = data.bids.slice(0, 8).map((b: any) => {
+        const price = Number(b[0]);
+        const qty = Number(b[1]);
+        bidAccum += qty;
+        return { price, qty, total: Number(bidAccum.toFixed(3)) };
+      });
+
+      let askAccum = 0;
+      const parsedAsks = data.asks.slice(0, 8).map((a: any) => {
+        const price = Number(a[0]);
+        const qty = Number(a[1]);
+        askAccum += qty;
+        return { price, qty, total: Number(askAccum.toFixed(3)) };
+      });
+
+      setBids(parsedBids);
+      setAsks(parsedAsks.reverse()); // Asks shown highest to lowest at spread
+    } catch (e) {
+      console.warn("Failed to fetch live order book from Binance:", e);
+    }
   };
 
   // ── http fetchers for synchronization ──────────────────────────────────────
@@ -318,12 +316,13 @@ function App() {
     const m = mode();
     console.log(`[Dashboard] Re-syncing state for mode: ${m}`);
     try {
-      const [positionsRes, ordersRes, fillsRes, pnlRes, healthRes, venueRes] = await Promise.all([
+      const [positionsRes, ordersRes, fillsRes, pnlRes, healthRes, accountRes, venueRes] = await Promise.all([
         fetch(getUrl(`/positions?mode=${m}`)).then(r => r.json() as Promise<Position[]>),
         fetch(getUrl(`/orders?mode=${m}&limit=25`)).then(r => r.json() as Promise<Order[]>),
         fetch(getUrl(`/fills?mode=${m}&limit=25`)).then(r => r.json() as Promise<Fill[]>),
         fetch(getUrl(`/pnl?mode=${m}`)).then(r => r.json() as Promise<Record<string, Pnl> | Pnl>),
         fetch(getUrl("/health")).then(r => r.json() as Promise<Health>),
+        fetch(getUrl(`/account?mode=${m}`)).then(r => r.json() as Promise<any>),
         m === "live"
           ? fetch(getUrl("/venue/account")).then(r => r.json() as Promise<any>).catch(() => null)
           : Promise.resolve(null)
@@ -398,6 +397,10 @@ function App() {
 
       setHealth(healthRes);
 
+      if (accountRes && accountRes.balance !== undefined) {
+        setAccountBalance(Number(accountRes.balance));
+      }
+
       // Handle both formats of PnL: Record<string, Pnl> or Pnl directly
       if (pnlRes) {
         const res = pnlRes as any;
@@ -431,11 +434,15 @@ function App() {
   onMount(() => {
     // Re-sync ticker prices and klines periodically
     const feedInterval = setInterval(() => {
+      const sym = selectedSymbol();
       // Periodic fetch for active symbol candles
-      fetchKlines(selectedSymbol(), timeframe());
+      fetchKlines(sym, timeframe());
       
       // Fetch live prices and update watchlist
       fetchLiveWatchlistData();
+
+      // Fetch live order book
+      fetchLiveOrderBook(sym);
 
       // Age updates
       const h = health();
@@ -451,7 +458,9 @@ function App() {
   // Initial load
   onMount(() => {
     fetchLiveWatchlistData();
+    fetchWatchlistSparklines();
     fetchKlines(selectedSymbol(), timeframe());
+    fetchLiveOrderBook(selectedSymbol());
   });
 
   // Watch for active symbol change to reload chart
@@ -461,7 +470,7 @@ function App() {
     if (activeItem) {
       setOrderPrice(activeItem.price.toString());
       fetchKlines(sym, timeframe());
-      updateOrderBook(activeItem.price);
+      fetchLiveOrderBook(sym);
     }
   });
 
@@ -722,174 +731,7 @@ function App() {
     }).join(" ");
   };
 
-  // ── interactive order placement simulation ──────────────────────────────
-  const handleOrderSubmit = (e: Event) => {
-    e.preventDefault();
-    const sym = selectedSymbol();
-    const side = orderSide() === "buy" ? "LONG" : "SHORT";
-    const type = orderType().toUpperCase();
-    const qty = Number(orderQty());
-    const price = orderType() === "limit" ? Number(orderPrice()) : (watchlist().find(w => w.symbol === sym)?.price || 0);
-    
-    if (isNaN(qty) || qty <= 0) {
-      showToast("Invalid Quantity", "danger");
-      return;
-    }
-    if (isNaN(price) || price <= 0) {
-      showToast("Invalid Price", "danger");
-      return;
-    }
-
-    const oid = `MOCK-${Date.now().toString().substring(6)}`;
-    
-    // Simulate ORDER_CREATED event
-    const createEv = {
-      event_type: "ORDER_CREATED",
-      ts: Date.now() / 1000,
-      payload: {
-        order_id: oid,
-        mode: mode(),
-        symbol: sym,
-        side: side,
-        order_type: type,
-        quantity: qty,
-        status: "NEW"
-      }
-    };
-    
-    setEvents(prev => [createEv, ...prev].slice(0, 50));
-    
-    const mockOrder: Order = {
-      exchange_order_id: oid,
-      mode: mode(),
-      symbol: sym,
-      side: side,
-      order_type: type,
-      qty: qty,
-      filled_qty: 0,
-      avg_fill_price: 0,
-      status: "NEW",
-      created_at: Date.now()
-    };
-    setOrders(prev => [mockOrder, ...prev].slice(0, 25));
-    triggerFlash(oid, "orders", "green");
-
-    showToast(`Order Placed: ${side} ${qty} ${sym}`, "success");
-
-    // Simulate Fill after 1 second
-    setTimeout(() => {
-      // Update order status
-      setOrders(prev => prev.map(o => o.exchange_order_id === oid ? { ...o, status: "FILLED", filled_qty: qty, avg_fill_price: price } : o));
-      triggerFlash(oid, "orders", "green");
-
-      const fillEv = {
-        event_type: "ORDER_FILLED",
-        ts: Date.now() / 1000,
-        payload: {
-          order_id: oid,
-          mode: mode(),
-          symbol: sym,
-          side: side,
-          quantity: qty,
-          fill_price: price,
-          fee: price * qty * 0.0004, // 0.04% fee
-          status: "FILLED"
-        }
-      };
-      setEvents(prev => [fillEv, ...prev].slice(0, 50));
-
-      const newFill: Fill = {
-        exchange_order_id: oid,
-        symbol: sym,
-        side: side,
-        mode: mode(),
-        price: price,
-        qty: qty,
-        fee: price * qty * 0.0004,
-        ts: Date.now()
-      };
-      setFills(prev => [newFill, ...prev].slice(0, 25));
-      triggerFlash(oid, "fills", "green");
-
-      // Check if position already exists for this symbol
-      setPositions(prev => {
-        const existing = prev.find(p => p.symbol === sym);
-        if (existing) {
-          // If same side, accumulate. If opposite side, subtract or close
-          if (existing.side === side) {
-            const newQty = existing.qty + qty;
-            const newAvg = (existing.qty * existing.avg_price + qty * price) / newQty;
-            return prev.map(p => p.symbol === sym ? { ...p, qty: newQty, avg_price: newAvg, last_event_ts: Date.now() } : p);
-          } else {
-            const netQty = existing.qty - qty;
-            if (netQty > 0) {
-              // Partial close
-              return prev.map(p => p.symbol === sym ? { ...p, qty: netQty, last_event_ts: Date.now() } : p);
-            } else {
-              // Full close
-              return prev.filter(p => p.symbol !== sym);
-            }
-          }
-        } else {
-          // Open new position
-          const newPos: Position = {
-            symbol: sym,
-            mode: mode(),
-            side: side,
-            qty: qty,
-            avg_price: price,
-            status: "OPEN",
-            last_event_ts: Date.now()
-          };
-          return [...prev, newPos];
-        }
-      });
-      triggerFlash(sym, "positions", "green");
-
-      // Deduct fee and adjust realized PnL
-      setPnl(prev => ({
-        ...prev,
-        fills: prev.fills + 1,
-        total_fees: prev.total_fees + (price * qty * 0.0004),
-        total_qty: prev.total_qty + qty,
-        realized_pnl: prev.realized_pnl - (price * qty * 0.0004)
-      }));
-
-    }, 800);
-  };
-
-  const closePositionLocally = (sym: string) => {
-    const pos = positions().find(p => p.symbol === sym);
-    if (!pos) return;
-
-    const currentPrice = watchlist().find(w => w.symbol === sym)?.price || pos.avg_price;
-    const sign = pos.side === "LONG" ? 1 : -1;
-    const realizedPnl = (currentPrice - pos.avg_price) * pos.qty * sign;
-    const fee = currentPrice * pos.qty * 0.0004;
-
-    setPositions(prev => prev.filter(p => p.symbol !== sym));
-    
-    // Simulate close logs
-    const closeEv = {
-      event_type: "POSITION_CLOSED",
-      ts: Date.now() / 1000,
-      payload: {
-        symbol: sym,
-        mode: mode(),
-        remaining_pnl: realizedPnl,
-        fee: fee
-      }
-    };
-    setEvents(prev => [closeEv, ...prev].slice(0, 50));
-
-    setPnl(prev => ({
-      ...prev,
-      realized_pnl: prev.realized_pnl + realizedPnl - fee,
-      total_fees: prev.total_fees + fee
-    }));
-
-    showToast(`Position closed. PnL: ${realizedPnl >= 0 ? '+' : ''}${(realizedPnl - fee).toFixed(2)} USDT`, realizedPnl - fee >= 0 ? "success" : "danger");
-  };
+  // ── order and position handlers (manual entry is locked on engine dashboard) ────────────────
 
   // Calculate live Unrealized PnL based on current ticker prices
   const unrealizedPnL = () => {
@@ -904,8 +746,7 @@ function App() {
     return total;
   };
 
-  const initialAccountBalance = 1000.0;
-  const realizedBalance = () => initialAccountBalance + pnl().realized_pnl;
+  const realizedBalance = () => accountBalance();
   const equity = () => realizedBalance() + unrealizedPnL();
 
   const renderChartSVG = () => {
@@ -1294,13 +1135,12 @@ function App() {
                         <th>Entry Price</th>
                         <th>Mark Price</th>
                         <th>Unrealized PnL</th>
-                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
                       <For each={positions()} fallback={
                         <tr>
-                          <td colspan="7" class="empty-row-state">No open positions. Portfolio flat.</td>
+                          <td colspan="6" class="empty-row-state">No open positions. Portfolio flat.</td>
                         </tr>
                       }>
                         {(p) => {
@@ -1321,15 +1161,6 @@ function App() {
                               <td>{livePrice().toFixed(livePrice() > 10 ? 2 : 4)}</td>
                               <td class={uPnl() >= 0 ? "watchlist-price up" : "watchlist-price down"}>
                                 {uPnl() >= 0 ? '+' : ''}{uPnl().toFixed(2)} USDT
-                              </td>
-                              <td>
-                                <button 
-                                  onClick={() => closePositionLocally(p.symbol)}
-                                  class="pct-badge" 
-                                  style="padding: 2px 6px; background-color: var(--bg-down-subtle); color: var(--color-down); border-color: var(--color-down);"
-                                >
-                                  Market Close
-                                </button>
                               </td>
                             </tr>
                           );
@@ -1481,7 +1312,7 @@ function App() {
               </button>
             </div>
 
-            <form class="order-form-body" onSubmit={handleOrderSubmit}>
+            <form class="order-form-body" onSubmit={(e) => e.preventDefault()}>
               {/* Limit / Market Switch */}
               <div class="mode-selector" style="width: 100%;">
                 <button 
@@ -1586,10 +1417,12 @@ function App() {
 
               {/* Submit CTA */}
               <button 
-                type="submit" 
-                class={`submit-order-btn ${orderSide() === 'buy' ? 'buy' : 'sell'}`}
+                type="button" 
+                class="submit-order-btn" 
+                style="background-color: var(--bg-terminal); color: var(--text-muted); border: 1px solid var(--border-main); cursor: not-allowed;"
+                disabled
               >
-                {orderSide() === 'buy' ? 'BUY / LONG' : 'SELL / SHORT'}
+                Manual Entry Locked (Engine Running)
               </button>
             </form>
           </section>

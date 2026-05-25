@@ -242,6 +242,7 @@ class LiveTradingSystem:
             channel=self.cfg.coindcx_stream_channel,
             on_fill=self._on_stream_fill,
             on_reconnect=self._safe_reconcile,
+            on_balance=self._on_stream_balance,
         )
         started = self.user_stream.start()
         logger.info("CoinDCX user stream: %s", "started" if started else "unavailable (REST fallback)")
@@ -266,6 +267,23 @@ class LiveTradingSystem:
                 sym, pos.side, fill.get("fill_price", 0), fill.get("fill_quantity", 0),
                 order_id=oid, reduce_only=True,
             )
+
+    def _on_stream_balance(self, balance_update: dict):
+        """Handle real-time balance updates from CoinDCX user stream."""
+        currency = balance_update.get("currency_short_name") or balance_update.get("currency")
+        if not currency:
+            return
+        mc = self.cfg.coindcx_margin_currency
+        if str(currency).upper() == str(mc).upper():
+            try:
+                bal_val = float(balance_update.get("balance", 0) or 0)
+                conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+                usdt_equiv = bal_val / conv if mc.upper() != "USDT" else bal_val
+                
+                logger.info("[STREAM] Received balance update: %.4f %s (~%.2f USDT)", bal_val, mc, usdt_equiv)
+                self.wallet.wallet_balance = Decimal(str(usdt_equiv))
+            except Exception as e:
+                logger.error("Failed to process stream balance update: %s", e)
 
     def _safe_reconcile(self):
         if self.reconciler is not None:

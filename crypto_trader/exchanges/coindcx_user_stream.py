@@ -297,10 +297,17 @@ class CoinDCXUserStream:
                 logger.error("CoinDCX on_position handler failed: %s", e)
 
     def _on_balance_update(self, data) -> None:
-        d = self._coerce(data)
-        logger.debug("CoinDCX balance update: %s", d)
-        if self.on_balance and d:
-            try:
-                self.on_balance(d)
-            except Exception as e:
-                logger.error("CoinDCX on_balance handler failed: %s", e)
+        logger.debug("CoinDCX balance update raw: %s", data)
+        parsed = self._coerce_any(data)
+        if parsed is None:
+            return
+        
+        updates = parsed if isinstance(parsed, list) else [parsed]
+        for item in updates:
+            if not isinstance(item, dict):
+                continue
+            if self.on_balance:
+                try:
+                    self.on_balance(item)
+                except Exception as e:
+                    logger.error("CoinDCX on_balance handler failed: %s", e)

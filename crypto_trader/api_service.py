@@ -271,7 +271,22 @@ async def get_account(mode: str = Query("paper")):
             unrealized += upnl
         enriched.append({**p, "mark_price": mark, "unrealized_pnl": upnl})
 
-    balance = INITIAL_BALANCE + realized
+    if mode == "live":
+        try:
+            eng = _get_venue_engine()
+            if eng is not None:
+                avail = float(eng.sync_balance())
+                conv = float(eng.get_usdt_conversion()) or 1.0
+                margin_currency = os.environ.get("COINDCX_MARGIN_CURRENCY", "USDT").upper()
+                balance = avail / conv if margin_currency != "USDT" else avail
+            else:
+                balance = INITIAL_BALANCE + realized
+        except Exception as e:
+            logger.error("Failed to sync live balance in get_account: %s", e)
+            balance = INITIAL_BALANCE + realized
+    else:
+        balance = INITIAL_BALANCE + realized
+
     return {
         "mode": mode,
         "initial_balance": INITIAL_BALANCE,
