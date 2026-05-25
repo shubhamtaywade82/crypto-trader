@@ -41,6 +41,28 @@ def health():
 
 @app.get("/positions")
 def get_positions(mode: str = Query("paper")):
+    if mode == "live":
+        try:
+            eng = _get_venue_engine()
+            if eng is not None:
+                venue_positions = eng.get_positions()
+                out = []
+                for p in venue_positions:
+                    qty = float(p.get("quantity", 0) or 0)
+                    if qty > 0:
+                        out.append({
+                            "symbol": p["symbol"],
+                            "mode": "live",
+                            "side": p["side"].upper(),
+                            "qty": qty,
+                            "avg_price": float(p.get("entry_price", 0) or p.get("avg_price", 0) or 0),
+                            "status": "OPEN",
+                            "last_event_ts": int(datetime.now().timestamp() * 1000)
+                        })
+                return out
+        except Exception as e:
+            logger.error("venue positions fetch failed in get_positions: %s", e)
+
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -51,6 +73,31 @@ def get_positions(mode: str = Query("paper")):
 
 @app.get("/orders")
 def get_orders(mode: str = Query("paper"), limit: int = 50):
+    if mode == "live":
+        try:
+            eng = _get_venue_engine()
+            if eng is not None:
+                open_orders = eng.get_open_orders()
+                out = []
+                for o in open_orders:
+                    qty = float(o.get("quantity", 0) or 0)
+                    filled = float(o.get("filled_quantity", 0) or 0)
+                    out.append({
+                        "exchange_order_id": o["exchange_order_id"],
+                        "mode": "live",
+                        "symbol": o["symbol"],
+                        "side": o["side"].upper(),
+                        "order_type": o.get("stage", "LIMIT").upper(),
+                        "qty": qty,
+                        "filled_qty": filled,
+                        "avg_fill_price": 0.0,
+                        "status": o["status"].upper(),
+                        "created_at": int(datetime.now().timestamp() * 1000)
+                    })
+                return out
+        except Exception as e:
+            logger.error("venue orders fetch failed in get_orders: %s", e)
+
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -173,11 +220,40 @@ async def get_account(mode: str = Query("paper")):
     try:
         with conn.cursor() as cur:
             realized = _realized_pnl(cur, mode)
-            cur.execute(
-                "SELECT symbol, side, qty, avg_price FROM active_positions WHERE mode=%s AND COALESCE(qty,0) > 0",
-                (mode,),
-            )
-            positions = cur.fetchall()
+            positions = []
+            if mode == "live":
+                try:
+                    eng = _get_venue_engine()
+                    if eng is not None:
+                        venue_positions = eng.get_positions()
+                        for p in venue_positions:
+                            qty = float(p.get("quantity", 0) or 0)
+                            if qty > 0:
+                                positions.append({
+                                    "symbol": p["symbol"],
+                                    "side": p["side"].upper(),
+                                    "qty": qty,
+                                    "avg_price": float(p.get("entry_price", 0) or p.get("avg_price", 0) or 0)
+                                })
+                    else:
+                        cur.execute(
+                            "SELECT symbol, side, qty, avg_price FROM active_positions WHERE mode=%s AND COALESCE(qty,0) > 0",
+                            (mode,),
+                        )
+                        positions = cur.fetchall()
+                except Exception as e:
+                    logger.error("Failed to fetch venue positions in get_account: %s", e)
+                    cur.execute(
+                        "SELECT symbol, side, qty, avg_price FROM active_positions WHERE mode=%s AND COALESCE(qty,0) > 0",
+                        (mode,),
+                    )
+                    positions = cur.fetchall()
+            else:
+                cur.execute(
+                    "SELECT symbol, side, qty, avg_price FROM active_positions WHERE mode=%s AND COALESCE(qty,0) > 0",
+                    (mode,),
+                )
+                positions = cur.fetchall()
     finally:
         conn.close()
 

@@ -96,6 +96,11 @@ class CoinDCXExecutionEngine:
         self.leverage = leverage
         self.margin_type = margin_type
         self.margin_currency = margin_currency.upper()
+        # Read methods scan both margin currencies so positions/orders are never
+        # missed when the funded wallet differs from the configured one (e.g.
+        # USDT-denominated pairs margined in INR). Order placement still uses the
+        # single configured margin_currency.
+        self.read_margin_currencies = list(dict.fromkeys([self.margin_currency, "USDT", "INR"]))
         self._ack = bool(i_understand_real_money)
         if self._ack:
             logger.warning(
@@ -228,7 +233,7 @@ class CoinDCXExecutionEngine:
     def get_positions(self) -> List[dict]:
         resp = self.client.post_signed(EP_POSITIONS, {
             "page": "1", "size": "100",
-            "margin_currency_short_name": [self.margin_currency],
+            "margin_currency_short_name": self.read_margin_currencies,
         })
         positions: List[dict] = []
         for raw in _as_list(resp):
@@ -236,6 +241,8 @@ class CoinDCXExecutionEngine:
             if not pair:
                 continue
             qty = raw.get("active_pos", raw.get("quantity", 0)) or 0
+            if float(qty or 0) == 0.0:
+                continue  # skip flat/empty position rows
             positions.append({
                 "symbol": coindcx_to_internal(pair),
                 "pair": pair,
@@ -254,7 +261,7 @@ class CoinDCXExecutionEngine:
     def get_open_orders(self, symbol: Optional[str] = None) -> List[dict]:
         resp = self.client.post_signed(EP_LIST_ORDERS, {
             "status": "open", "page": "1", "size": "100",
-            "margin_currency_short_name": [self.margin_currency],
+            "margin_currency_short_name": self.read_margin_currencies,
         })
         orders = [self._normalize_order_dict(o) for o in _as_list(resp)]
         if symbol:
