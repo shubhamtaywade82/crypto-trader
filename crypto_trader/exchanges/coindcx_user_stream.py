@@ -85,8 +85,11 @@ class CoinDCXUserStream:
         self._running = False
         self._connected = False
         self._reconnect_attempts = 0
-        self._seen_fills: set = set()
-        self._filled_by_order: dict = {}   # order_id -> cumulative filled_quantity
+        from collections import OrderedDict
+        # FIFO-bounded dedup: evict the OLDEST key, never an arbitrary (possibly
+        # recent) one — a set.pop() could drop a just-seen fill and re-process it.
+        self._seen_fills: "OrderedDict" = OrderedDict()
+        self._filled_by_order: "OrderedDict" = OrderedDict()  # order_id -> cumulative filled_qty
         self._lock = threading.Lock()
 
     # ── auth ──────────────────────────────────────────────────────────────────
@@ -210,9 +213,9 @@ class CoinDCXUserStream:
         with self._lock:
             if key in self._seen_fills:
                 return
-            self._seen_fills.add(key)
-            if len(self._seen_fills) > 5000:  # bound memory
-                self._seen_fills.pop()
+            self._seen_fills[key] = None
+            if len(self._seen_fills) > 5000:  # bound memory (evict oldest)
+                self._seen_fills.popitem(last=False)
         fill = {
             "exchange_order_id": order_id,
             "symbol": coindcx_to_internal(pair) if pair else "",

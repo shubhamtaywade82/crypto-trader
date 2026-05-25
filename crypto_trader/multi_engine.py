@@ -268,6 +268,10 @@ def main():
     # Divide total balance equally among symbols to prevent overallocation
     per_symbol_balance = total_balance / len(symbols)
 
+    # Shared wallet: bound each symbol's per-trade risk to 1/N of the budget so
+    # N concurrent positions don't collectively risk N×2% of the whole account.
+    risk_fraction = 1.0 / max(1, len(symbols))
+
     for sym in symbols:
         engine = WebSocketTradingEngine(
             symbol=sym,
@@ -282,6 +286,7 @@ def main():
             log_ws=args.log_ws,
             log_llm=args.log_llm,
             event_bus=bus,
+            risk_budget_fraction=risk_fraction,
         )
         engine.risk_manager = global_risk  # Share the global risk manager
         engines.append(engine)

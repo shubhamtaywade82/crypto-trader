@@ -56,6 +56,7 @@ class WSMarketData:
     kline_4h: Optional[dict] = None
     last_update_ms: int = 0
     is_connected: bool = False
+    connected_at_ms: int = 0      # local time the socket last opened (grace window)
 
     # Track freshness of individual price sources (in local time ms)
     last_price_time_ms: int = 0
@@ -170,20 +171,42 @@ class BinanceWebSocketFeed:
                 return (self.data.best_ask + self.data.best_bid) / 2
             return self.data.mark_price
 
+    _GRACE_MS = 20000   # post-open window where "no data yet" still counts as connected
+
     def is_connected(self) -> bool:
-        """Check if WebSocket is connected AND receiving data recently."""
+        """Check if WebSocket is connected AND receiving data recently.
+
+        True when: the socket is open AND either we received a message in the
+        last 20s OR we are within the 20s grace window after the socket opened.
+        A never-received-data socket past the grace window returns False (the
+        prior magic-number check left it True forever).
+        """
         with self._lock:
             if not self.data.is_connected:
                 return False
-            
-            # If we just connected in the last 20 seconds, we're "connected" even if no data yet
             now_ms = int(time.time() * 1000)
-            if (now_ms - self.data.last_update_ms) > 1000000000: # Initial state (0)
-                 # Grace period of 20 seconds after opening the connection
-                 return True 
+            if self.data.last_update_ms and (now_ms - self.data.last_update_ms) < self._GRACE_MS:
+                return True
+            if self.data.connected_at_ms and (now_ms - self.data.connected_at_ms) < self._GRACE_MS:
+                return True
+            return False
 
-            # Otherwise, must have received a message in the last 20 seconds
-            return (now_ms - self.data.last_update_ms) < 20000
+    def data_age_ms(self) -> Optional[int]:
+        """Age (ms) of the freshest price source, or None if none received yet."""
+        with self._lock:
+            ts = max(self.data.last_price_time_ms,
+                     self.data.book_ticker_time_ms,
+                     self.data.mark_price_time_ms)
+            if ts <= 0:
+                return None
+            return int(time.time() * 1000) - ts
+
+    def is_fresh(self, max_age_ms: int) -> bool:
+        """True only if a real price update arrived within ``max_age_ms``.
+
+        Used to veto trading on stale data — never fabricates/extrapolates."""
+        age = self.data_age_ms()
+        return age is not None and age <= max_age_ms
 
     # ── Internal ──
 
@@ -241,6 +264,7 @@ class BinanceWebSocketFeed:
         logger.info(f"[WS] Connected to {self.symbol}")
         with self._lock:
             self.data.is_connected = True
+            self.data.connected_at_ms = int(time.time() * 1000)
 
     def _on_close(self, ws, close_status_code, close_msg):
         logger.warning(f"[WS] Closed: {close_status_code} {close_msg}")
@@ -406,16 +430,19 @@ class WebSocketPositionManager:
         event_bus = None,
         health_check = None,             # callable(): authoritative margin guard
         health_interval_s: float = 5.0,  # how often to run it (REST-bound)
+        feed_stale_ms: int = 15000,      # max price age before exits are skipped
     ):
         self.ws = ws_feed
         self.wallet = wallet
         self.event_bus = event_bus
         self.symbol = self.ws.symbol.upper()
         self.check_interval_ms = check_interval_ms
+        self.feed_stale_ms = feed_stale_ms
         self.wick_buffer = deque(maxlen=wick_buffer_size)
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_log_time = 0
+        self._last_stale_warn = 0.0
         # G4: authoritative liquidation guard must run far faster than the 5-min
         # signal tick. Driven here on the 1s monitor loop (throttled).
         self._health_check = health_check
@@ -469,6 +496,22 @@ class WebSocketPositionManager:
 
                 if ltp <= 0:
                     # Still waiting for the first message on a new connection
+                    time.sleep(0.5)
+                    continue
+
+                # A1: never run SL/TP/trailing on stale prices. The authoritative
+                # REST margin guard above still protects against liquidation; the
+                # software exits simply wait for a fresh tick rather than acting on
+                # a seconds-old price. mid can fall back to a stale mark, so gate
+                # on real price-source age, not just ltp>0.
+                if not self.ws.is_fresh(self.feed_stale_ms) or mid <= 0:
+                    now_s = time.time()
+                    if now_s - self._last_stale_warn >= 10:
+                        age = self.ws.data_age_ms()
+                        logger.warning(
+                            "[WS-PM] %s feed stale (age=%sms > %dms) — skipping exit checks this tick",
+                            self.symbol, age, self.feed_stale_ms)
+                        self._last_stale_warn = now_s
                     time.sleep(0.5)
                     continue
 

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .data_feed import BinanceDataFeed
+from .exchanges.resilient_data_feed import StaleCandlesError
 from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
@@ -64,6 +65,7 @@ class WebSocketTradingEngine:
         event_bus = None,
         cfg = None,
         signal_publisher = None,
+        risk_budget_fraction: float = 1.0,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
@@ -74,6 +76,11 @@ class WebSocketTradingEngine:
         # idempotency lock / DLQ / PEL-recovery / risk-gate safety on the live
         # entry path. When None, the hardened direct path runs unchanged.
         self.signal_publisher = signal_publisher
+        # Fraction of the per-trade risk budget this engine may use. With a
+        # SHARED wallet across N symbols (multi_engine), each engine sizes off
+        # the full balance, so without this N symbols would each risk the full
+        # 2% → up to 2N% concurrent. Set to 1/N to bound total exposure.
+        self.risk_budget_fraction = max(0.0, min(1.0, float(risk_budget_fraction)))
         # CoinDCX market data for the cross-venue basis guard (F3). Public, no
         # creds; built lazily so paper/tests without network stay light.
         self._coindcx_md = None
@@ -167,6 +174,8 @@ class WebSocketTradingEngine:
             # G4: drive the authoritative margin guard on the 1s loop (every ~5s),
             # not only on the 5-min signal tick — liquidation can't wait 5 min.
             health_check=self._check_authoritative_health,
+            # A1: skip software exits on prices older than this.
+            feed_stale_ms=(cfg.feed_stale_ms if cfg else 15000),
         )
 
         # State
@@ -361,8 +370,14 @@ class WebSocketTradingEngine:
                 logger.warning(f"[WS-ENGINE] Invalid mark price {mark_price}. Skipping signal tick.")
                 return
 
+        except StaleCandlesError as e:
+            # A3: fallback klines too old — never generate a signal from stale
+            # technicals. Skip the whole tick (already the behaviour; explicit
+            # for clarity/observability).
+            logger.warning(f"[WS-ENGINE] Stale klines — skipping signal tick: {e}")
+            return
         except Exception as e:
-            logger.error(f"Data fetch failed: {e}")
+            logger.error(f"Data fetch failed — skipping signal tick: {e}")
             return
 
         # 1. Regime analysis
@@ -590,15 +605,23 @@ class WebSocketTradingEngine:
                       mark_price, funding_rate, oi_delta, taker_ratio,
                       tech_score, regime, regime_score, advice, dynamic_threshold):
         """Execute entry using real-time WebSocket prices."""
+        # A1: never enter on stale data. If the WS feed has no fresh price within
+        # the staleness budget, veto the entry rather than fall back to a possibly
+        # seconds-old price. (Exits are separately gated in ws_pm.)
+        stale_ms = self.cfg.feed_stale_ms if self.cfg else 15000
+        if not self.ws_feed.is_fresh(stale_ms):
+            age = self.ws_feed.data_age_ms()
+            logger.warning("[ENTRY] WS feed stale (age=%sms > %dms) — vetoing entry", age, stale_ms)
+            return
+
         # Get current LTP and spread from WebSocket
         ltp = self.ws_feed.get_ltp()
         mid = self.ws_feed.get_mid_price()
         spread = self.ws_feed.get_spread()
 
-        if ltp <= 0:
-            logger.warning("[ENTRY] WebSocket LTP unavailable, using mark price")
-            ltp = mark_price
-            mid = mark_price
+        if ltp <= 0 or mid <= 0:
+            logger.warning("[ENTRY] WebSocket LTP/mid unavailable (ltp=%.4f mid=%.4f) — vetoing entry", ltp, mid)
+            return
 
         # Slippage estimate: if spread > 0.1%, log warning
         spread_pct = spread / mid * 100 if mid > 0 else 0
@@ -653,9 +676,10 @@ class WebSocketTradingEngine:
             _levels = setup.get("tp_levels", [])
             tp = _levels[0]["price"] if _levels else entry_price
 
-        # Risk-based sizing from stop distance (2% risk per trade)
+        # Risk-based sizing from stop distance (2% risk per trade, scaled by this
+        # engine's share of a shared wallet to avoid multi-symbol over-allocation).
         stop_distance = abs(entry_price - setup["sl_price"])
-        risk_budget = self.wallet.margin_balance * Decimal("0.02")
+        risk_budget = self.wallet.margin_balance * Decimal("0.02") * Decimal(str(self.risk_budget_fraction))
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
         risk_budget *= Decimal(str(size_multiplier))
         stop_distance_dec = Decimal(str(stop_distance))

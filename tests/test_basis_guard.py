@@ -37,6 +37,12 @@ class _FakeWS:
     def get_spread(self):
         return 0.0
 
+    def is_fresh(self, max_age_ms):
+        return True
+
+    def data_age_ms(self):
+        return 0
+
 
 def _fresh_wallet(symbol):
     ns = f"test_{uuid.uuid4().hex}"
