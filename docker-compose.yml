@@ -45,6 +45,8 @@ services:
     environment:
       DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
       REDIS_URL: redis://redis:6379/0
+      PROJECTION_ENABLED: "true"
+      UI_EVENTS_ENABLED: "true"
     command: ["python", "-m", "crypto_trader.engine_live", "--tick", "300"]
     restart: unless-stopped
 
