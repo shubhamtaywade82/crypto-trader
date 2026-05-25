@@ -50,6 +50,8 @@ def build_consumer(cfg=None, *, consumer_name: str = "worker-1") -> SignalConsum
         bus = RedisStreamBus.from_url(cfg.redis_url) if cfg.redis_enabled else None
         
         def _sink(ev):
+            if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
+                ev["payload"]["mode"] = cfg.mode.value
             if getattr(system, "event_store", None) is not None:
                 try: system.event_store.append(ev)
                 except Exception as e: logger.error("event store append failed: %s", e)

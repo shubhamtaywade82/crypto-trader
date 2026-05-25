@@ -75,6 +75,50 @@ def get_fills(mode: str = Query("paper"), limit: int = 50):
     finally:
         conn.close()
 
+@app.get("/pnl")
+def get_pnl(mode: str = Query("paper")):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS fills, 
+                          COALESCE(SUM(fee), 0) AS total_fees, 
+                          COALESCE(SUM(qty), 0) AS total_qty 
+                   FROM fills 
+                   WHERE mode = %s""",
+                (mode,)
+            )
+            fills_row = cur.fetchone()
+            
+            cur.execute(
+                """SELECT COALESCE(SUM(
+                    CASE 
+                        WHEN type = 'POSITION_PARTIALLY_CLOSED' THEN COALESCE((payload->>'pnl')::numeric, (payload->>'remaining_pnl')::numeric, 0) - COALESCE((payload->>'fee')::numeric, 0)
+                        WHEN type IN ('POSITION_CLOSED', 'LIQUIDATION') THEN COALESCE((payload->>'remaining_pnl')::numeric, 0) - COALESCE((payload->>'fee')::numeric, 0)
+                        WHEN type = 'FUNDING_APPLIED' THEN COALESCE((payload->>'amount')::numeric, 0)
+                        WHEN type = 'FEE_CHARGED' THEN -COALESCE((payload->>'amount')::numeric, 0)
+                        WHEN type IN ('ORDER_FILLED', 'ORDER_PARTIALLY_FILLED') THEN -COALESCE((payload->>'fee')::numeric, 0)
+                        ELSE 0
+                    END
+                ), 0) AS realized_pnl
+                FROM events
+                WHERE payload->>'mode' = %s""",
+                (mode,)
+            )
+            pnl_row = cur.fetchone()
+            
+            return {
+                mode: {
+                    "mode": mode,
+                    "fills": int(fills_row["fills"] or 0),
+                    "total_fees": float(fills_row["total_fees"] or 0),
+                    "total_qty": float(fills_row["total_qty"] or 0),
+                    "realized_pnl": float(pnl_row["realized_pnl"] or 0)
+                }
+            }
+    finally:
+        conn.close()
+
 @app.get("/events/stream")
 async def event_stream(request: Request):
     """Bridge Redis events to Server-Sent Events (SSE)."""

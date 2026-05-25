@@ -57,7 +57,48 @@ class PostgresRepo:
         sql = ("SELECT mode, COUNT(*) AS fills, COALESCE(SUM(fee),0) AS total_fees, "
                "COALESCE(SUM(qty),0) AS total_qty FROM fills")
         rows = self._rows(sql + (" WHERE mode=%s" if mode else "") + " GROUP BY mode", (mode,) if mode else ())
-        return {r["mode"]: r for r in rows}
+        
+        sql_pnl = """
+            SELECT 
+                payload->>'mode' AS mode,
+                COALESCE(SUM(
+                    CASE 
+                        WHEN type = 'POSITION_PARTIALLY_CLOSED' THEN COALESCE((payload->>'pnl')::numeric, (payload->>'remaining_pnl')::numeric, 0) - COALESCE((payload->>'fee')::numeric, 0)
+                        WHEN type IN ('POSITION_CLOSED', 'LIQUIDATION') THEN COALESCE((payload->>'remaining_pnl')::numeric, 0) - COALESCE((payload->>'fee')::numeric, 0)
+                        WHEN type = 'FUNDING_APPLIED' THEN COALESCE((payload->>'amount')::numeric, 0)
+                        WHEN type = 'FEE_CHARGED' THEN -COALESCE((payload->>'amount')::numeric, 0)
+                        WHEN type IN ('ORDER_FILLED', 'ORDER_PARTIALLY_FILLED') THEN -COALESCE((payload->>'fee')::numeric, 0)
+                        ELSE 0
+                    END
+                ), 0) AS realized_pnl
+            FROM events
+        """
+        if mode:
+            pnl_rows = self._rows(sql_pnl + " WHERE payload->>'mode' = %s GROUP BY payload->>'mode'", (mode,))
+        else:
+            pnl_rows = self._rows(sql_pnl + " WHERE payload->>'mode' IS NOT NULL GROUP BY payload->>'mode'")
+            
+        pnl_by_mode = {r["mode"]: float(r["realized_pnl"]) for r in pnl_rows}
+        
+        res = {}
+        for r in rows:
+            m = r["mode"]
+            res[m] = {
+                "mode": m,
+                "fills": int(r["fills"]),
+                "total_fees": float(r["total_fees"]),
+                "total_qty": float(r["total_qty"]),
+                "realized_pnl": pnl_by_mode.get(m, 0.0)
+            }
+        if mode and mode not in res:
+            res[mode] = {
+                "mode": mode,
+                "fills": 0,
+                "total_fees": 0.0,
+                "total_qty": 0.0,
+                "realized_pnl": pnl_by_mode.get(mode, 0.0)
+            }
+        return res
 
     def health(self) -> dict:
         try:

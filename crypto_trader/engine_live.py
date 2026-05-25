@@ -305,6 +305,8 @@ class LiveTradingSystem:
         if self.event_store is not None or self.projection is not None or ui_publisher is not None:
             prev = self.wallet.event_hook
             def _sink(ev):
+                if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
+                    ev["payload"]["mode"] = self.cfg.mode.value
                 if self.event_store is not None:
                     try:
                         self.event_store.append(ev)

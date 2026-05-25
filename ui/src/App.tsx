@@ -26,13 +26,31 @@ function App() {
   const [events, setEvents] = createSignal<any[]>([]);
   
   const fetchPositions = async (m: string): Promise<Position[]> => {
-    const res = await fetch(`${API_BASE}/positions?mode=${m}`);
-    return res.json();
+    console.log("[API] Fetching positions for mode:", m);
+    try {
+        const res = await fetch(`${API_BASE}/positions?mode=${m}`);
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const data = await res.json();
+        console.log("[API] Positions data:", data);
+        return data;
+    } catch (e) {
+        console.error("[API] Fetch positions failed:", e);
+        return [];
+    }
   };
 
   const fetchOrders = async (m: string): Promise<Order[]> => {
-    const res = await fetch(`${API_BASE}/orders?mode=${m}`);
-    return res.json();
+    console.log("[API] Fetching orders for mode:", m);
+    try {
+        const res = await fetch(`${API_BASE}/orders?mode=${m}`);
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const data = await res.json();
+        console.log("[API] Orders data:", data);
+        return data;
+    } catch (e) {
+        console.error("[API] Fetch orders failed:", e);
+        return [];
+    }
   };
 
   const [positions, { refetch: refetchPositions }] = createResource(mode, fetchPositions);
@@ -40,24 +58,46 @@ function App() {
 
   // SSE Setup
   onMount(() => {
+    console.log("[SSE] Connecting to:", `${API_BASE}/events/stream`);
     const eventSource = new EventSource(`${API_BASE}/events/stream`);
+    
+    eventSource.onopen = () => console.log("✅ [SSE] Connected");
+    eventSource.onerror = (err) => console.error("❌ [SSE] Error:", err);
+    
     eventSource.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      setEvents(prev => [data, ...prev].slice(0, 50));
-      
-      // Trigger refetch on certain events
-      if (data.event_type?.includes("Order") || data.event_type?.includes("Trade")) {
-        refetchPositions();
-        refetchOrders();
+      try {
+        const data = JSON.parse(e.data);
+        console.log("[SSE] Message:", data);
+        setEvents(prev => [data, ...prev].slice(0, 50));
+        
+        // Match both 'ORDER_FILLED' and 'POSITION_OPENED' types
+        const et = (data.event_type || "").toUpperCase();
+        if (et.includes("ORDER") || et.includes("TRADE") || et.includes("POSITION") || et.includes("FILL")) {
+          console.log(`🔄 [SSE] Triggering refetch (Event: ${et})`);
+          refetchPositions();
+          refetchOrders();
+        }
+      } catch (err) {
+        console.error("[SSE] Parse error:", err);
       }
     };
-    onCleanup(() => eventSource.close());
+    onCleanup(() => {
+        console.log("[SSE] Closing connection");
+        eventSource.close();
+    });
   });
+
+  const formatTs = (e: any) => {
+    // Handle both 'ts' (ms) and 'timestamp' (s)
+    const val = e.ts || (e.timestamp ? e.timestamp * 1000 : null);
+    if (!val) return "—";
+    return new Date(val).toLocaleTimeString();
+  };
 
   return (
     <div class="container">
       <header>
-        <h1>Crypto Trader v4</h1>
+        <h1>Crypto Trader v4 Dashboard</h1>
         <div class="mode-toggle">
           <button 
             class={`mode-btn ${mode() === 'paper' ? 'active' : ''}`} 
@@ -80,8 +120,8 @@ function App() {
           <div class="value">{positions()?.length || 0}</div>
         </div>
         <div class="card">
-          <h3>Total Realized PnL</h3>
-          <div class="value">$0.00</div>
+          <h3>Live Feed</h3>
+          <div class="value">{events().length} Events</div>
         </div>
       </div>
 
@@ -99,19 +139,21 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              <For each={positions()}>
+              <For each={positions() || []}>
                 {(p: any) => (
                   <tr>
                     <td>{p.symbol}</td>
-                    <td class={p.side.toLowerCase()}>{p.side}</td>
+                    <td class={p.side?.toLowerCase() || ""}>{p.side}</td>
                     <td>{p.qty}</td>
                     <td>{p.avg_price}</td>
-                    <td><span class={`status-tag status-${p.status.toLowerCase()}`}>{p.status}</span></td>
+                    <td><span class={`status-tag status-${p.status?.toLowerCase() || ""}`}>{p.status}</span></td>
                   </tr>
                 )}
               </For>
             </tbody>
           </table>
+          {positions.loading && <div style="text-align: center; padding: 1rem; color: #666;">Loading positions...</div>}
+          {!positions.loading && positions()?.length === 0 && <div style="text-align: center; padding: 1rem; color: #666;">No active positions</div>}
         </div>
       </section>
 
@@ -130,12 +172,12 @@ function App() {
                 </tr>
               </thead>
               <tbody>
-                <For each={orders()}>
+                <For each={orders() || []}>
                   {(o: any) => (
                     <tr>
                       <td style="font-size: 0.7rem;">{o.exchange_order_id}</td>
                       <td>{o.symbol}</td>
-                      <td class={o.side.toLowerCase()}>{o.side}</td>
+                      <td class={o.side?.toLowerCase() || ""}>{o.side}</td>
                       <td>{o.qty}</td>
                       <td>{o.status}</td>
                     </tr>
@@ -143,6 +185,8 @@ function App() {
                 </For>
               </tbody>
             </table>
+            {orders.loading && <div style="text-align: center; padding: 1rem; color: #666;">Loading orders...</div>}
+            {!orders.loading && orders()?.length === 0 && <div style="text-align: center; padding: 1rem; color: #666;">No recent orders</div>}
           </div>
         </section>
 
@@ -152,12 +196,15 @@ function App() {
             <For each={events()}>
               {(e) => (
                 <div class="event-item">
-                  <span class="event-ts">[{new Date(e.timestamp * 1000).toLocaleTimeString()}]</span>{" "}
+                  <span class="event-ts">[{formatTs(e)}]</span>{" "}
                   <span class="event-type">{e.event_type || 'Event'}</span>
-                  <div style="color: #ccc; margin-top: 2px;">{JSON.stringify(e, (k,v) => k === 'timestamp' || k === 'event_type' ? undefined : v)}</div>
+                  <div style="color: #ccc; margin-top: 2px; font-size: 0.7rem; white-space: pre-wrap; overflow-x: hidden;">
+                    {JSON.stringify(e.payload || e, (k,v) => (k === 'ts' || k === 'timestamp' || k === 'event_type' || k === 'namespace') ? undefined : v, 2)}
+                  </div>
                 </div>
               )}
             </For>
+            {events().length === 0 && <div style="text-align: center; padding: 1rem; color: #666;">Waiting for events...</div>}
           </div>
         </section>
       </div>
