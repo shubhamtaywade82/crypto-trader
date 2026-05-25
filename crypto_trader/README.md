@@ -137,13 +137,13 @@ Binance geo-block (HTTP 451).
 The **single supported live entrypoint** is `engine_live.py`:
 
 ```bash
-# Always start here for paper/testnet/live — it runs a startup self-test gate.
+# Always start here for paper/live — it runs a startup self-test gate.
 python -m crypto_trader.engine_live                   # MODE from .env
 python -m crypto_trader.engine_live --self-test-only  # run the gate and exit
 ```
 
 `MODE` selects the execution adapter: `paper` → `PaperExecutionEngine`,
-`testnet`/`live` → `CoinDCXExecutionEngine`. Live orders are gated three ways
+`live` → `CoinDCXExecutionEngine` (mainnet). Live orders are gated three ways
 (`safe_mode`): `LIVE_TRADING_ENABLED=true` +
 `LIVE_TRADING_ACK="I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"` + no
 `~/.crypto_trader/HALT` file.

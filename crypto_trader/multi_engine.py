@@ -45,7 +45,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
     parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier")
-    parser.add_argument("--testnet", action="store_true", help="Use Binance Testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM advisor")
     parser.add_argument("--llm-host", type=str, default=None, help="Ollama host URL")
     parser.add_argument("--llm-model", type=str, default=None, help="Ollama model name")
@@ -275,7 +274,6 @@ def main():
             wallet=global_wallet,
             initial_balance=per_symbol_balance,
             leverage=args.leverage,
-            testnet=args.testnet,
             use_llm=not args.no_llm,
             llm_host=args.llm_host,
             llm_model=args.llm_model,

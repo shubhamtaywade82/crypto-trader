@@ -54,7 +54,7 @@ Open http://localhost:3030 — toggle PAPER/LIVE, watch positions/orders/PnL + l
 
 | Var | Purpose |
 |-----|---------|
-| `MODE` | `paper` \| `testnet` \| `live` |
+| `MODE` | `paper` \| `live` (both on CoinDCX mainnet) |
 | `TRADE_SYMBOL` | primary symbol (default SOLUSDT) |
 | `WATCHLIST` | comma list, e.g. `BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT` (multi-symbol) |
 | `DATA_SOURCE` | `binance` \| `coindcx` \| `auto` (Binance primary, CoinDCX fallback) |

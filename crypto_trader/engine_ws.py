@@ -53,7 +53,6 @@ class WebSocketTradingEngine:
         symbol: str = DEFAULT_SYMBOL,
         initial_balance: float = 1_000.0,
         leverage: int = LEVERAGE,
-        testnet: bool = False,
         use_llm: bool = True,
         llm_host: str = None,
         llm_model: str = None,
@@ -78,13 +77,11 @@ class WebSocketTradingEngine:
         llm_logged = log_responses or log_llm
 
         # REST client (for historical data, funding, OI)
-        base_url = "https://demo-fapi.binance.com" if testnet else "https://fapi.binance.com"
-        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=rest_logged)
+        self.data_feed = BinanceDataFeed(log_responses=rest_logged)
 
         # WebSocket client (for real-time LTP, mark price, bid/ask)
         self.ws_feed = BinanceWebSocketFeed(
             symbol=self.symbol,
-            testnet=testnet,
             on_mark_price=self._on_mark_price,
             on_kline=self._on_kline,
             on_book_ticker=self._on_book_ticker,
@@ -662,7 +659,6 @@ def main():
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--balance", type=float, default=1_000.0)
     parser.add_argument("--leverage", type=int, default=LEVERAGE)
-    parser.add_argument("--testnet", action="store_true")
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--llm-host", default=None, help="Ollama host URL (defaults to OLLAMA_HOST env var)")
     parser.add_argument("--llm-model", default=None, help="Ollama model name (defaults to OLLAMA_MODEL env var)")
@@ -681,7 +677,6 @@ def main():
         symbol=args.symbol,
         initial_balance=args.balance,
         leverage=args.leverage,
-        testnet=args.testnet,
         use_llm=not args.no_llm,
         llm_host=args.llm_host,
         llm_model=args.llm_model,

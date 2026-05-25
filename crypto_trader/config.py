@@ -17,7 +17,6 @@ from typing import List, Optional
 
 class TradingMode(str, Enum):
     PAPER = "paper"
-    TESTNET = "testnet"
     LIVE = "live"
 
 
@@ -196,7 +195,7 @@ class TradingConfig:
 
     @property
     def is_live(self) -> bool:
-        return self.mode in (TradingMode.LIVE, TradingMode.TESTNET)
+        return self.mode == TradingMode.LIVE
 
     @property
     def has_coindcx_credentials(self) -> bool:
@@ -219,7 +218,7 @@ class TradingConfig:
             errs.append("TRADE_SYMBOL is required")
         if self.is_live and not self.has_coindcx_credentials:
             errs.append(
-                "Live/testnet mode requires COINDCX_API_KEY and COINDCX_API_SECRET"
+                "Live mode requires COINDCX_API_KEY and COINDCX_API_SECRET"
             )
         return errs
 

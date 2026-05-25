@@ -32,7 +32,6 @@ import websocket
 logger = logging.getLogger("crypto_trader.ws_client")
 
 BINANCE_WS_BASE = "wss://fstream.binance.com"
-BINANCE_WS_TESTNET = "wss://stream.binancefuture.com"
 
 
 @dataclass
@@ -80,7 +79,6 @@ class BinanceWebSocketFeed:
     def __init__(
         self,
         symbol: str,
-        testnet: bool = False,
         on_mark_price: Optional[Callable] = None,
         on_kline: Optional[Callable] = None,
         on_book_ticker: Optional[Callable] = None,
@@ -89,7 +87,6 @@ class BinanceWebSocketFeed:
         log_responses: bool = False,
     ):
         self.symbol = symbol.lower()
-        self.testnet = testnet
         self.on_mark_price = on_mark_price
         self.on_kline = on_kline
         self.on_book_ticker = on_book_ticker
@@ -216,7 +213,7 @@ class BinanceWebSocketFeed:
 
     def _connect(self):
         """Establish WebSocket connection and subscribe to streams."""
-        base = BINANCE_WS_TESTNET if self.testnet else BINANCE_WS_BASE
+        base = BINANCE_WS_BASE
         # Combined stream: /stream?streams=topic1/topic2/...
         # Simplified stream list to ensure maximum compatibility
         streams = "/".join([

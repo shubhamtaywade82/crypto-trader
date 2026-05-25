@@ -2,8 +2,8 @@
 crypto_trader.engine_live — Single gated production entrypoint
 ===============================================================
 The ONE supported way to run the bot against real capital. Selects the
-execution engine by ``MODE`` (paper | testnet | live) and, for live/testnet,
-refuses to trade unless a startup self-test passes:
+execution engine by ``MODE`` (paper | live) and, for live, refuses to trade
+unless a startup self-test passes:
 
     * config is complete and valid (leverage <= cap, symbol set)
     * CoinDCX credentials authenticate (balances readable)
@@ -32,7 +32,7 @@ logger = logging.getLogger("crypto_trader.engine_live")
 
 
 class LiveGateBlocked(Exception):
-    """Raised when live/testnet mode fails the startup self-test."""
+    """Raised when live mode fails the startup self-test."""
 
 
 @dataclass
