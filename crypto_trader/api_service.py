@@ -119,6 +119,148 @@ def get_pnl(mode: str = Query("paper")):
     finally:
         conn.close()
 
+BINANCE_FAPI = "https://fapi.binance.com"
+INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", "1000") or 1000)
+
+
+async def _fetch_ltp(symbols: List[str]) -> dict:
+    """Mark/last price per symbol from Binance USDⓈ-M public API (no creds)."""
+    import httpx
+    out: dict = {}
+    if not symbols:
+        return out
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        async def one(sym: str):
+            try:
+                r = await client.get(f"{BINANCE_FAPI}/fapi/v1/ticker/price", params={"symbol": sym})
+                r.raise_for_status()
+                out[sym] = float(r.json()["price"])
+            except Exception as e:
+                logger.warning("ltp fetch failed for %s: %s", sym, e)
+                out[sym] = None
+        await asyncio.gather(*(one(s) for s in symbols))
+    return out
+
+
+def _realized_pnl(cur, mode: str) -> float:
+    cur.execute(
+        """SELECT COALESCE(SUM(
+            CASE
+                WHEN type = 'POSITION_PARTIALLY_CLOSED' THEN COALESCE((payload->>'pnl')::numeric, (payload->>'remaining_pnl')::numeric, 0) - COALESCE((payload->>'fee')::numeric, 0)
+                WHEN type IN ('POSITION_CLOSED', 'LIQUIDATION') THEN COALESCE((payload->>'remaining_pnl')::numeric, 0) - COALESCE((payload->>'fee')::numeric, 0)
+                WHEN type = 'FUNDING_APPLIED' THEN COALESCE((payload->>'amount')::numeric, 0)
+                WHEN type = 'FEE_CHARGED' THEN -COALESCE((payload->>'amount')::numeric, 0)
+                WHEN type IN ('ORDER_FILLED', 'ORDER_PARTIALLY_FILLED') THEN -COALESCE((payload->>'fee')::numeric, 0)
+                ELSE 0
+            END), 0) AS realized
+           FROM events WHERE payload->>'mode' = %s""",
+        (mode,),
+    )
+    return float(cur.fetchone()["realized"] or 0)
+
+
+@app.get("/ltp")
+async def get_ltp(symbols: str = Query("", description="comma-separated symbols")):
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    return await _fetch_ltp(syms)
+
+
+@app.get("/account")
+async def get_account(mode: str = Query("paper")):
+    """Balance, realized + unrealized PnL, equity. Balance is derived from the
+    event journal (initial + realized) so it matches the projection."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            realized = _realized_pnl(cur, mode)
+            cur.execute(
+                "SELECT symbol, side, qty, avg_price FROM active_positions WHERE mode=%s AND COALESCE(qty,0) > 0",
+                (mode,),
+            )
+            positions = cur.fetchall()
+    finally:
+        conn.close()
+
+    ltp = await _fetch_ltp([p["symbol"] for p in positions])
+    unrealized = 0.0
+    enriched = []
+    for p in positions:
+        mark = ltp.get(p["symbol"])
+        avg = float(p["avg_price"] or 0)
+        qty = float(p["qty"] or 0)
+        upnl = None
+        if mark is not None and avg > 0:
+            sign = 1.0 if str(p["side"]).upper() in ("LONG", "BUY") else -1.0
+            upnl = (mark - avg) * qty * sign
+            unrealized += upnl
+        enriched.append({**p, "mark_price": mark, "unrealized_pnl": upnl})
+
+    balance = INITIAL_BALANCE + realized
+    return {
+        "mode": mode,
+        "initial_balance": INITIAL_BALANCE,
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "balance": balance,
+        "equity": balance + unrealized,
+        "open_positions": enriched,
+    }
+
+
+@app.get("/risk")
+def get_risk():
+    """RiskManager persisted state (kill switch, daily count, drawdown)."""
+    import json as _json
+    from pathlib import Path
+    f = Path.home() / ".crypto_trader" / "risk_state.json"
+    if not f.exists():
+        return {"available": False}
+    try:
+        return {"available": True, **_json.loads(f.read_text())}
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+@app.get("/gate")
+def get_gate():
+    """Live-trading gate status (safe_mode): is real-money placement enabled?"""
+    from pathlib import Path
+    halt = (Path.home() / ".crypto_trader" / "HALT").exists()
+    enabled = os.environ.get("LIVE_TRADING_ENABLED", "").lower() in ("true", "1", "yes")
+    ack_ok = os.environ.get("LIVE_TRADING_ACK", "") == "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"
+    return {
+        "mode": os.environ.get("MODE", "paper"),
+        "live_enabled": enabled,
+        "ack_ok": ack_ok,
+        "halt_file": halt,
+        "live_orders_allowed": enabled and ack_ok and not halt,
+    }
+
+
+@app.get("/positions/detail")
+def positions_detail(mode: str = Query("paper")):
+    """Active positions joined with SL/TP from the latest POSITION_OPENED event."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM active_positions WHERE mode=%s", (mode,))
+            rows = cur.fetchall()
+            for r in rows:
+                cur.execute(
+                    """SELECT payload->>'sl_price' AS sl, payload->'tp_levels' AS tp
+                       FROM events
+                       WHERE type='POSITION_OPENED' AND payload->>'symbol'=%s AND payload->>'mode'=%s
+                       ORDER BY id DESC LIMIT 1""",
+                    (r["symbol"], mode),
+                )
+                d = cur.fetchone()
+                r["sl_price"] = float(d["sl"]) if d and d["sl"] else None
+                r["tp_levels"] = d["tp"] if d else None
+            return rows
+    finally:
+        conn.close()
+
+
 @app.get("/events/stream")
 async def event_stream(request: Request):
     """Bridge Redis events to Server-Sent Events (SSE)."""
