@@ -47,7 +47,7 @@ class LiveTradingSystem:
     def __init__(self, cfg: Optional[TradingConfig] = None, bus: Optional[EventBus] = None):
         self.cfg = cfg or load_config()
         self.bus = bus or global_bus
-        self.risk = RiskManager()
+        self.risk = RiskManager(max_orders_per_minute=self.cfg.max_orders_per_minute)
         self.event_store = None
         self.execution_engine = None
         self.router = None
@@ -139,6 +139,23 @@ class LiveTradingSystem:
         )
         checks.append(Check("safe_mode_gate", gate_open, gate_detail))
 
+        # G1: clock skew vs the venue. Advisory (Date-header resolution is ~1s),
+        # so it warns rather than blocks unless drift is egregiously large.
+        try:
+            skew = self.execution_engine.client.measure_clock_skew_ms()
+            if skew is None:
+                checks.append(Check("clock_skew", True, "unavailable (probe failed)", critical=False))
+            else:
+                within = abs(skew) <= self.cfg.clock_skew_max_ms
+                checks.append(Check("clock_skew", within,
+                                    f"drift {skew:+.0f}ms (max {self.cfg.clock_skew_max_ms}ms)",
+                                    critical=False))
+                if not within:
+                    logger.warning("[CLOCK] local clock drifts %.0fms from CoinDCX — "
+                                   "sync NTP to avoid signature/window auth errors", skew)
+        except Exception as e:
+            checks.append(Check("clock_skew", True, f"skipped ({e})", critical=False))
+
         # Credentials authenticate; available margin (in the wallet's currency)
         mc = self.cfg.coindcx_margin_currency
         avail = 0.0
@@ -173,7 +190,8 @@ class LiveTradingSystem:
         # Boot reconciliation healthy
         try:
             from .execution.reconciler import Reconciler
-            self.reconciler = Reconciler(self.wallet, self.execution_engine, self.risk, bus=self.bus)
+            self.reconciler = Reconciler(self.wallet, self.execution_engine, self.risk,
+                                         bus=self.bus, strict_cancel=self.cfg.reconcile_strict_cancel)
             mismatches = self.reconciler.reconcile(self.cfg.symbol)
             unresolved = [m for m in mismatches if not m.repaired]
             # Block startup if truth is unverifiable (transient) OR there is a

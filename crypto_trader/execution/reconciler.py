@@ -36,12 +36,16 @@ class Reconciler:
         *,
         bus: Optional[EventBus] = None,
         qty_tolerance: Decimal = _QTY_TOLERANCE,
+        strict_cancel: bool = False,
     ):
         self.wallet = wallet
+        self.engine = execution_engine
         self.account_sync = AccountSync(execution_engine)
         self.risk = risk_manager
         self.bus = bus
         self.qty_tolerance = qty_tolerance
+        # G5: on unresolved desync, cancel ALL venue orders to protect capital.
+        self.strict_cancel = strict_cancel
         # True after a reconcile where the venue snapshot could not be fetched.
         self.snapshot_failed = False
 
@@ -61,6 +65,14 @@ class Reconciler:
                            m.kind, m.internal, m.exchange)
         unresolved = [m for m in mismatches if not m.repaired]
         if unresolved:
+            # G5: strict mode flattens the venue order book before halting, so a
+            # corrupted local state can't leave working orders unsupervised.
+            if self.strict_cancel:
+                try:
+                    n = self.engine.cancel_all_orders(symbol)
+                    logger.critical("Strict reconcile: cancelled %d venue order(s) on desync", n)
+                except Exception as e:
+                    logger.error("Strict cancel-all failed: %s", e)
             self._trip(f"{len(unresolved)} unresolved reconciliation mismatch(es)")
         return mismatches
 

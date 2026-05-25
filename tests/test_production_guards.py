@@ -1,0 +1,223 @@
+"""Production-readiness guards G1–G5."""
+import tempfile
+import time
+import uuid
+from email.utils import formatdate
+from pathlib import Path
+
+import pytest
+
+from crypto_trader.config import TradingConfig
+from crypto_trader.exchanges.coindcx_client import CoinDCXClient, _parse_float
+from crypto_trader.risk import RiskManager
+
+
+def _clean_risk(**kw):
+    r = RiskManager(**kw)
+    # Isolate from the shared persisted state file (RiskManager.DATA_DIR is
+    # import-time fixed, so redirect saves to a unique temp file).
+    r.state_file = Path(tempfile.gettempdir()) / f"risk_test_{uuid.uuid4().hex}.json"
+    r.kill_switch = False
+    r.daily_count = 0
+    r.consecutive_losses = 0
+    r.last_loss_time = None
+    r.peak_balance = None
+    r._recent_open_times = []
+    return r
+
+
+# ── G1: clock-skew measurement ───────────────────────────────────────────────
+class _Resp:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_clock_skew_detects_drift(monkeypatch):
+    client = CoinDCXClient(api_key="k", api_secret="s")
+    server_epoch = time.time() - 5  # venue clock 5s behind local
+    monkeypatch.setattr(client.session, "get",
+                        lambda *a, **k: _Resp({"Date": formatdate(server_epoch, usegmt=True)}))
+    skew = client.measure_clock_skew_ms()
+    assert skew is not None
+    assert 4000 < skew < 6500   # ~+5000ms (1s Date resolution + RTT slack)
+
+
+def test_clock_skew_none_without_date_header(monkeypatch):
+    client = CoinDCXClient(api_key="k", api_secret="s")
+    monkeypatch.setattr(client.session, "get", lambda *a, **k: _Resp({}))
+    assert client.measure_clock_skew_ms() is None
+
+
+# ── G2: velocity circuit breaker ──────────────────────────────────────────────
+def test_velocity_breaker_blocks_burst():
+    r = _clean_risk(max_daily_trades=100, max_orders_per_minute=3)
+    for _ in range(3):
+        ok, _ = r.can_trade()
+        assert ok
+        r.record_open()
+    ok, reason = r.can_trade()
+    assert not ok
+    assert "Velocity" in reason
+
+
+def test_velocity_window_prunes_old_opens():
+    r = _clean_risk(max_daily_trades=100, max_orders_per_minute=2)
+    # Two opens older than 60s should not count against the window.
+    r._recent_open_times = [time.time() - 120, time.time() - 90]
+    ok, _ = r.can_trade()
+    assert ok
+
+
+def test_velocity_disabled_when_zero():
+    r = _clean_risk(max_daily_trades=100, max_orders_per_minute=0)
+    r._recent_open_times = [time.time()] * 50
+    ok, _ = r.can_trade()
+    assert ok
+
+
+# ── G3: thread supervisor ─────────────────────────────────────────────────────
+class _FakeThread:
+    def __init__(self, alive):
+        self._alive = alive
+
+    def is_alive(self):
+        return self._alive
+
+
+def _engine(monkeypatch, tmp_path, feed_alive=True, pm_alive=True):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    from crypto_trader.engine_ws import WebSocketTradingEngine
+    eng = WebSocketTradingEngine(symbol="SOLUSDT", use_llm=False, cfg=TradingConfig())
+    eng.ws_feed = _FakeThread(feed_alive)
+    eng.ws_pm = _FakeThread(pm_alive)
+    eng.risk_manager = _clean_risk()
+    return eng
+
+
+def test_supervisor_passes_when_threads_alive(monkeypatch, tmp_path):
+    eng = _engine(monkeypatch, tmp_path, feed_alive=True, pm_alive=True)
+    assert eng._supervise_threads() is True
+    assert not eng.risk_manager.kill_switch
+
+
+def test_supervisor_fail_stops_on_dead_thread(monkeypatch, tmp_path):
+    from crypto_trader import safe_mode
+    halt = tmp_path / "HALT"
+    monkeypatch.setattr(safe_mode, "HALT_FILE", halt)
+    eng = _engine(monkeypatch, tmp_path, feed_alive=False, pm_alive=True)
+    from crypto_trader.events import EventBus, SystemFailureEvent
+    bus = EventBus()
+    failures = []
+    bus.subscribe(SystemFailureEvent, lambda e: failures.append(e))
+    eng.event_bus = bus
+
+    assert eng._supervise_threads() is False
+    assert eng._halted is True
+    assert eng.risk_manager.kill_switch is True
+    assert halt.exists()
+    assert len(failures) == 1
+
+
+def test_supervisor_respects_disable_flag(monkeypatch, tmp_path):
+    cfg = TradingConfig(thread_supervisor_enabled=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    from crypto_trader.engine_ws import WebSocketTradingEngine
+    eng = WebSocketTradingEngine(symbol="SOLUSDT", use_llm=False, cfg=cfg)
+    eng.ws_feed = _FakeThread(False)
+    eng.ws_pm = _FakeThread(False)
+    eng.risk_manager = _clean_risk()
+    assert eng._supervise_threads() is True   # supervisor disabled -> no halt
+
+
+# ── G4: rate-limit backpressure ───────────────────────────────────────────────
+def test_backpressure_sleeps_when_quota_low(monkeypatch):
+    client = CoinDCXClient(api_key="k", api_secret="s")
+    slept = []
+    monkeypatch.setattr("crypto_trader.exchanges.coindcx_client.time.sleep", lambda s: slept.append(s))
+    client._apply_backpressure(_Resp({"X-RateLimit-Remaining": "2", "X-RateLimit-Limit": "100"}))
+    assert slept and slept[0] > 0
+
+
+def test_backpressure_noop_when_quota_high(monkeypatch):
+    client = CoinDCXClient(api_key="k", api_secret="s")
+    slept = []
+    monkeypatch.setattr("crypto_trader.exchanges.coindcx_client.time.sleep", lambda s: slept.append(s))
+    client._apply_backpressure(_Resp({"X-RateLimit-Remaining": "90", "X-RateLimit-Limit": "100"}))
+    assert not slept
+
+
+def test_parse_float_helper():
+    assert _parse_float("12") == 12.0
+    assert _parse_float(None) is None
+    assert _parse_float("abc") is None
+
+
+# ── G5: order-status query, cancel-all, strict reconcile ──────────────────────
+class _FakeExecEngine:
+    def __init__(self, open_orders=None, fills=None, positions=None):
+        self._open = open_orders or []
+        self._fills = fills or []
+        self._positions = positions or []
+        self.cancelled = []
+        self.cancel_all_calls = 0
+
+    def get_open_orders(self, symbol=None):
+        return self._open
+
+    def get_fills(self, symbol=None, **kw):
+        return self._fills
+
+    def get_positions(self):
+        return self._positions
+
+    def get_balances(self):
+        return {}
+
+    def cancel_order(self, oid):
+        self.cancelled.append(oid)
+        return True
+
+    def cancel_all_orders(self, symbol=None):
+        self.cancel_all_calls += 1
+        n = len(self._open)
+        self._open = []
+        return n
+
+    # delegate get_order_status / sync to the real implementation under test
+    from crypto_trader.exchanges.coindcx_execution import CoinDCXExecutionEngine
+    get_order_status = CoinDCXExecutionEngine.get_order_status
+
+
+def test_get_order_status_open_filled_unknown():
+    eng = _FakeExecEngine(
+        open_orders=[{"exchange_order_id": "A", "status": "open", "filled_quantity": 0.0}],
+        fills=[{"exchange_order_id": "B", "fill_quantity": 1.5}],
+    )
+    assert eng.get_order_status("A", "SOLUSDT")["status"] == "open"
+    assert eng.get_order_status("B", "SOLUSDT")["status"] == "filled"
+    assert eng.get_order_status("C", "SOLUSDT")["status"] == "unknown"
+
+
+def test_strict_reconcile_cancels_all_on_unresolved(monkeypatch, tmp_path):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    import uuid
+    from crypto_trader.wallet import DATA_DIR, EnhancedFuturesWallet, Playbook, PositionSide
+    from crypto_trader.execution.reconciler import Reconciler
+
+    ns = f"test_{uuid.uuid4().hex}"
+    wallet = EnhancedFuturesWallet(symbol="SOLUSDT", state_namespace=ns, leverage=1)
+    wallet.open_position("SOLUSDT", {
+        "entry_price": "100", "side": PositionSide.LONG, "playbook": Playbook.INTRADAY,
+        "sl_price": "90", "tp_price": "110",
+    }, mark_price=100, custom_quantity=1)
+
+    # Venue has NO position (ghost) and one stray open order -> unresolved desync.
+    eng = _FakeExecEngine(open_orders=[{"exchange_order_id": "Z", "symbol": "DOGEUSDT", "status": "open"}],
+                          positions=[])
+    risk = _clean_risk()
+    rec = Reconciler(wallet, eng, risk, strict_cancel=True)
+    mismatches = rec.reconcile("SOLUSDT")
+
+    assert any(m.kind == "ghost_position" for m in mismatches)
+    assert eng.cancel_all_calls == 1          # strict mode flattened the book
+    assert risk.kill_switch is True           # and halted

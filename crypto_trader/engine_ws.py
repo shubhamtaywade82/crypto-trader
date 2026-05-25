@@ -221,6 +221,10 @@ class WebSocketTradingEngine:
         iteration = 0
         try:
             while True:
+                # G3: supervise the WS threads — never trade on a dead/stale feed.
+                if not self._supervise_threads():
+                    break
+
                 # Signal generation tick (REST-based)
                 self._signal_tick()
 
@@ -233,6 +237,37 @@ class WebSocketTradingEngine:
             logger.info("Engine stopped by user")
         finally:
             self.stop()
+
+    def _supervise_threads(self) -> bool:
+        """G3: fail-stop if a background WS thread died silently.
+
+        Returns True if it is safe to continue. On a dead feed/position-manager
+        thread it trips HALT + the kill switch and halts the engine, rather than
+        evaluating signals or managing positions against a stale feed.
+        """
+        if self.cfg is not None and not getattr(self.cfg, "thread_supervisor_enabled", True):
+            return True
+        dead = []
+        if not self.ws_feed.is_alive():
+            dead.append("ws_feed")
+        if not self.ws_pm.is_alive():
+            dead.append("ws_position_manager")
+        if not dead:
+            return True
+        reason = f"WS thread(s) died: {', '.join(dead)}"
+        logger.critical("[SUPERVISOR] %s — halting engine (fail-stop)", reason)
+        try:
+            from . import safe_mode
+            safe_mode.trip_halt(reason)
+        except Exception:
+            pass
+        if getattr(self, "risk_manager", None) is not None:
+            self.risk_manager.trigger_kill_switch(reason)
+        if self.event_bus:
+            from .events import SystemFailureEvent
+            self.event_bus.publish(SystemFailureEvent(component="thread_supervisor", error=reason))
+        self._halted = True
+        return False
 
     def _signal_tick(self):
         """Generate signals using REST data (runs every 5 min)."""

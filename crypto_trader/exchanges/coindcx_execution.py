@@ -305,6 +305,43 @@ class CoinDCXExecutionEngine:
             logger.warning("set_leverage failed: %s", e)
             return False
 
+    def get_order_status(self, order_id: str, symbol: Optional[str] = None) -> dict:
+        """Resolve a single order's terminal status (G5).
+
+        CoinDCX has no documented per-order status endpoint, so this is
+        best-effort: if the id is still in open orders it's working; otherwise we
+        scan recent fills to tell ``filled`` from ``cancelled``/absent. Returns
+        ``{"status", "filled_quantity", "source"}``.
+        """
+        oid = str(order_id)
+        for o in self.get_open_orders(symbol):
+            if str(o.get("exchange_order_id")) == oid:
+                return {"status": o.get("status") or "open",
+                        "filled_quantity": float(o.get("filled_quantity", 0) or 0),
+                        "source": "open_orders"}
+        if symbol:
+            filled = sum(float(f.get("fill_quantity", 0) or 0)
+                         for f in self.get_fills(symbol)
+                         if str(f.get("exchange_order_id")) == oid)
+            if filled > 0:
+                return {"status": "filled", "filled_quantity": filled, "source": "fills"}
+        return {"status": "unknown", "filled_quantity": 0.0, "source": "absent"}
+
+    def cancel_all_orders(self, symbol: Optional[str] = None) -> int:
+        """Cancel every open order (optionally for one symbol). Returns count (G5).
+
+        Used as a strict capital-protection sweep when the reconciler detects an
+        unresolved desync. Each cancel inherits the ``safe_mode`` gate.
+        """
+        cancelled = 0
+        for o in self.get_open_orders(symbol):
+            oid = o.get("exchange_order_id")
+            if oid and self.cancel_order(oid):
+                cancelled += 1
+        if cancelled:
+            logger.warning("cancel_all_orders flattened %d venue order(s)", cancelled)
+        return cancelled
+
     # ── helpers ─────────────────────────────────────────────────────────────
     def _parse_order_response(self, resp, symbol, side, qty, order_type, reduce_only) -> Order:
         data = resp[0] if isinstance(resp, list) and resp else resp

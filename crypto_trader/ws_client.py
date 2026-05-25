@@ -116,6 +116,10 @@ class BinanceWebSocketFeed:
         self._thread.start()
         logger.info(f"[WS] Starting WebSocket for {self.symbol}")
 
+    def is_alive(self) -> bool:
+        """True while the background feed thread is running (G3 supervisor)."""
+        return self._running and self._thread is not None and self._thread.is_alive()
+
     def stop(self):
         """Gracefully stop WebSocket."""
         self._running = False
@@ -422,6 +426,10 @@ class WebSocketPositionManager:
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
         logger.info("[WS-PM] Position manager started")
+
+    def is_alive(self) -> bool:
+        """True while the monitor thread is running (G3 supervisor)."""
+        return self._running and self._thread is not None and self._thread.is_alive()
 
     def stop(self):
         self._running = False

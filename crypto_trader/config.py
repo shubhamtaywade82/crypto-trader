@@ -102,6 +102,16 @@ class TradingConfig:
     coindcx_stream_url: str = "wss://stream.coindcx.com"
     coindcx_stream_channel: str = "coindcx"
 
+    # ── Production-readiness guards (G1–G5) ──
+    # G1: max tolerated local↔venue clock drift (ms) before warning/halting.
+    clock_skew_max_ms: int = 2000
+    # G2: per-minute order velocity circuit breaker (on top of the daily cap).
+    max_orders_per_minute: int = 6
+    # G3: supervise WS feed / position-manager threads; HALT if one dies silently.
+    thread_supervisor_enabled: bool = True
+    # G5: on an unresolved venue desync, cancel ALL venue orders to protect capital.
+    reconcile_strict_cancel: bool = False
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -144,6 +154,10 @@ class TradingConfig:
             coindcx_user_stream_enabled=_get_bool("COINDCX_USER_STREAM_ENABLED", False),
             coindcx_stream_url=_get("COINDCX_STREAM_URL", "wss://stream.coindcx.com"),
             coindcx_stream_channel=_get("COINDCX_STREAM_CHANNEL", "coindcx"),
+            clock_skew_max_ms=_get_int("CLOCK_SKEW_MAX_MS", 2000),
+            max_orders_per_minute=_get_int("MAX_ORDERS_PER_MINUTE", 6),
+            thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
+            reconcile_strict_cancel=_get_bool("RECONCILE_STRICT_CANCEL", False),
         )
 
     @property
