@@ -107,6 +107,7 @@ def gate_open(monkeypatch):
     """Open the safe_mode live gate for the duration of a test."""
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
     monkeypatch.setenv("LIVE_TRADING_ACK", safe_mode.ACK_PHRASE)
+    monkeypatch.setenv("PLACE_ORDER", "true")  # not read-only for these tests
     existed = safe_mode.HALT_FILE.exists()
     if existed:
         safe_mode.HALT_FILE.unlink()
@@ -155,6 +156,16 @@ def test_place_order_blocked_without_gate(monkeypatch):
     monkeypatch.delenv("LIVE_TRADING_ACK", raising=False)
     fake = _FakeClient()
     eng = _engine(fake, ack=False)
+    with pytest.raises(safe_mode.LiveTradingBlocked):
+        eng.place_order("SOLUSDT", PositionSide.LONG, Decimal("1.0"), OrderType.MARKET)
+    assert not any(ep.endswith("orders/create") for ep, _ in fake.calls)  # no order sent
+
+
+def test_place_order_blocked_when_read_only(gate_open, monkeypatch):
+    # Gate fully open but PLACE_ORDER=false -> read-only live mode blocks execution.
+    monkeypatch.setenv("PLACE_ORDER", "false")
+    fake = _FakeClient()
+    eng = _engine(fake)
     with pytest.raises(safe_mode.LiveTradingBlocked):
         eng.place_order("SOLUSDT", PositionSide.LONG, Decimal("1.0"), OrderType.MARKET)
     assert not any(ep.endswith("orders/create") for ep, _ in fake.calls)  # no order sent
