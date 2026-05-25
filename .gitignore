@@ -25,3 +25,4 @@ crypto_trader/__pycache__/**
 tests/__pycache__/**
 ./wallet_**.json
 tests/__pycache__/**
+.env.secrets
