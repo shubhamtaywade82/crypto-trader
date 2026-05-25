@@ -612,25 +612,40 @@ class WebSocketTradingEngine:
         if buf:
             entry_price = mid * (1 + buf) if setup["side"] == PositionSide.LONG else mid * (1 - buf)
 
-        # Recalculate SL/TP based on actual entry price
-        if setup["side"] == PositionSide.LONG:
-            sl = entry_price * (1 - 0.007)  # Use Playbook A SL as default
-            tp = entry_price * (1 + 0.010)
-        else:
-            sl = entry_price * (1 + 0.007)
-            tp = entry_price * (1 - 0.010)
+        # Re-anchor the PLAYBOOK's stop/target to the actual fill entry.
+        # The playbook computed sl/tp off its signal price; the real entry (mid +
+        # basis buffer) differs slightly, so we preserve the playbook's
+        # proportional stop distance rather than discarding it for a flat default.
+        is_long = setup["side"] == PositionSide.LONG
+        pb_entry = float(setup.get("entry_price") or 0)
+        default_sl_pct, default_tp_pct = 0.007, 0.010
 
-        # Update setup with actual entry price
+        def _reanchor(level_price, fallback_pct, is_stop):
+            """Map a playbook level to the actual entry, keeping its ratio."""
+            if pb_entry > 0 and level_price and float(level_price) > 0:
+                return entry_price * (float(level_price) / pb_entry)
+            # No usable playbook level — fall back to a flat default.
+            if is_stop:
+                return entry_price * (1 - fallback_pct) if is_long else entry_price * (1 + fallback_pct)
+            return entry_price * (1 + fallback_pct) if is_long else entry_price * (1 - fallback_pct)
+
+        sl = _reanchor(setup.get("sl_price"), default_sl_pct, is_stop=True)
+
+        # Update setup with actual entry price + re-anchored stop.
         setup["entry_price"] = entry_price
         setup["sl_price"] = sl
         if "tp_price" in setup:
-            setup["tp_price"] = tp
+            setup["tp_price"] = _reanchor(setup.get("tp_price"), default_tp_pct, is_stop=False)
         else:
             for tp_level in setup.get("tp_levels", []):
-                if setup["side"] == PositionSide.LONG:
-                    tp_level["price"] = entry_price * (1 + 0.010 if tp_level["label"] == "TP1" else 0.020)
-                else:
-                    tp_level["price"] = entry_price * (1 - 0.010 if tp_level["label"] == "TP1" else 0.020)
+                lvl_default = 0.010 if tp_level.get("label") == "TP1" else 0.020
+                tp_level["price"] = _reanchor(tp_level.get("price"), lvl_default, is_stop=False)
+
+        # Representative TP for events/logging (first target, or single tp_price).
+        tp = setup.get("tp_price")
+        if tp is None:
+            _levels = setup.get("tp_levels", [])
+            tp = _levels[0]["price"] if _levels else entry_price
 
         # Risk-based sizing from stop distance (2% risk per trade)
         stop_distance = abs(entry_price - setup["sl_price"])
