@@ -44,7 +44,7 @@ class Config:
     MAX_LEVERAGE = 5.0             # 5x max
     MAX_DAILY_DRAWDOWN = 0.05      # 5% kill switch
     MAX_CORRELATED_POS = 2         # Max 2 same-direction in correlated group
-    MAX_MARGIN_RATIO = 0.30        # 30% max margin allocation per position
+    MAX_MARGIN_RATIO = 0.45        # 45% max margin allocation per position
     SL_PCT = 0.015                 # 1.5% stop loss
     TP_PCT = 0.035                 # 3.5% take profit
 
@@ -87,11 +87,11 @@ class Config:
             'TP_PCT': 0.035
         },
         'SOL/USDT:USDT': {
-            'BB_PERIOD': 25,
-            'BB_STD': 1.5,
-            'ADX_TREND_THRESHOLD': 25,
-            'SL_PCT': 0.015,
-            'TP_PCT': 0.035
+            'BB_PERIOD': 20,
+            'BB_STD': 3.0,
+            'ADX_TREND_THRESHOLD': 30,
+            'SL_PCT': 0.025,
+            'TP_PCT': 0.08
         },
         'XRP/USDT:USDT': {
             'BB_PERIOD': 25,
@@ -197,16 +197,30 @@ class MeanReversionEngine:
 
     def get_symbol_config(self, symbol: str):
         cfg = self.cfg
-        if hasattr(cfg, 'SYMBOL_PARAMS') and symbol in cfg.SYMBOL_PARAMS:
-            params = cfg.SYMBOL_PARAMS[symbol]
-            class SymbolConfig:
-                def __init__(self, base_cfg, sym_params):
-                    for attr in dir(base_cfg):
-                        if not attr.startswith('__') and not callable(getattr(base_cfg, attr)):
-                            setattr(self, attr, getattr(base_cfg, attr))
-                    for k, v in sym_params.items():
-                        setattr(self, k, v)
-            return SymbolConfig(cfg, params)
+        if not symbol:
+            return cfg
+        
+        def get_base_asset(s: str) -> str:
+            s = s.upper()
+            if "/" in s:
+                return s.split("/")[0]
+            if s.endswith("USDT"):
+                return s[:-4]
+            return s
+            
+        base_asset = get_base_asset(symbol)
+        
+        if hasattr(cfg, 'SYMBOL_PARAMS'):
+            for sym_key, params in cfg.SYMBOL_PARAMS.items():
+                if get_base_asset(sym_key) == base_asset:
+                    class SymbolConfig:
+                        def __init__(self, base_cfg, sym_params):
+                            for attr in dir(base_cfg):
+                                if not attr.startswith('__') and not callable(getattr(base_cfg, attr)):
+                                    setattr(self, attr, getattr(base_cfg, attr))
+                            for k, v in sym_params.items():
+                                setattr(self, k, v)
+                    return SymbolConfig(cfg, params)
         return cfg
 
     def calculate(self, df: pd.DataFrame, symbol: str = None) -> pd.DataFrame:
