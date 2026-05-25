@@ -165,9 +165,19 @@ class PostgresProjection:
         logger.info("Postgres projection ready")
 
     def apply(self, event: dict) -> None:
-        """Apply one event to the projection tables (idempotent upserts)."""
+        """Apply one event to the projection tables (idempotent upserts).
+
+        Events whose effect depends on prior state (ORDER_FILLED, cancellations,
+        partial closes) are applied as incremental SQL against the already-
+        persisted row, because each call uses a fresh reducer that has no memory
+        of earlier events in this process. ``rebuild_from`` keeps the stateful
+        reducer for full replays.
+        """
         st = ProjectionState(mode=self.mode)
         st.apply(event)
+        et = event.get("event_type")
+        p = event.get("payload", {}) or {}
+        mode = p.get("mode", self.mode)
         with self.conn.cursor() as cur:
             for o in st.orders.values():
                 self._upsert_order(cur, o)
@@ -175,12 +185,40 @@ class PostgresProjection:
                 self._upsert_position(cur, pos)
             for f in st.fills:
                 self._insert_fill(cur, f)
-            # Closures/liquidations remove the row.
-            et = event.get("event_type")
-            if et in ("POSITION_CLOSED", "LIQUIDATION"):
-                sym = (event.get("payload") or {}).get("symbol")
+
+            if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
+                oid = p.get("order_id")
+                if oid:
+                    cur.execute(
+                        """UPDATE orders
+                              SET filled_qty = COALESCE(filled_qty, 0) + %s,
+                                  avg_fill_price = COALESCE(NULLIF(%s, 0), avg_fill_price),
+                                  status = %s
+                            WHERE exchange_order_id = %s AND mode = %s""",
+                        (_f(p.get("quantity")), _f(p.get("fill_price")),
+                         p.get("status", "FILLED"), oid, mode),
+                    )
+            elif et in ("ORDER_CANCELLED", "ORDER_REJECTED", "ORDER_EXPIRED"):
+                oid = p.get("order_id")
+                if oid:
+                    cur.execute(
+                        "UPDATE orders SET status=%s WHERE exchange_order_id=%s AND mode=%s",
+                        (et.replace("ORDER_", ""), oid, mode),
+                    )
+            elif et == "POSITION_PARTIALLY_CLOSED":
+                sym = p.get("symbol")
                 if sym:
-                    cur.execute("DELETE FROM active_positions WHERE symbol=%s AND mode=%s", (sym, self.mode))
+                    cur.execute(
+                        """UPDATE active_positions
+                              SET qty = GREATEST(0, COALESCE(qty, 0) - %s),
+                                  last_event_ts = %s, updated_at = NOW()
+                            WHERE symbol=%s AND mode=%s""",
+                        (_f(p.get("closed_qty")), int(event.get("ts", 0) or 0), sym, mode),
+                    )
+            elif et in ("POSITION_CLOSED", "LIQUIDATION"):
+                sym = p.get("symbol")
+                if sym:
+                    cur.execute("DELETE FROM active_positions WHERE symbol=%s AND mode=%s", (sym, mode))
 
     def rebuild_from(self, events: Iterable[dict]) -> None:
         """Truncate and rematerialize the projection from the event stream."""
