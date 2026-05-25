@@ -5,8 +5,10 @@ Daily trade limits, consecutive loss tracking, and LLM failure circuit breaker.
 """
 
 import json
+import os
 import time
 import logging
+import tempfile
 from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Tuple, Optional
@@ -16,6 +18,24 @@ logger = logging.getLogger("crypto_trader.risk")
 
 DATA_DIR = Path.home() / ".crypto_trader"
 DATA_DIR.mkdir(exist_ok=True)
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically (temp file + fsync + rename) so a crash mid-write
+    can't leave a truncated/corrupt state file — critical for the kill switch."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class RiskManager:
@@ -29,6 +49,8 @@ class RiskManager:
         max_daily_drawdown_pct: float = 0.05,
         cooldown_after_loss_minutes: int = 30,
         max_correlated_positions: int = 2,
+        max_orders_per_minute: int = 6,
+        max_margin_ratio: float = 0.80,
     ):
         self.max_daily = max_daily_trades
         self.max_consecutive = max_consecutive_losses
@@ -36,6 +58,11 @@ class RiskManager:
         self.max_daily_drawdown_pct = max_daily_drawdown_pct
         self.cooldown_after_loss_seconds = cooldown_after_loss_minutes * 60
         self.max_correlated_positions = max_correlated_positions
+        self.max_margin_ratio = max_margin_ratio
+        # G2: per-minute order velocity circuit breaker (runaway-loop guard).
+        # In-memory only; a restart resets the 60s window, which is safe.
+        self.max_orders_per_minute = max_orders_per_minute
+        self._recent_open_times: list = []
         self.daily_count = 0
         self.daily_pnl = 0.0
         self.last_trade_date: Optional[date] = None
@@ -79,6 +106,14 @@ class RiskManager:
 
         if self.daily_count >= self.max_daily:
             return False, f"Daily trade limit reached ({self.max_daily})"
+
+        # G2: velocity circuit breaker — block runaway bursts within a 60s window.
+        if self.max_orders_per_minute > 0:
+            now = time.time()
+            self._recent_open_times = [t for t in self._recent_open_times if now - t < 60.0]
+            if len(self._recent_open_times) >= self.max_orders_per_minute:
+                return False, (f"Velocity limit reached "
+                               f"({len(self._recent_open_times)}/{self.max_orders_per_minute} orders/min)")
         
         # Kill switch: 5% daily drawdown
         if initial_daily_balance and self.daily_pnl <= -initial_daily_balance * self.max_daily_drawdown_pct:
@@ -95,11 +130,17 @@ class RiskManager:
         
         if current_balance is not None and self.peak_balance and self.peak_balance > 0:
             cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
-            peak = float(self.peak_balance) if isinstance(self.peak_balance, Decimal) else float(self.peak_balance)
+            peak = float(self.peak_balance) if self.peak_balance is not None else 0.0
             dd = (peak - cur) / peak
             if dd >= self.max_drawdown_pct:
                 return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
         
+        return True, "OK"
+
+    def check_margin_ratio(self, ratio: float) -> Tuple[bool, str]:
+        """Verify the authoritative exchange margin ratio is within safe bounds."""
+        if ratio >= self.max_margin_ratio:
+            return False, f"Exchange margin ratio too high: {ratio:.2%} >= {self.max_margin_ratio:.2%}"
         return True, "OK"
 
     def check_correlation(self, symbol: str, side: str, active_positions: dict) -> Tuple[bool, str]:
@@ -128,6 +169,7 @@ class RiskManager:
             self.daily_pnl = 0.0
             self.last_trade_date = today
         self.daily_count += 1
+        self._recent_open_times.append(time.time())  # G2 velocity tracking
         self._save_state()
 
     def record_close(self, net_pnl: float):
@@ -168,8 +210,7 @@ class RiskManager:
             "kill_switch": self.kill_switch,
             "kill_switch_reason": self.kill_switch_reason,
         }
-        with open(self.state_file, "w") as f:
-            json.dump(state, f)
+        _atomic_write_json(self.state_file, state)
 
     def _load_state(self):
         if not self.state_file.exists():
@@ -237,8 +278,7 @@ class AdaptiveThresholdManager:
 
     def _save_state(self):
         try:
-            with open(self.state_file, "w") as f:
-                json.dump({"last_trade_time": self.last_trade_time}, f)
+            _atomic_write_json(self.state_file, {"last_trade_time": self.last_trade_time})
         except Exception:
             pass
 

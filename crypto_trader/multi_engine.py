@@ -45,7 +45,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
     parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier")
-    parser.add_argument("--testnet", action="store_true", help="Use Binance Testnet")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM advisor")
     parser.add_argument("--llm-host", type=str, default=None, help="Ollama host URL")
     parser.add_argument("--llm-model", type=str, default=None, help="Ollama model name")
@@ -197,6 +196,56 @@ def main():
         initial_balance=total_balance, 
         leverage=args.leverage,
     )
+
+    # ── Database Projections & Event Journal for Dashboard UI ──
+    from crypto_trader.config import load_config
+    cfg = load_config()
+    
+    event_store = None
+    projection = None
+    ui_publisher = None
+    
+    if cfg.database_url:
+        try:
+            from crypto_trader.storage import get_event_store
+            event_store = get_event_store(cfg.database_url)
+            logger.info("Postgres event store initialized for multi-engine")
+        except Exception as e:
+            logger.error("Failed to initialize Postgres event store: %s", e)
+            
+    if cfg.projection_enabled and cfg.database_url:
+        try:
+            from crypto_trader.storage.projection import PostgresProjection
+            projection = PostgresProjection(cfg.database_url, mode=cfg.mode.value)
+            logger.info("Postgres projection read-model enabled for multi-engine")
+        except Exception as e:
+            logger.error("Failed to initialize Postgres projection: %s", e)
+            
+    if cfg.ui_events_enabled and cfg.redis_url:
+        try:
+            from crypto_trader.api.events_bridge import RedisEventPublisher
+            ui_publisher = RedisEventPublisher(cfg.redis_url, cfg.ui_events_channel)
+            logger.info("Realtime UI event relay enabled for multi-engine (channel=%s)", cfg.ui_events_channel)
+        except Exception as e:
+            logger.error("Failed to initialize UI event relay: %s", e)
+            
+    if event_store is not None or projection is not None or ui_publisher is not None:
+        prev_hook = global_wallet.event_hook
+        def _sink(ev):
+            if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
+                ev["payload"]["mode"] = cfg.mode.value
+                
+            if event_store is not None:
+                try: event_store.append(ev)
+                except Exception as e: logger.error("event store append failed: %s", e)
+            if projection is not None:
+                try: projection.apply(ev)
+                except Exception as e: logger.error("projection apply failed: %s", e)
+            if ui_publisher is not None:
+                ui_publisher(ev)
+            if prev_hook:
+                prev_hook(ev)
+        global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
 
@@ -219,13 +268,16 @@ def main():
     # Divide total balance equally among symbols to prevent overallocation
     per_symbol_balance = total_balance / len(symbols)
 
+    # Shared wallet: bound each symbol's per-trade risk to 1/N of the budget so
+    # N concurrent positions don't collectively risk N×2% of the whole account.
+    risk_fraction = 1.0 / max(1, len(symbols))
+
     for sym in symbols:
         engine = WebSocketTradingEngine(
             symbol=sym,
             wallet=global_wallet,
             initial_balance=per_symbol_balance,
             leverage=args.leverage,
-            testnet=args.testnet,
             use_llm=not args.no_llm,
             llm_host=args.llm_host,
             llm_model=args.llm_model,
@@ -234,6 +286,7 @@ def main():
             log_ws=args.log_ws,
             log_llm=args.log_llm,
             event_bus=bus,
+            risk_budget_fraction=risk_fraction,
         )
         engine.risk_manager = global_risk  # Share the global risk manager
         engines.append(engine)

@@ -7,11 +7,25 @@ services:
       POSTGRES_PASSWORD: trader
       POSTGRES_DB: crypto_trader
     ports:
-      - "5434:5432"
+      - "5435:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trader -d crypto_trader"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: crypto_trader_redis
+    command: ["redis-server", "--appendonly", "yes"]   # AOF persistence for stream durability
+    ports:
+      - "6382:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -25,11 +39,54 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file: .env
     environment:
       DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
+      REDIS_URL: redis://redis:6379/0
+      PROJECTION_ENABLED: "true"
+      UI_EVENTS_ENABLED: "true"
     command: ["python", "-m", "crypto_trader.engine_live", "--tick", "300"]
+    restart: unless-stopped
+
+  # Optional: the decoupled Redis Streams execution worker (consumer group).
+  # Enable with: docker compose --profile bot up execution-worker
+  execution-worker:
+    profiles: ["bot"]
+    build: .
+    container_name: crypto_trader_exec
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
+      REDIS_URL: redis://redis:6379/0
+      EXECUTION_BUS: redis
+    command: ["python", "-m", "crypto_trader.execution.run_consumer"]
+    restart: unless-stopped
+
+  api:
+    profiles: ["bot"]
+    build: .
+    container_name: crypto_trader_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8088:8088"
+    command: ["python", "-m", "crypto_trader.api", "--port", "8088"]
     restart: unless-stopped
 
 volumes:
   pgdata:
+  redisdata:

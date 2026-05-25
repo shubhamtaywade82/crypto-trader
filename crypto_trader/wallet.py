@@ -588,6 +588,13 @@ class EnhancedFuturesWallet:
             reduce_only=reduce_only, client_order_id=coid,
         )
         price = order.avg_fill_price if order.avg_fill_price and order.avg_fill_price > 0 else Decimal("0")
+        if price <= Decimal("0"):
+            # Booking at price 0 would corrupt PnL/SL/TP/liquidation. The engine
+            # confirms market fills, so a zero here is a hard failure to surface.
+            raise ValueError(
+                f"venue fill for {symbol} ({intent}) returned no usable price "
+                f"(order_id={order.id}); refusing to book a zero-price fill"
+            )
         fee = self._calculate_fee(price * quantity, is_taker=True)
         return {"price": price, "fee": fee, "order_id": order.id, "client_order_id": coid}
 
@@ -857,9 +864,19 @@ class EnhancedFuturesWallet:
             if pos.remaining_quantity <= Decimal("0.0001"):
                 return self.close_position(symbol, mark_price, reason="FULL_VIA_PARTIALS")
 
-            # F1: restore a resting stop sized to the reduced position.
+            # F1: restore a resting stop sized to the reduced position. The
+            # software SL backup (_software_sl_level, checked every 1s) covers the
+            # brief cancel→replace window. If a venue SL is mandatory but the
+            # re-place yields no stop (even without an exception), HALT — a live
+            # position must never be left without its required protective stop.
             if had_protective:
                 self._place_protective_orders(pos)
+                if (self.live_execution and self.execution_engine is not None
+                        and self.venue_sl_enabled and self.require_venue_sl
+                        and not pos.protective_orders.get("sl")):
+                    from . import safe_mode
+                    safe_mode.trip_halt(
+                        f"venue SL re-placement after partial close yielded no stop for {symbol}")
 
             self._save_state()
             return pnl_slice
@@ -991,7 +1008,9 @@ class EnhancedFuturesWallet:
             # 1. Catastrophic SL (-50% margin)
             cat_sl = pos.margin_used * self._to_decimal(self.catastrophic_sl_pct)
             if self._is_liquidation_required(pos, mark_price):
-                self._liquidate_position(symbol, float(mark_price))
+                # mark_price is already Decimal here; _liquidate_position is
+                # Decimal-typed — don't round-trip through float in the hot path.
+                self._liquidate_position(symbol, self._to_decimal(mark_price))
                 return
             if pnl <= cat_sl:
                 self.close_position(symbol, float(mark_price), reason=f"CATASTROPHIC_SL ({pnl:.2f})")

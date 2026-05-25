@@ -16,7 +16,6 @@ import pandas as pd
 logger = logging.getLogger("crypto_trader.data_feed")
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
-BINANCE_FAPI_TESTNET = "https://demo-fapi.binance.com"
 
 
 class BinanceDataFeed:

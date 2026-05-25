@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Clear the bot's safety kill-switch and reset risk limits
+
+set -e
+cd "$(dirname "$0")/.."
+
+echo "--- Resetting Safety Gates ---"
+python3 -c "from crypto_trader.risk import RiskManager; rm = RiskManager(); rm.clear_kill_switch(); rm.reset_consecutive_losses(); print('✅ Kill switch cleared and loss streak reset.')"

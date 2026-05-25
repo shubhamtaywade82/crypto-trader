@@ -2,8 +2,8 @@
 crypto_trader.engine_live — Single gated production entrypoint
 ===============================================================
 The ONE supported way to run the bot against real capital. Selects the
-execution engine by ``MODE`` (paper | testnet | live) and, for live/testnet,
-refuses to trade unless a startup self-test passes:
+execution engine by ``MODE`` (paper | live) and, for live, refuses to trade
+unless a startup self-test passes:
 
     * config is complete and valid (leverage <= cap, symbol set)
     * CoinDCX credentials authenticate (balances readable)
@@ -32,7 +32,7 @@ logger = logging.getLogger("crypto_trader.engine_live")
 
 
 class LiveGateBlocked(Exception):
-    """Raised when live/testnet mode fails the startup self-test."""
+    """Raised when live mode fails the startup self-test."""
 
 
 @dataclass
@@ -47,12 +47,17 @@ class LiveTradingSystem:
     def __init__(self, cfg: Optional[TradingConfig] = None, bus: Optional[EventBus] = None):
         self.cfg = cfg or load_config()
         self.bus = bus or global_bus
-        self.risk = RiskManager()
+        self.risk = RiskManager(
+            max_orders_per_minute=self.cfg.max_orders_per_minute,
+            max_daily_trades=self.cfg.max_daily_trades,
+            max_margin_ratio=self.cfg.max_margin_ratio
+        )
         self.event_store = None
         self.execution_engine = None
         self.router = None
         self.reconciler = None
         self.user_stream = None
+        self.projection = None
 
         self.wallet = EnhancedFuturesWallet(
             symbol=self.cfg.symbol,
@@ -139,6 +144,23 @@ class LiveTradingSystem:
         )
         checks.append(Check("safe_mode_gate", gate_open, gate_detail))
 
+        # G1: clock skew vs the venue. Advisory (Date-header resolution is ~1s),
+        # so it warns rather than blocks unless drift is egregiously large.
+        try:
+            skew = self.execution_engine.client.measure_clock_skew_ms()
+            if skew is None:
+                checks.append(Check("clock_skew", True, "unavailable (probe failed)", critical=False))
+            else:
+                within = abs(skew) <= self.cfg.clock_skew_max_ms
+                checks.append(Check("clock_skew", within,
+                                    f"drift {skew:+.0f}ms (max {self.cfg.clock_skew_max_ms}ms)",
+                                    critical=False))
+                if not within:
+                    logger.warning("[CLOCK] local clock drifts %.0fms from CoinDCX — "
+                                   "sync NTP to avoid signature/window auth errors", skew)
+        except Exception as e:
+            checks.append(Check("clock_skew", True, f"skipped ({e})", critical=False))
+
         # Credentials authenticate; available margin (in the wallet's currency)
         mc = self.cfg.coindcx_margin_currency
         avail = 0.0
@@ -173,7 +195,8 @@ class LiveTradingSystem:
         # Boot reconciliation healthy
         try:
             from .execution.reconciler import Reconciler
-            self.reconciler = Reconciler(self.wallet, self.execution_engine, self.risk, bus=self.bus)
+            self.reconciler = Reconciler(self.wallet, self.execution_engine, self.risk,
+                                         bus=self.bus, strict_cancel=self.cfg.reconcile_strict_cancel)
             mismatches = self.reconciler.reconcile(self.cfg.symbol)
             unresolved = [m for m in mismatches if not m.repaired]
             # Block startup if truth is unverifiable (transient) OR there is a
@@ -220,6 +243,7 @@ class LiveTradingSystem:
             channel=self.cfg.coindcx_stream_channel,
             on_fill=self._on_stream_fill,
             on_reconnect=self._safe_reconcile,
+            on_balance=self._on_stream_balance,
         )
         started = self.user_stream.start()
         logger.info("CoinDCX user stream: %s", "started" if started else "unavailable (REST fallback)")
@@ -245,12 +269,73 @@ class LiveTradingSystem:
                 order_id=oid, reduce_only=True,
             )
 
+    def _on_stream_balance(self, balance_update: dict):
+        """Handle real-time balance updates from CoinDCX user stream."""
+        currency = balance_update.get("currency_short_name") or balance_update.get("currency")
+        if not currency:
+            return
+        mc = self.cfg.coindcx_margin_currency
+        if str(currency).upper() == str(mc).upper():
+            try:
+                bal_val = float(balance_update.get("balance", 0) or 0)
+                conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+                usdt_equiv = bal_val / conv if mc.upper() != "USDT" else bal_val
+                
+                logger.info("[STREAM] Received balance update: %.4f %s (~%.2f USDT)", bal_val, mc, usdt_equiv)
+                self.wallet.wallet_balance = Decimal(str(usdt_equiv))
+            except Exception as e:
+                logger.error("Failed to process stream balance update: %s", e)
+
     def _safe_reconcile(self):
         if self.reconciler is not None:
             try:
                 self.reconciler.reconcile(self.cfg.symbol)
             except Exception as e:
                 logger.warning("post-reconnect reconcile failed: %s", e)
+
+    # ── decoupled execution bus (in-process, shared wallet) ─────────────────
+    def _start_inproc_execution_consumer(self):
+        """Wire the Redis execution bus in-process when enabled.
+
+        Returns a ``SignalPublisher`` the engine uses to emit entries, and spins
+        up a daemon consumer thread that drains ``execution:signals`` and
+        executes against ``self.wallet`` (the same wallet ws_pm manages exits
+        on). Returns ``None`` when the bus is disabled — the engine then uses the
+        hardened direct path.
+
+        NOTE: do NOT also run the standalone ``run_consumer`` process on the same
+        stream+group while this is active — a consumer group load-balances, so
+        entries would be split across two wallets. This in-process consumer is
+        the single owner when EXECUTION_BUS=redis.
+        """
+        if not self.cfg.redis_enabled:
+            return None
+        import threading
+        from .infra.redis_streams import RedisStreamBus
+        from .execution.signal_bus import (
+            SignalPublisher, SignalConsumer, WalletSignalAdapter, build_risk_gate,
+        )
+        bus = RedisStreamBus.from_url(self.cfg.redis_url)
+        bus.ensure_group(self.cfg.signal_stream, self.cfg.consumer_group)
+        adapter = WalletSignalAdapter(self.wallet, event_bus=self.bus)
+        consumer = SignalConsumer(
+            bus, {"paper": adapter, "live": adapter},
+            stream=self.cfg.signal_stream,
+            group=self.cfg.consumer_group,
+            consumer="engine-inproc",
+            max_deliveries=self.cfg.signal_max_deliveries,
+            idempotency_ttl_seconds=self.cfg.idempotency_ttl_seconds,
+            risk_gate=build_risk_gate(self.risk),
+        )
+        consumer.setup()
+        consumer.recover_pending()  # handle orphaned in-flight signals on boot
+        t = threading.Thread(target=consumer.run_forever, name="exec-consumer", daemon=True)
+        t.start()
+        self._exec_consumer = consumer
+        logger.warning(
+            "In-process execution consumer started (stream=%s group=%s) — do NOT run "
+            "a separate run_consumer on the same group.", self.cfg.signal_stream, self.cfg.consumer_group)
+        return SignalPublisher(bus, stream=self.cfg.signal_stream)
 
     # ── run ───────────────────────────────────────────────────────────────
     def start(self, signal_interval_seconds: int = 300, max_iterations: Optional[int] = None):
@@ -260,16 +345,53 @@ class LiveTradingSystem:
         if self.cfg.is_live:
             self.wallet.attach_execution_engine(self.execution_engine, live=True)
             self._maybe_start_user_stream()
-        if self.event_store is not None:
+        # Optional Postgres read-model (projection) derived from the event stream.
+        if self.cfg.projection_enabled and self.cfg.database_url:
+            try:
+                from .storage.projection import PostgresProjection
+                self.projection = PostgresProjection(self.cfg.database_url, mode=self.cfg.mode.value)
+                logger.info("Postgres projection (read-model) enabled")
+            except Exception as e:
+                logger.error("projection init failed (continuing without it): %s", e)
+                self.projection = None
+
+        # Realtime UI relay: publish each event to Redis pub/sub for the dashboard.
+        ui_publisher = None
+        if self.cfg.ui_events_enabled and self.cfg.redis_url:
+            try:
+                from .api.events_bridge import RedisEventPublisher
+                ui_publisher = RedisEventPublisher(self.cfg.redis_url, self.cfg.ui_events_channel)
+                logger.info("Realtime UI event relay enabled (channel=%s)", self.cfg.ui_events_channel)
+            except Exception as e:
+                logger.error("UI event relay init failed (continuing without it): %s", e)
+
+        if self.event_store is not None or self.projection is not None or ui_publisher is not None:
             prev = self.wallet.event_hook
             def _sink(ev):
-                try:
-                    self.event_store.append(ev)
-                except Exception as e:  # never let journaling kill trading
-                    logger.error("event store append failed: %s", e)
+                if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
+                    ev["payload"]["mode"] = self.cfg.mode.value
+                if self.event_store is not None:
+                    try:
+                        self.event_store.append(ev)
+                    except Exception as e:  # never let journaling kill trading
+                        logger.error("event store append failed: %s", e)
+                if self.projection is not None:
+                    try:
+                        self.projection.apply(ev)
+                    except Exception as e:  # projection is derived; never fatal
+                        logger.error("projection apply failed: %s", e)
+                if ui_publisher is not None:
+                    ui_publisher(ev)  # already swallows its own errors
                 if prev:
                     prev(ev)
             self.wallet.event_hook = _sink
+
+        # Decoupled execution bus (opt-in via EXECUTION_BUS=redis + REDIS_URL):
+        # the engine PUBLISHES entry signals and an in-process consumer thread
+        # executes them against the SAME wallet — so idempotency / DLQ / PEL
+        # recovery / risk-gate apply to live entries while ws_pm keeps managing
+        # exits on the one wallet. When disabled, the hardened direct path runs.
+        signal_publisher = self._start_inproc_execution_consumer()
 
         from .engine_ws import WebSocketTradingEngine
         engine = WebSocketTradingEngine(
@@ -279,6 +401,7 @@ class LiveTradingSystem:
             event_bus=self.bus,
             use_llm=False if self.cfg.mode == TradingMode.PAPER else True,
             cfg=self.cfg,
+            signal_publisher=signal_publisher,
         )
         engine.risk_manager = self.risk  # share kill switch with reconciler
         # AUTO failover for the signal tick: Binance primary, CoinDCX fallback

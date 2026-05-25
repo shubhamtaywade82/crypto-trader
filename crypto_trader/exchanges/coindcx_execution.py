@@ -96,6 +96,11 @@ class CoinDCXExecutionEngine:
         self.leverage = leverage
         self.margin_type = margin_type
         self.margin_currency = margin_currency.upper()
+        # Read methods scan both margin currencies so positions/orders are never
+        # missed when the funded wallet differs from the configured one (e.g.
+        # USDT-denominated pairs margined in INR). Order placement still uses the
+        # single configured margin_currency.
+        self.read_margin_currencies = list(dict.fromkeys([self.margin_currency, "USDT", "INR"]))
         self._ack = bool(i_understand_real_money)
         if self._ack:
             logger.warning(
@@ -147,8 +152,18 @@ class CoinDCXExecutionEngine:
         if trigger_price is not None:
             order_obj["stop_price"] = float(spec.round_price(Decimal(str(trigger_price))))
 
-        resp = self.client.post_signed(EP_CREATE_ORDER, {"order": order_obj})
-        return self._parse_order_response(resp, symbol, side, qty, order_type, reduce_only)
+        # retry_safe=False: a duplicate create on timeout/5xx would double the
+        # position (CoinDCX has no client_order_id idempotency).
+        resp = self.client.post_signed(EP_CREATE_ORDER, {"order": order_obj}, retry_safe=False)
+        order = self._parse_order_response(resp, symbol, side, qty, order_type, reduce_only)
+        # CoinDCX market-order create responds before the fill settles, so the
+        # avg price is usually absent (0). Booking a position at price 0 would
+        # corrupt PnL/SL/TP/liquidation, so resolve the real fill before
+        # returning. Resting protective orders (stop/TP) are NOT polled — they
+        # fill later, by design.
+        if order_type == OrderType.MARKET:
+            order = self._resolve_market_fill(order, symbol)
+        return order
 
     def cancel_order(self, order_id: str) -> bool:
         safe_mode.assert_live_allowed(
@@ -167,7 +182,7 @@ class CoinDCXExecutionEngine:
             "EXIT", venue=self.VENUE, constructor_ack=self._ack, symbol=position_id
         )
         try:
-            self.client.post_signed(EP_POSITION_EXIT, {"id": position_id})
+            self.client.post_signed(EP_POSITION_EXIT, {"id": position_id}, retry_safe=False)
             return True
         except CoinDCXError as e:
             logger.warning("Exit failed for position %s: %s", position_id, e)
@@ -194,6 +209,16 @@ class CoinDCXExecutionEngine:
             except (TypeError, ValueError):
                 continue
         return balances
+
+    def get_cross_margin_details(self) -> Optional[dict]:
+        """Fetch full cross-margin account details (pnl, margin_ratio, equity, etc)."""
+        try:
+            res = self.client.get_signed(EP_CROSS_MARGIN, {})
+            if isinstance(res, dict):
+                return res
+        except CoinDCXError as e:
+            logger.debug("cross_margin_details fetch failed: %s", e)
+        return None
 
     def sync_balance(self) -> float:
         """Available trading balance in the configured margin currency.
@@ -228,7 +253,7 @@ class CoinDCXExecutionEngine:
     def get_positions(self) -> List[dict]:
         resp = self.client.post_signed(EP_POSITIONS, {
             "page": "1", "size": "100",
-            "margin_currency_short_name": [self.margin_currency],
+            "margin_currency_short_name": self.read_margin_currencies,
         })
         positions: List[dict] = []
         for raw in _as_list(resp):
@@ -236,6 +261,8 @@ class CoinDCXExecutionEngine:
             if not pair:
                 continue
             qty = raw.get("active_pos", raw.get("quantity", 0)) or 0
+            if float(qty or 0) == 0.0:
+                continue  # skip flat/empty position rows
             positions.append({
                 "symbol": coindcx_to_internal(pair),
                 "pair": pair,
@@ -254,7 +281,7 @@ class CoinDCXExecutionEngine:
     def get_open_orders(self, symbol: Optional[str] = None) -> List[dict]:
         resp = self.client.post_signed(EP_LIST_ORDERS, {
             "status": "open", "page": "1", "size": "100",
-            "margin_currency_short_name": [self.margin_currency],
+            "margin_currency_short_name": self.read_margin_currencies,
         })
         orders = [self._normalize_order_dict(o) for o in _as_list(resp)]
         if symbol:
@@ -305,6 +332,43 @@ class CoinDCXExecutionEngine:
             logger.warning("set_leverage failed: %s", e)
             return False
 
+    def get_order_status(self, order_id: str, symbol: Optional[str] = None) -> dict:
+        """Resolve a single order's terminal status (G5).
+
+        CoinDCX has no documented per-order status endpoint, so this is
+        best-effort: if the id is still in open orders it's working; otherwise we
+        scan recent fills to tell ``filled`` from ``cancelled``/absent. Returns
+        ``{"status", "filled_quantity", "source"}``.
+        """
+        oid = str(order_id)
+        for o in self.get_open_orders(symbol):
+            if str(o.get("exchange_order_id")) == oid:
+                return {"status": o.get("status") or "open",
+                        "filled_quantity": float(o.get("filled_quantity", 0) or 0),
+                        "source": "open_orders"}
+        if symbol:
+            filled = sum(float(f.get("fill_quantity", 0) or 0)
+                         for f in self.get_fills(symbol)
+                         if str(f.get("exchange_order_id")) == oid)
+            if filled > 0:
+                return {"status": "filled", "filled_quantity": filled, "source": "fills"}
+        return {"status": "unknown", "filled_quantity": 0.0, "source": "absent"}
+
+    def cancel_all_orders(self, symbol: Optional[str] = None) -> int:
+        """Cancel every open order (optionally for one symbol). Returns count (G5).
+
+        Used as a strict capital-protection sweep when the reconciler detects an
+        unresolved desync. Each cancel inherits the ``safe_mode`` gate.
+        """
+        cancelled = 0
+        for o in self.get_open_orders(symbol):
+            oid = o.get("exchange_order_id")
+            if oid and self.cancel_order(oid):
+                cancelled += 1
+        if cancelled:
+            logger.warning("cancel_all_orders flattened %d venue order(s)", cancelled)
+        return cancelled
+
     # ── helpers ─────────────────────────────────────────────────────────────
     def _parse_order_response(self, resp, symbol, side, qty, order_type, reduce_only) -> Order:
         data = resp[0] if isinstance(resp, list) and resp else resp
@@ -322,6 +386,50 @@ class CoinDCXExecutionEngine:
             reduce_only=reduce_only,
             filled_quantity=Decimal(str(data.get("total_quantity", "0") if cdcx_status == "filled" else "0")),
             avg_fill_price=Decimal(str(data.get("avg_price", data.get("price", "0")) or "0")),
+        )
+
+    def _resolve_market_fill(self, order: Order, symbol: str, *, attempts: int = 5,
+                             delay_s: float = 0.4) -> Order:
+        """Resolve a market order's real avg fill price + filled qty.
+
+        The create response rarely carries the settled price, so poll recent
+        fills for this order id (with short backoff). Raises ``CoinDCXError`` if
+        the fill can't be confirmed — the caller must NOT book a zero-price
+        position. A confirmed terminal cancel/reject is surfaced too.
+        """
+        import time as _t
+        if order.avg_fill_price and order.avg_fill_price > 0 and order.filled_quantity and order.filled_quantity > 0:
+            return order
+        oid = str(order.id or "")
+        if not oid:
+            raise CoinDCXError("market order create returned no order id — cannot confirm fill")
+        last_status = "unknown"
+        for i in range(attempts):
+            _t.sleep(delay_s)
+            try:
+                fills = [f for f in self.get_fills(symbol, days=1)
+                         if str(f.get("exchange_order_id")) == oid]
+            except CoinDCXError as e:
+                logger.warning("fill lookup failed for %s (attempt %d): %s", oid, i + 1, e)
+                fills = []
+            filled = sum(float(f.get("fill_quantity", 0) or 0) for f in fills)
+            if filled > 0:
+                notional = sum(float(f.get("fill_price", 0) or 0) * float(f.get("fill_quantity", 0) or 0)
+                               for f in fills)
+                avg = notional / filled if filled > 0 else 0.0
+                if avg > 0:
+                    order.avg_fill_price = Decimal(str(avg))
+                    order.filled_quantity = Decimal(str(filled))
+                    order.status = OrderStatus.FILLED
+                    return order
+            # Not yet in fills — check if the order terminally failed.
+            st = self.get_order_status(oid, symbol)
+            last_status = st.get("status", "unknown")
+            if last_status in ("cancelled", "canceled", "rejected"):
+                raise CoinDCXError(f"market order {oid} terminal status '{last_status}' — no fill")
+        raise CoinDCXError(
+            f"market order {oid} fill unconfirmed after {attempts} polls "
+            f"(last status '{last_status}') — refusing to book a zero-price position"
         )
 
     def _normalize_order_dict(self, o: dict) -> dict:

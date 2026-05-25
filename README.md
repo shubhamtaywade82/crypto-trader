@@ -1,319 +1,179 @@
-# Binance USD-M Futures Trading System (SOL 10× Snap)
+# Antigravity — Production-Grade Crypto Trading System (v4)
 
-A suite of production-grade automated trading scripts for Binance USD-Margined Futures.
-Implements the **"SOL 10× Snap"** strategy — from a basic technical engine (v1) through to a full AI-enhanced filtering system (v3).
-
----
-
-## 📂 File Overview
-
-| File | Role | Run Directly? |
-|------|------|---------------|
-| `binance_futures_trading_system.py` | v1 — Basic EMA/RSI paper trader | ✅ Yes |
-| `binance_futures_trading_system_v2.py` | v2 — Multi-timeframe + Risk Manager | ✅ Yes |
-| `binance_futures_trading_system_v3.py` | v3 — v2 + Ollama LLM filter | ✅ Yes |
-| `ollama_advisor.py` | AI advisory module (used by v3) | ✅ Yes (standalone test) |
-| `crypto_trader/` | v4 — Modular package (`engine`, `wallet`, `risk`, etc.) | ✅ Yes (`python -m crypto_trader.engine`) |
+A modular, high-fidelity algorithmic trading suite designed for the Indian market. Antigravity features a hybrid architecture using **Binance** for high-frequency market data and **CoinDCX** for execution. It includes an event-sourced wallet, decoupled Redis/Postgres pipeline, and a real-time SolidJS dashboard.
 
 ---
 
-## 🛠️ Prerequisites
+## 🏗️ High-Level Architecture
 
-### Python dependencies
-
-```bash
-pip3 install pandas numpy requests
+```
+[ Market Data ] ─────▶ [ Strategy Engine ] ─────▶ [ Redis Streams ]
+(Binance WS)           (Regime/SMC Analysis)       (Signal Queue)
+                                                          │
+[ SolidJS UI ] ◀────── [ FastAPI Bridge ] ◀───── [ Execution Consumer ]
+(Live Dashboard)       (SSE/Broadcast)             (CoinDCX Execution)
 ```
 
-### Ollama (required for `v3` and `ollama_advisor.py`)
+### Core Components
 
-Ollama must be running **before** starting v3. Two options:
-
-**Option A — Docker (recommended, already set up):**
-
-```bash
-# Already running as a container:
-# ollama-server  0.0.0.0:11434->11434/tcp
-
-# Verify it's up:
-curl -s http://localhost:11434/api/tags
-```
-
-**Option B — Native install:**
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen3.5:4b
-ollama run qwen3.5:4b   # starts the API server on :11434
-```
+- **Hybrid Data/Execution:** Low-latency Binance WebSocket data coupled with authoritative CoinDCX REST execution.
+- **Decoupled Pipeline:** Redis Streams provide at-least-once delivery, crash recovery (PEL), and worker idempotency.
+- **Event-Sourced Wallet:** Comprehensive position lifecycle tracking with 1% TDS accounting (F2), venue-resident stops (F1), and partial close support.
+- **Relational Read-Model:** Postgres Projections transform JSONB events into queryable tables for the UI and analytics.
+- **AI Fusion (Optional):** Optional Ollama/LLM advisory layer for signal sentiment filtering.
 
 ---
 
-## 🔬 Running `ollama_advisor.py` (Standalone Test)
+## 📂 Project Structure
 
-`ollama_advisor.py` is both a library (imported by v3) **and** a runnable diagnostic script.
-When executed directly it:
-
-1. Checks whether Ollama is reachable at `http://localhost:11434`
-2. Generates synthetic OHLCV candle data
-3. Sends it to the LLM and prints the parsed `LLMAdvice` response
-
-```bash
-# Make sure Ollama is running first, then:
-python3 ollama_advisor.py
-```
-
-**Expected output (Ollama running, model warm):**
-
-```
-Ollama available: True
-
-LLM Advice:
-{
-  "timestamp": 1779312704,
-  "symbol": "TESTUSDT",
-  "bias": "bullish",
-  "confidence": 0.72,
-  "sentiment_score": 0.45,
-  "risk_level": "low",
-  "key_factors": ["Consistent uptrend", "Volume confirms move"],
-  "recommended_bias": "long_only",
-  "technical_alignment": 0.6,
-  "veto": false,
-  "veto_reason": null
-}
-```
-
-**Expected output (Ollama not running):**
-
-```
-Ollama available: False
-Ollama not running. Start it with: ollama run qwen3.5:4b
-```
-
-### Environment variable overrides
-
-You can point the advisor at a different host or model without editing the file:
-
-```bash
-OLLAMA_HOST=http://192.168.1.100:11434 python3 ollama_advisor.py   # remote server
-OLLAMA_MODEL=qwen3.5:4b              python3 ollama_advisor.py   # better reasoning
-OLLAMA_TIMEOUT=320                   python3 ollama_advisor.py   # slower hardware
-```
-
-> **Default timeout is 90 s** — covers the ~37 s cold-start of `qwen3.5:4b` plus full-prompt inference (~20 s).
-> Subsequent warm calls take ~15 s. `qwen3.5:4b` is faster (~2 s warm) but produces shallower analysis.
-
-### Available models on this server
-
-| Model | Size | Cold start | Warm call | Quality | Notes |
-|-------|------|-----------|-----------|---------|-------|
-| `qwen3.5:4b` ⭐ | 3.4 GB | ~37s | ~15s | ★★★★★ | **Recommended** — cites actual price levels |
-| `qwen3.5:4b` | 2.0 GB | ~34s | ~2s | ★★★☆☆ | Default fallback — fast but shallow analysis |
-| `qwen3.5:4b` | 5.2 GB | ~55s | ~25s | ★★★★★ | Best quality, use `OLLAMA_TIMEOUT=120` |
-| `llama3.1:8b` | 4.9 GB | ~50s | ~20s | ★★★★☆ | Good alternative to qwen3.5:4b |
-| `qwen2.5:0.5b` | 0.4 GB | ~5s | <1s | ★★☆☆☆ | Fastest, weakest JSON reliability |
+| Directory / File     | Description                                              |
+| :------------------- | :------------------------------------------------------- |
+| `crypto_trader/`     | Core Python package (Engines, Exchanges, Risk, Storage). |
+| `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
+| `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `test_ui`).  |
+| `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382).   |
+| `docs/`              | Detailed architectural deep-dives.                       |
 
 ---
 
-## 📈 Running the Trading Scripts
+## 🚀 Getting Started
 
-All three trading scripts share the same CLI pattern.
-Use `--help` on any of them for the full argument list:
+### 1. Prerequisites
+
+- Python 3.8+
+- Node.js 18+ (for UI)
+- Docker & Docker Compose
+- CoinDCX API Key/Secret (for Live mode)
+
+### 2. Setup
 
 ```bash
-python3 binance_futures_trading_system_v2.py --help
+cp .env.example .env
+# Update .env with your credentials and configuration
+pip install -r crypto_trader/requirements.txt
 ```
 
-### v1 — Basic EMA/RSI engine
+### 3. Run (one command, paper-safe)
 
 ```bash
-# Single tick (demo)
-python3 binance_futures_trading_system.py --symbol SOLUSDT
-
-# Live loop (every 60 s)
-python3 binance_futures_trading_system.py --symbol SOLUSDT --loop --tick 60
-
-# 30-day backtest
-python3 binance_futures_trading_system.py --symbol SOLUSDT --backtest-days 30
-
-# Testnet
-python3 binance_futures_trading_system.py --symbol SOLUSDT --testnet --loop
+./bin/start                 # infra + API + multi-symbol bot (MODE defaults to paper)
+./bin/start --tick 60       # extra args forwarded to the bot
 ```
 
-### v2 — SOL 10× Snap (multi-timeframe, risk-managed)
+### 4. Launch Dashboard UI (separate terminal)
 
 ```bash
-# Single tick
-python3 binance_futures_trading_system_v2.py --symbol SOLUSDT
-
-# Live loop (5-min ticks — aligns well with 1H candle close)
-python3 binance_futures_trading_system_v2.py --symbol SOLUSDT --loop --tick 300
-
-# 14-day backtest
-python3 binance_futures_trading_system_v2.py --symbol SOLUSDT --backtest-days 14
-
-# Different symbol (see parameter tuning section)
-python3 binance_futures_trading_system_v2.py --symbol ETHUSDT --loop --tick 300
+cd ui
+npm install
+npm run dev -- --port 3030
 ```
 
-### v3 — AI-Enhanced (v2 + Ollama LLM filter)
+Access the dashboard at **<http://localhost:3030>**.
 
-Ollama **must be running** before launching v3.
-
-```bash
-# Verify Ollama is up first:
-curl -s http://localhost:11434/api/tags | python3 -m json.tool
-
-# Single tick with LLM (default: qwen3.5:4b at localhost:11434)
-python3 binance_futures_trading_system_v3.py --symbol SOLUSDT
-
-# Live loop with LLM
-python3 binance_futures_trading_system_v3.py --symbol SOLUSDT --loop --tick 300
-
-# Technical-only fallback (disable LLM — behaves like v2)
-python3 binance_futures_trading_system_v3.py --symbol SOLUSDT --no-llm --loop
-
-# Remote Ollama server
-python3 binance_futures_trading_system_v3.py \
-    --symbol SOLUSDT \
-    --llm-host http://192.168.1.100:11434 \
-    --llm-model qwen2.5:7b \
-    --loop
-```
-
-### v4 — Modular package runner (`crypto_trader.engine`)
+### Manual / split processes (alternative to `./bin/start`)
 
 ```bash
-# Install package deps
-pip3 install -r crypto_trader/requirements.txt
-
-# Single tick
-python3 -m crypto_trader.engine --symbol SOLUSDT
-
-# Live loop
-python3 -m crypto_trader.engine --symbol SOLUSDT --loop --tick 300
-
-# No LLM mode
-python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --loop
-
-# v4 always runs with websocket ticker (bookTicker mid-price as live LTP)
-python3 -m crypto_trader.engine --symbol SOLUSDT --no-llm --loop --tick 5
-```
-
-### Binance WebSocket data you can use for realtime entries/exits
-
-For USDⓈ-M futures, useful public streams include:
-
-- `@bookTicker`: best bid/ask updates (good for LTP proxy + spread checks)
-- `@markPrice`: mark price and funding-related timing context
-- `@aggTrade` / `@trade`: trade flow and micro momentum
-- `@kline_1m` (or other intervals): live candle building
-
-In this repo, `crypto_trader.websocket_feed.RealtimeTicker` wires `@bookTicker`
-and exposes `last_bid`, `last_ask`, and `last_price`. `TradingEngine` starts
-the websocket feed by default, keeps reconnecting on disconnect, and uses realtime
-price for entries (falling back to REST mark price only until first tick arrives).
-
----
-
-## ⚙️ Configuration & Tuning
-
-All key parameters sit at the top of each script file:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `LEVERAGE` | `10` | Position leverage multiplier |
-| `EQUITY_UTILIZATION` | `0.50` | Fraction of available balance per trade |
-| `A_SL_PCT` | `0.007` | Playbook A stop-loss (0.7% price move) |
-| `A_TP_PCT` | `0.010` | Playbook A take-profit (1.0% price move) |
-| `B_SL_PCT` | `0.012` | Playbook B stop-loss (1.2% price move) |
-| `MAX_DAILY_TRADES` | `2` | Max trades per UTC day |
-| `MAX_CONSEC_LOSS` | `2` | Halt after N consecutive losses |
-| `OLLAMA_MODEL` | `qwen3.5:4b` | LLM model (`qwen3.5:4b` recommended) |
-| `OLLAMA_TIMEOUT` | `90` | LLM request timeout in seconds |
-| `CACHE_TTL_SECONDS` | `1800` | LLM cache duration (30 min) |
-| `LLM_MIN_CONFIDENCE` | `0.65` | Ignore LLM if confidence is below this |
-| `LLM_VETO_THRESHOLD` | `-0.70` | Block trade if LLM sentiment score is below this |
-
-### Tuning for different pairs
-
-The default parameters are calibrated for **SOLUSDT** (avg 1H range ~0.74%).
-For other pairs, adjust `A_SL_PCT` and `A_TP_PCT` based on the pair's ATR:
-
-| Pair | Suggested `A_SL_PCT` | Suggested `A_TP_PCT` |
-|------|----------------------|----------------------|
-| SOLUSDT (low vol) | `0.004` | `0.006` |
-| ETHUSDT, SOLUSDT | `0.007` | `0.010` |
-| DOGEUSDT, SHIB (high vol) | `0.012` | `0.018` |
-
----
-
-## 💾 State Persistence
-
-v2/v3 now save state under `~/.crypto_trader/` (not the current working directory).
-The v4 package uses the same base directory and adds a journal subfolder.
-
-| File | Contents |
-|------|----------|
-| `~/.crypto_trader/wallet_{SYMBOL}_v2.json` | v2 wallet balance, open positions, trade history |
-| `~/.crypto_trader/risk_manager_state.json` | v2 daily trade count, consecutive loss streak |
-| `~/.crypto_trader/llm_cache/` | v3 cached LLM responses (30-min TTL) |
-| `~/.crypto_trader/wallet_{SYMBOL}.json` | v4 wallet state |
-| `~/.crypto_trader/risk_state.json` | v4 risk state |
-| `~/.crypto_trader/journal/YYYY-MM-DD.jsonl` | v4 append-only trade journal |
-
-To **reset** and start fresh (new wallet):
-
-```bash
-rm -f ~/.crypto_trader/wallet_SOLUSDT_v2.json ~/.crypto_trader/risk_manager_state.json
-rm -f ~/.crypto_trader/wallet_SOLUSDT.json ~/.crypto_trader/risk_state.json
-rm -rf ~/.crypto_trader/llm_cache ~/.crypto_trader/journal
+./bin/dev                   # backend only: infra + execution consumer + API (:8088)
+./bin/bot                   # multi-symbol trading bot (uses WATCHLIST), e.g. ./bin/bot --tick 60
+python3 bin/test_ui         # fire tiny paper signals to verify the UI/API pipeline
 ```
 
 ---
 
-## 🏗️ Architecture
+## ▶️ Going LIVE (real money)
 
-```
-binance_futures_trading_system_v3.py  (TradingEngineV3)
-│
-├── binance_futures_trading_system_v2.py  (TradingEngine, EnhancedFuturesWallet,
-│       RiskManager, MarketRegimeAnalyzer, PlaybookA, PlaybookB, BinanceDataFeed)
-│
-└── ollama_advisor.py  (OllamaAdvisor)
-        ├── OllamaClient      — HTTP calls to /api/generate
-        ├── LLMResponseParser — JSON extraction & validation
-        ├── LLMCache          — 30-min disk cache (llm_cache/)
-        └── LLMAdvice         — Structured result: bias, confidence, veto_reason
+Paper-soak first. Then set in `.env`:
+
+```bash
+MODE=live
+LIVE_TRADING_ENABLED=true
+LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST
+PLACE_ORDER=true
+COINDCX_API_KEY=...   COINDCX_API_SECRET=...
+COINDCX_MARGIN_CURRENCY=USDT     # or INR
 ```
 
-**v4 modular architecture:**
+Validate the gate before trading (single-symbol gated entrypoint):
 
-```
-crypto_trader/
-├── data_feed.py     (Binance REST + 418/429 handling)
-├── wallet.py        (position lifecycle + partial close accounting)
-├── risk.py          (daily limits + LLM circuit breaker)
-├── regime.py        (regime classification)
-├── playbooks.py     (entry setup logic)
-├── llm_advisor.py   (LLM advice schema + latency metadata)
-├── journal.py       (JSONL journaling)
-└── engine.py        (orchestrator + CLI)
+```bash
+python3 -m crypto_trader.engine_live --self-test-only
 ```
 
-**Signal flow in v3:**
+Orders are blocked unless ALL hold: `LIVE_TRADING_ENABLED=true` **and** the exact
+`LIVE_TRADING_ACK` phrase **and** no `~/.crypto_trader/HALT` file **and** `PLACE_ORDER=true`.
 
+### Emergency controls
+
+| Action                                         | Command                                  |
+| :--------------------------------------------- | :--------------------------------------- |
+| Halt all live orders instantly                 | `touch ~/.crypto_trader/HALT`            |
+| Resume                                         | `rm ~/.crypto_trader/HALT`               |
+| Clear kill-switch + loss streak (after review) | `./bin/clear_risk`                       |
+| Telegram (if configured)                       | `/kill` · `/resume` · `/status` · `/pnl` |
+
+> ⚠️ Known gaps before public/live deploy: Telegram `/kill` has **no sender allowlist**;
+> the dashboard API binds `0.0.0.0` with open CORS and no auth; do **not** set
+> `EXECUTION_BUS=redis` in `docker-compose` yet (the `bot` and `execution-worker`
+> services share one consumer group and would split entries across two wallets).
+> `./bin/bot` / `./bin/start` (multi_engine) use the in-process direct path and are unaffected.
+
+---
+
+## 🛡️ Hardened Safety (G1–G5 & F1–F5)
+
+Antigravity is built for capital preservation through multiple layers of defense:
+
+### Production Guards (G)
+
+- **G1 Clock Skew:** Warnings/Halts if local clock drifts from venue (>2000ms).
+- **G2 Velocity Breaker:** Limits order frequency (default: 6 orders/min).
+- **G3 Thread Supervisor:** Halts the engine if WebSocket or Position Manager threads die.
+- **G4 Authoritative Margin Guard:** Instant kill-switch if CoinDCX `margin_ratio_cross` exceeds 80%.
+- **G5 Strict Reconciliation:** Optional cancel-all-on-desync behavior.
+
+### Hardened Features (F)
+
+- **F1 Venue Stops:** Automatic placement of resting Stop-Loss orders on the exchange.
+- **F2 TDS Accounting:** Models the 1% Indian TDS on sell-legs for accurate equity curves.
+- **F3 Basis Guard:** Rejects entries if Binance/CoinDCX prices diverge beyond threshold.
+- **F4 Execution Degradation:** Realistic paper-trading model with spread penalties.
+- **F5 User Stream:** Real-time authoritative fill/balance reconciliation.
+
+---
+
+## 📈 Developer Tools
+
+| Script             | Purpose                                                                     |
+| :----------------- | :-------------------------------------------------------------------------- |
+| `./bin/start`      | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
+| `./bin/dev`        | Launches the backend stack (Infra + Consumer + API).                        |
+| `./bin/bot`        | Launches **only** the multi-symbol trading bot.                             |
+| `./bin/test_ui`    | Fires a burst of tiny test signals to verify the UI/API pipeline.           |
+| `./bin/clear_risk` | Clears the kill-switch and resets the consecutive-loss counter.             |
+
+### Sending Test Signals
+
+While `./bin/dev` and the UI are running, run this in a new terminal:
+
+```bash
+python3 bin/test_ui
 ```
-Fetch 4H + 1H data
-    → Regime analysis (4H)
-    → Start async LLM call (non-blocking)
-    → Update open positions (TP / SL / trail / time-stop)
-    → Evaluate Playbook A or B signal
-    → LLM filter (veto? reduce size? allow?)
-    → Risk Manager check (daily cap / loss streak)
-    → Open position (EnhancedFuturesWallet)
-```
+
+This will open positions in your paper wallet and you will see them appear instantly on the dashboard.
+
+---
+
+## ⚙️ Configuration (.env)
+
+| Variable           | Default   | Description                                 |
+| :----------------- | :-------- | :------------------------------------------ |
+| `MODE`             | `paper`   | `paper` (simulated) or `live` (CoinDCX).    |
+| `TRADE_SYMBOL`     | `SOLUSDT` | Active symbol for the single-engine runner. |
+| `MAX_LEVERAGE`     | `2`       | Hard leverage cap (Max 2x for safety).      |
+| `MAX_DAILY_TRADES` | `2`       | Daily safety limit for trades.              |
+| `MAX_MARGIN_RATIO` | `0.80`    | Exchange liquidation guard threshold.       |
+| `DATABASE_URL`     | `:5435`   | Postgres connection string.                 |
+| `REDIS_URL`        | `:6382`   | Redis connection string.                    |
 
 ---
 
@@ -322,62 +182,6 @@ Fetch 4H + 1H data
 This software is for **educational and paper-trading purposes only**.
 
 - Cryptocurrency futures trading involves significant risk of loss.
-- 10× leverage is extremely aggressive.
+- High leverage is extremely aggressive.
 - Always test on testnet or in simulation before deploying real capital.
 - The authors are not responsible for any financial losses.
-
-### v4 WebSocket hybrid engine
-
-```bash
-python3 -m crypto_trader.engine_ws --symbol SOLUSDT --loop --tick 300
-python3 -m crypto_trader.engine_ws --symbol SOLUSDT --no-llm --loop
-python3 -m crypto_trader.engine_ws --symbol SOLUSDT --testnet --loop
-```
-
----
-
-## 📊 Network & LLM Logging
-
-The v4 engines provide extensive logging capabilities to audit exchange data payloads and verify prompts sent to the LLM layers. You can control these logs individually or globally.
-
-### CLI Flags
-
-You can specify these switches when launching `crypto_trader.engine` or `crypto_trader.engine_ws`:
-
-- `--log-rest`: Enable detailed logging of Binance REST API requests and responses (klines, prices, OI, funding, taker ratio), truncated to 1000 characters to keep stdout clean.
-- `--log-ws`: Enable real-time logging of raw incoming WebSocket messages (e.g. trade updates, book ticker changes).
-- `--log-llm`: Enable multiline printing of the exact prompt sent to the LLM and the raw JSON response received.
-- `--log-responses`: Master switch that activates all of the above (REST, WebSocket, and LLM logging) simultaneously.
-
-**Example Usage**:
-```bash
-# Log only the prompts and JSON responses from Ollama
-python3 -m crypto_trader.engine_ws --symbol SOLUSDT --log-llm --loop
-
-# Log only standard REST endpoints and response JSONs
-python3 -m crypto_trader.engine --symbol SOLUSDT --log-rest --loop
-```
-
-### Environment Variables & .env File
-
-You can configure options globally using environment variables or a `.env` file in the project root. The trading system automatically detects and loads environment variables from `.env` at startup.
-
-Copy the template to create your `.env` configuration:
-```bash
-cp .env.example .env
-```
-
-Available configurations in `.env`:
-```ini
-OLLAMA_HOST=http://localhost:11434  # Ollama server url
-OLLAMA_MODEL=qwen3.5:4b             # Ollama model to pull and use
-OLLAMA_TIMEOUT=320                  # Timeout in seconds
-OLLAMA_MAX_TOKENS=512               # Max tokens for generated advice
-LLM_CACHE_TTL=1800                  # TTL in seconds for Ollama disk cache
-LLM_MAX_AGE=20                      # Age in seconds to reject stale advice
-LLM_MAX_LATENCY=3000                # Latency budget in ms (before proceeding with technical-only)
-LLM_WEIGHT=0.20                     # Weighted confidence fusion influence
-FINAL_SCORE_THRESHOLD=0.75          # Strategy confidence threshold for trade entries
-LOG_BINANCE_RESPONSES=false         # Toggle both REST and WebSocket logging
-LOG_LLM=false                       # Toggle LLM prompt and response logging
-```

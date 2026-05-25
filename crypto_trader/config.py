@@ -17,7 +17,6 @@ from typing import List, Optional
 
 class TradingMode(str, Enum):
     PAPER = "paper"
-    TESTNET = "testnet"
     LIVE = "live"
 
 
@@ -102,6 +101,40 @@ class TradingConfig:
     coindcx_stream_url: str = "wss://stream.coindcx.com"
     coindcx_stream_channel: str = "coindcx"
 
+    # ── Redis Streams pipeline + Postgres projection (data modeling) ──
+    # Redis decouples strategy (producer) from execution (consumer group) and
+    # gives at-least-once delivery + crash recovery via the Pending Entries List.
+    redis_url: str = ""                       # redis://host:6379/0; empty => disabled
+    execution_bus: str = "inproc"             # "inproc" (default) | "redis"
+    signal_stream: str = "execution:signals"
+    consumer_group: str = "execution_engine"
+    signal_max_deliveries: int = 3            # poison-pill -> DLQ after this many tries
+    idempotency_ttl_seconds: int = 300        # duplicate-suppression window
+    # Postgres relational read-model derived from the JSONB event stream.
+    projection_enabled: bool = False
+
+    # ── Dashboard API + realtime UI bridge ──
+    # The bot publishes each domain event to a Redis pub/sub channel; the FastAPI
+    # service relays it over SSE for true realtime (no polling).
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    ui_events_enabled: bool = True          # bot -> Redis pub/sub for the UI
+    ui_events_channel: str = "events:ui"
+
+    # ── Production-readiness guards (G1–G5) ──
+    # G1: max tolerated local↔venue clock drift (ms) before warning/halting.
+    clock_skew_max_ms: int = 2000
+    # G2: per-minute order velocity circuit breaker (on top of the daily cap).
+    max_orders_per_minute: int = 6
+    # G3: supervise WS feed / position-manager threads; HALT if one dies silently.
+    thread_supervisor_enabled: bool = True
+    # G4: max exchange margin ratio (0.80 = 80%) before halting to avoid liquidation.
+    max_margin_ratio: float = 0.80
+    # G2: daily trade limit
+    max_daily_trades: int = 2
+    # G5: on an unresolved venue desync, cancel ALL venue orders to protect capital.
+    reconcile_strict_cancel: bool = False
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -144,15 +177,36 @@ class TradingConfig:
             coindcx_user_stream_enabled=_get_bool("COINDCX_USER_STREAM_ENABLED", False),
             coindcx_stream_url=_get("COINDCX_STREAM_URL", "wss://stream.coindcx.com"),
             coindcx_stream_channel=_get("COINDCX_STREAM_CHANNEL", "coindcx"),
+            redis_url=_get("REDIS_URL"),
+            execution_bus=_get("EXECUTION_BUS", "inproc").lower(),
+            signal_stream=_get("SIGNAL_STREAM", "execution:signals"),
+            consumer_group=_get("CONSUMER_GROUP", "execution_engine"),
+            signal_max_deliveries=_get_int("SIGNAL_MAX_DELIVERIES", 3),
+            idempotency_ttl_seconds=_get_int("IDEMPOTENCY_TTL_SECONDS", 300),
+            projection_enabled=_get_bool("PROJECTION_ENABLED", False),
+            api_host=_get("API_HOST", "0.0.0.0"),
+            api_port=_get_int("API_PORT", 8000),
+            ui_events_enabled=_get_bool("UI_EVENTS_ENABLED", True),
+            ui_events_channel=_get("UI_EVENTS_CHANNEL", "events:ui"),
+            clock_skew_max_ms=_get_int("CLOCK_SKEW_MAX_MS", 2000),
+            max_orders_per_minute=_get_int("MAX_ORDERS_PER_MINUTE", 6),
+            max_daily_trades=_get_int("MAX_DAILY_TRADES", 2),
+            max_margin_ratio=_get_float("MAX_MARGIN_RATIO", 0.80),
+            thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
+            reconcile_strict_cancel=_get_bool("RECONCILE_STRICT_CANCEL", False),
         )
 
     @property
     def is_live(self) -> bool:
-        return self.mode in (TradingMode.LIVE, TradingMode.TESTNET)
+        return self.mode == TradingMode.LIVE
 
     @property
     def has_coindcx_credentials(self) -> bool:
         return bool(self.coindcx_api_key and self.coindcx_api_secret)
+
+    @property
+    def redis_enabled(self) -> bool:
+        return self.execution_bus == "redis" and bool(self.redis_url)
 
     def validate(self) -> List[str]:
         """Return a list of human-readable problems. Empty list == OK."""
@@ -167,7 +221,7 @@ class TradingConfig:
             errs.append("TRADE_SYMBOL is required")
         if self.is_live and not self.has_coindcx_credentials:
             errs.append(
-                "Live/testnet mode requires COINDCX_API_KEY and COINDCX_API_SECRET"
+                "Live mode requires COINDCX_API_KEY and COINDCX_API_SECRET"
             )
         return errs
 

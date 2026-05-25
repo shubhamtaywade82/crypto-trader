@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .data_feed import BinanceDataFeed
+from .exchanges.resilient_data_feed import StaleCandlesError
 from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
@@ -53,7 +54,6 @@ class WebSocketTradingEngine:
         symbol: str = DEFAULT_SYMBOL,
         initial_balance: float = 1_000.0,
         leverage: int = LEVERAGE,
-        testnet: bool = False,
         use_llm: bool = True,
         llm_host: str = None,
         llm_model: str = None,
@@ -64,11 +64,23 @@ class WebSocketTradingEngine:
         wallet = None,
         event_bus = None,
         cfg = None,
+        signal_publisher = None,
+        risk_budget_fraction: float = 1.0,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
         self.event_bus = event_bus
         self.cfg = cfg
+        # When set (live + Redis execution bus), entries are PUBLISHED as signals
+        # and executed by the in-process consumer (shared wallet) — giving the
+        # idempotency lock / DLQ / PEL-recovery / risk-gate safety on the live
+        # entry path. When None, the hardened direct path runs unchanged.
+        self.signal_publisher = signal_publisher
+        # Fraction of the per-trade risk budget this engine may use. With a
+        # SHARED wallet across N symbols (multi_engine), each engine sizes off
+        # the full balance, so without this N symbols would each risk the full
+        # 2% → up to 2N% concurrent. Set to 1/N to bound total exposure.
+        self.risk_budget_fraction = max(0.0, min(1.0, float(risk_budget_fraction)))
         # CoinDCX market data for the cross-venue basis guard (F3). Public, no
         # creds; built lazily so paper/tests without network stay light.
         self._coindcx_md = None
@@ -78,20 +90,17 @@ class WebSocketTradingEngine:
         llm_logged = log_responses or log_llm
 
         # REST client (for historical data, funding, OI)
-        base_url = "https://demo-fapi.binance.com" if testnet else "https://fapi.binance.com"
-        self.data_feed = BinanceDataFeed(base_url=base_url, log_responses=rest_logged)
+        self.data_feed = BinanceDataFeed(log_responses=rest_logged)
 
         # WebSocket client (for real-time LTP, mark price, bid/ask)
         self.ws_feed = BinanceWebSocketFeed(
             symbol=self.symbol,
-            testnet=testnet,
             on_mark_price=self._on_mark_price,
             on_kline=self._on_kline,
             on_book_ticker=self._on_book_ticker,
             log_responses=ws_logged,
         )
 
-        # Wallet & Risk
         if wallet:
             self.wallet = wallet
         else:
@@ -100,7 +109,15 @@ class WebSocketTradingEngine:
                 initial_balance=initial_balance,
                 leverage=leverage,
             )
-        self.risk_manager = RiskManager()
+        
+        if cfg:
+            self.risk_manager = RiskManager(
+                max_daily_trades=cfg.max_daily_trades,
+                max_orders_per_minute=cfg.max_orders_per_minute,
+                max_margin_ratio=cfg.max_margin_ratio
+            )
+        else:
+            self.risk_manager = RiskManager()
         self.adaptive_threshold = AdaptiveThresholdManager(
             base_threshold=FINAL_SCORE_THRESHOLD,
             min_threshold=0.50,
@@ -154,6 +171,11 @@ class WebSocketTradingEngine:
             wallet=self.wallet,
             check_interval_ms=1000,  # Check every 1 second
             event_bus=self.event_bus,
+            # G4: drive the authoritative margin guard on the 1s loop (every ~5s),
+            # not only on the 5-min signal tick — liquidation can't wait 5 min.
+            health_check=self._check_authoritative_health,
+            # A1: skip software exits on prices older than this.
+            feed_stale_ms=(cfg.feed_stale_ms if cfg else 15000),
         )
 
         # State
@@ -177,8 +199,18 @@ class WebSocketTradingEngine:
         if event.command == "KILL_ALL" or (event.command == "KILL" and event.params.get("symbol") == self.symbol):
             self._halted = True
             logger.warning(f"🛑 [HALTED] {self.symbol} received KILL command.")
-            # Optional: Close all positions immediately
-            # self.wallet.close_all_positions(reason="REMOTE_KILL")
+            # A remote KILL must flatten the live position, not just block new
+            # entries — otherwise an open position rides on unattended.
+            try:
+                pos = self.wallet.get_open_position(self.symbol)
+                if pos:
+                    mark = self.ws_feed.get_ltp() or self.ws_feed.get_mid_price()
+                    if not mark or mark <= 0:
+                        mark = float(pos.entry_price)
+                    self.wallet.close_position(self.symbol, float(mark), reason="REMOTE_KILL")
+                    logger.warning(f"🛑 [KILL] flattened {self.symbol} on remote command")
+            except Exception as e:
+                logger.error("remote KILL flatten failed for %s: %s", self.symbol, e)
         
         elif event.command == "RESUME_ALL" or (event.command == "RESUME" and event.params.get("symbol") == self.symbol):
             self._halted = False
@@ -209,6 +241,45 @@ class WebSocketTradingEngine:
         self.ws_feed.stop()
         logger.info("[ENGINE] Stopped")
 
+    def _check_authoritative_health(self):
+        """Monitor authoritative exchange metrics (margin ratio) and trigger kill switch if unsafe."""
+        if not self.cfg or not self.cfg.is_live:
+            return
+
+        from .exchanges.coindcx_execution import CoinDCXExecutionEngine
+        if not isinstance(self.wallet.execution_engine, CoinDCXExecutionEngine):
+            return
+
+        try:
+            details = self.wallet.execution_engine.get_cross_margin_details()
+            if details:
+                ratio = float(details.get("margin_ratio_cross", 0) or 0)
+                ok, reason = self.risk_manager.check_margin_ratio(ratio)
+                if not ok:
+                    logger.critical(f"[AUTHORITATIVE GUARD] {reason}")
+                    self.risk_manager.trigger_kill_switch(reason)
+                    self._halted = True
+                    if self.event_bus:
+                        from .events import SystemFailureEvent
+                        self.event_bus.publish(SystemFailureEvent(component="margin_guard", error=reason))
+                    # Halting only blocks NEW entries; an open position is still
+                    # racing toward liquidation at this margin ratio. Flatten it.
+                    try:
+                        pos = self.wallet.get_open_position(self.symbol)
+                        if pos:
+                            mark = self.ws_feed.get_ltp() or self.ws_feed.get_mid_price()
+                            if not mark or mark <= 0:
+                                mark = float(pos.entry_price)
+                            self.wallet.close_position(
+                                self.symbol, float(mark),
+                                reason="MARGIN_GUARD_FLATTEN",
+                            )
+                            logger.critical("[AUTHORITATIVE GUARD] flattened %s to avoid liquidation", self.symbol)
+                    except Exception as e:
+                        logger.error("margin-guard flatten failed for %s: %s", self.symbol, e)
+        except Exception as e:
+            logger.error("Authoritative health check failed: %s", e)
+
     # ── Main Loop ──
 
     def run_loop(self, signal_interval_seconds: int = 300, max_iterations: int = None):
@@ -221,6 +292,13 @@ class WebSocketTradingEngine:
         iteration = 0
         try:
             while True:
+                # G3: supervise the WS threads — never trade on a dead/stale feed.
+                if not self._supervise_threads():
+                    break
+                
+                # Authoritative health check (margin ratio guard)
+                self._check_authoritative_health()
+
                 # Signal generation tick (REST-based)
                 self._signal_tick()
 
@@ -233,6 +311,37 @@ class WebSocketTradingEngine:
             logger.info("Engine stopped by user")
         finally:
             self.stop()
+
+    def _supervise_threads(self) -> bool:
+        """G3: fail-stop if a background WS thread died silently.
+
+        Returns True if it is safe to continue. On a dead feed/position-manager
+        thread it trips HALT + the kill switch and halts the engine, rather than
+        evaluating signals or managing positions against a stale feed.
+        """
+        if self.cfg is not None and not getattr(self.cfg, "thread_supervisor_enabled", True):
+            return True
+        dead = []
+        if not self.ws_feed.is_alive():
+            dead.append("ws_feed")
+        if not self.ws_pm.is_alive():
+            dead.append("ws_position_manager")
+        if not dead:
+            return True
+        reason = f"WS thread(s) died: {', '.join(dead)}"
+        logger.critical("[SUPERVISOR] %s — halting engine (fail-stop)", reason)
+        try:
+            from . import safe_mode
+            safe_mode.trip_halt(reason)
+        except Exception:
+            pass
+        if getattr(self, "risk_manager", None) is not None:
+            self.risk_manager.trigger_kill_switch(reason)
+        if self.event_bus:
+            from .events import SystemFailureEvent
+            self.event_bus.publish(SystemFailureEvent(component="thread_supervisor", error=reason))
+        self._halted = True
+        return False
 
     def _signal_tick(self):
         """Generate signals using REST data (runs every 5 min)."""
@@ -261,8 +370,14 @@ class WebSocketTradingEngine:
                 logger.warning(f"[WS-ENGINE] Invalid mark price {mark_price}. Skipping signal tick.")
                 return
 
+        except StaleCandlesError as e:
+            # A3: fallback klines too old — never generate a signal from stale
+            # technicals. Skip the whole tick (already the behaviour; explicit
+            # for clarity/observability).
+            logger.warning(f"[WS-ENGINE] Stale klines — skipping signal tick: {e}")
+            return
         except Exception as e:
-            logger.error(f"Data fetch failed: {e}")
+            logger.error(f"Data fetch failed — skipping signal tick: {e}")
             return
 
         # 1. Regime analysis
@@ -354,8 +469,27 @@ class WebSocketTradingEngine:
         if not self.wallet.get_open_position(self.symbol) and can_trade:
             # Get latest ADX for Ares playbook filter
             latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
-            self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                                funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
+            try:
+                self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                                    funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
+            except Exception as e:
+                # An exception mid-entry (e.g. order placed but booking/SL failed)
+                # could leave an unmanaged live position. Fail safe: HALT, trip
+                # the kill switch, and reconcile against the venue rather than
+                # letting the loop crash and abandon a naked position.
+                logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e)
+                self._halted = True
+                if getattr(self, "risk_manager", None) is not None:
+                    self.risk_manager.trigger_kill_switch(f"entry failure: {e}")
+                if self.cfg and self.cfg.is_live:
+                    try:
+                        from . import safe_mode
+                        safe_mode.trip_halt(f"entry failure for {self.symbol}: {e}")
+                    except Exception:
+                        pass
+                if self.event_bus:
+                    from .events import SystemFailureEvent
+                    self.event_bus.publish(SystemFailureEvent(component="entry", error=str(e)))
 
         # 6. Print summary
         self.wallet.print_summary()
@@ -471,15 +605,23 @@ class WebSocketTradingEngine:
                       mark_price, funding_rate, oi_delta, taker_ratio,
                       tech_score, regime, regime_score, advice, dynamic_threshold):
         """Execute entry using real-time WebSocket prices."""
+        # A1: never enter on stale data. If the WS feed has no fresh price within
+        # the staleness budget, veto the entry rather than fall back to a possibly
+        # seconds-old price. (Exits are separately gated in ws_pm.)
+        stale_ms = self.cfg.feed_stale_ms if self.cfg else 15000
+        if not self.ws_feed.is_fresh(stale_ms):
+            age = self.ws_feed.data_age_ms()
+            logger.warning("[ENTRY] WS feed stale (age=%sms > %dms) — vetoing entry", age, stale_ms)
+            return
+
         # Get current LTP and spread from WebSocket
         ltp = self.ws_feed.get_ltp()
         mid = self.ws_feed.get_mid_price()
         spread = self.ws_feed.get_spread()
 
-        if ltp <= 0:
-            logger.warning("[ENTRY] WebSocket LTP unavailable, using mark price")
-            ltp = mark_price
-            mid = mark_price
+        if ltp <= 0 or mid <= 0:
+            logger.warning("[ENTRY] WebSocket LTP/mid unavailable (ltp=%.4f mid=%.4f) — vetoing entry", ltp, mid)
+            return
 
         # Slippage estimate: if spread > 0.1%, log warning
         spread_pct = spread / mid * 100 if mid > 0 else 0
@@ -499,35 +641,91 @@ class WebSocketTradingEngine:
         if buf:
             entry_price = mid * (1 + buf) if setup["side"] == PositionSide.LONG else mid * (1 - buf)
 
-        # Recalculate SL/TP based on actual entry price
-        if setup["side"] == PositionSide.LONG:
-            sl = entry_price * (1 - 0.007)  # Use Playbook A SL as default
-            tp = entry_price * (1 + 0.010)
-        else:
-            sl = entry_price * (1 + 0.007)
-            tp = entry_price * (1 - 0.010)
+        # Re-anchor the PLAYBOOK's stop/target to the actual fill entry.
+        # The playbook computed sl/tp off its signal price; the real entry (mid +
+        # basis buffer) differs slightly, so we preserve the playbook's
+        # proportional stop distance rather than discarding it for a flat default.
+        is_long = setup["side"] == PositionSide.LONG
+        pb_entry = float(setup.get("entry_price") or 0)
+        default_sl_pct, default_tp_pct = 0.007, 0.010
 
-        # Update setup with actual entry price
+        def _reanchor(level_price, fallback_pct, is_stop):
+            """Map a playbook level to the actual entry, keeping its ratio."""
+            if pb_entry > 0 and level_price and float(level_price) > 0:
+                return entry_price * (float(level_price) / pb_entry)
+            # No usable playbook level — fall back to a flat default.
+            if is_stop:
+                return entry_price * (1 - fallback_pct) if is_long else entry_price * (1 + fallback_pct)
+            return entry_price * (1 + fallback_pct) if is_long else entry_price * (1 - fallback_pct)
+
+        sl = _reanchor(setup.get("sl_price"), default_sl_pct, is_stop=True)
+
+        # Update setup with actual entry price + re-anchored stop.
         setup["entry_price"] = entry_price
         setup["sl_price"] = sl
         if "tp_price" in setup:
-            setup["tp_price"] = tp
+            setup["tp_price"] = _reanchor(setup.get("tp_price"), default_tp_pct, is_stop=False)
         else:
             for tp_level in setup.get("tp_levels", []):
-                if setup["side"] == PositionSide.LONG:
-                    tp_level["price"] = entry_price * (1 + 0.010 if tp_level["label"] == "TP1" else 0.020)
-                else:
-                    tp_level["price"] = entry_price * (1 - 0.010 if tp_level["label"] == "TP1" else 0.020)
+                lvl_default = 0.010 if tp_level.get("label") == "TP1" else 0.020
+                tp_level["price"] = _reanchor(tp_level.get("price"), lvl_default, is_stop=False)
 
-        # Risk-based sizing from stop distance (2% risk per trade)
+        # Representative TP for events/logging (first target, or single tp_price).
+        tp = setup.get("tp_price")
+        if tp is None:
+            _levels = setup.get("tp_levels", [])
+            tp = _levels[0]["price"] if _levels else entry_price
+
+        # Risk-based sizing from stop distance (2% risk per trade, scaled by this
+        # engine's share of a shared wallet to avoid multi-symbol over-allocation).
         stop_distance = abs(entry_price - setup["sl_price"])
-        risk_budget = self.wallet.margin_balance * Decimal("0.02")
+        risk_budget = self.wallet.margin_balance * Decimal("0.02") * Decimal(str(self.risk_budget_fraction))
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
         risk_budget *= Decimal(str(size_multiplier))
         stop_distance_dec = Decimal(str(stop_distance))
         quantity = (risk_budget / stop_distance_dec) if stop_distance_dec > 0 else Decimal("0")
 
         trade_id = str(uuid.uuid4())[:8]
+
+        if quantity <= 0:
+            logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
+            return
+
+        # Decoupled path: publish the entry as a signal. The in-process consumer
+        # (shared wallet) executes it with idempotency/DLQ/PEL-recovery + a final
+        # risk-gate veto, then emits TradeOpenedEvent. record_open is performed
+        # exactly once by the consumer's risk gate, so we do NOT record it here.
+        if self.signal_publisher is not None:
+            from .execution.signal_bus import Signal
+            meta = {
+                "sl_price": float(setup["sl_price"]),
+                "regime": regime.value if regime else "",
+                "tech_score": float(tech_score),
+                "llm_decision": "ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
+                "funding_rate": float(funding_rate),
+                "oi_delta": float(oi_delta),
+            }
+            if "time_stop_hours" in setup:
+                meta["time_stop_hours"] = setup["time_stop_hours"]
+            if "tp_price" in setup:
+                meta["tp_price"] = float(setup["tp_price"])
+            else:
+                meta["tp_levels"] = [
+                    {"price": float(t["price"]), "pct": float(t.get("pct", 1.0)),
+                     "label": t.get("label", "TP")}
+                    for t in setup.get("tp_levels", []) if t.get("price")
+                ]
+            mode = self.cfg.mode.value if self.cfg else "paper"
+            self.signal_publisher.emit(Signal(
+                strategy_id=f"engine_ws:{self.symbol}",
+                symbol=self.symbol, side=setup["side"].value,
+                quantity=float(quantity), mode=mode, order_type="market",
+                price=float(entry_price), metadata=meta,
+            ))
+            self.adaptive_threshold.record_trade()
+            logger.info("[EXECUTED→BUS] %s %s qty=%.4f @ %.4f published to execution bus",
+                        self.symbol, setup["side"].value, float(quantity), float(entry_price))
+            return
 
         # Open position
         pos = self.wallet.open_position(
@@ -627,7 +825,6 @@ def main():
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--balance", type=float, default=1_000.0)
     parser.add_argument("--leverage", type=int, default=LEVERAGE)
-    parser.add_argument("--testnet", action="store_true")
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--llm-host", default=None, help="Ollama host URL (defaults to OLLAMA_HOST env var)")
     parser.add_argument("--llm-model", default=None, help="Ollama model name (defaults to OLLAMA_MODEL env var)")
@@ -646,7 +843,6 @@ def main():
         symbol=args.symbol,
         initial_balance=args.balance,
         leverage=args.leverage,
-        testnet=args.testnet,
         use_llm=not args.no_llm,
         llm_host=args.llm_host,
         llm_model=args.llm_model,

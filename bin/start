@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# One-command launcher: infrastructure + dashboard API + trading bot.
+# Paper-safe by default (MODE defaults to paper). Forwards extra args to the
+# bot, e.g.  ./bin/start --tick 60 --symbols BTCUSDT,ETHUSDT
+set -e
+cd "$(dirname "$0")/.."
+
+# Load .env if present
+if [ -f .env ]; then export $(grep -v '^#' .env | xargs); fi
+
+# Defaults (overridable via .env / environment)
+export DATABASE_URL=${DATABASE_URL:-"postgresql://trader:trader@localhost:5435/crypto_trader"}
+export REDIS_URL=${REDIS_URL:-"redis://localhost:6382/0"}
+export MODE=${MODE:-"paper"}
+export MAX_MARGIN_RATIO=${MAX_MARGIN_RATIO:-"0.80"}
+
+# Live mode is real money — require an explicit confirmation before launching.
+if [ "$MODE" = "live" ]; then
+  echo "⚠️  MODE=live — REAL ORDERS WILL BE PLACED ON COINDCX."
+  echo "    Gate must be open: LIVE_TRADING_ENABLED=true, LIVE_TRADING_ACK set, no HALT file."
+  read -r -p "    Type 'live' to continue, anything else to abort: " confirm
+  [ "$confirm" = "live" ] || { echo "Aborted."; exit 1; }
+fi
+
+echo "--- Infrastructure (Postgres, Redis) ---"
+docker compose up -d postgres redis
+docker compose ps
+
+echo "--- Dashboard API (background) on :8088 ---"
+rm -f api.log
+python3 -m crypto_trader.api_service --port 8088 > api.log 2>&1 &
+API_PID=$!
+
+# Clean shutdown of all children on Ctrl+C / TERM
+trap "echo ''; echo 'Shutting down...'; kill ${API_PID} ${BOT_PID} 2>/dev/null; exit" SIGINT SIGTERM
+
+echo "--- Trading bot (multi-symbol, MODE=${MODE}) ---"
+python3 -m crypto_trader.multi_engine "$@" &
+BOT_PID=$!
+
+echo ""
+echo "===================================================="
+echo "  Antigravity running | MODE=${MODE}"
+echo "  API:  http://localhost:8088"
+echo "  UI :  cd ui && npm run dev -- --port 3030   (-> http://localhost:3030)"
+echo "  Logs: api.log     Stop: Ctrl+C"
+echo "===================================================="
+echo ""
+
+# Keep the launcher alive so background processes keep running.
+wait

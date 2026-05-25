@@ -137,13 +137,13 @@ Binance geo-block (HTTP 451).
 The **single supported live entrypoint** is `engine_live.py`:
 
 ```bash
-# Always start here for paper/testnet/live — it runs a startup self-test gate.
+# Always start here for paper/live — it runs a startup self-test gate.
 python -m crypto_trader.engine_live                   # MODE from .env
 python -m crypto_trader.engine_live --self-test-only  # run the gate and exit
 ```
 
 `MODE` selects the execution adapter: `paper` → `PaperExecutionEngine`,
-`testnet`/`live` → `CoinDCXExecutionEngine`. Live orders are gated three ways
+`live` → `CoinDCXExecutionEngine` (mainnet). Live orders are gated three ways
 (`safe_mode`): `LIVE_TRADING_ENABLED=true` +
 `LIVE_TRADING_ACK="I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"` + no
 `~/.crypto_trader/HALT` file.
@@ -244,6 +244,72 @@ python -m crypto_trader.engine_live --self-test-only   # E2E gate
 `tests/test_coindcx_execution.py` has the reusable `_FakeClient` + `gate_open`
 fixtures; `tests/test_protective_stops.py` has a `FakeEngine` for the wallet's
 live order path.
+
+### Production-readiness guards (G1–G5)
+
+A second hardening pass added infra guards. **Note on scope:** an external review
+proposed a Redis-Streams + PostgreSQL multi-process design (DLQ/PEL, consumer
+groups, etc.). This project is intentionally **single-process, threaded, and
+event-sourced**, so those Redis/DLQ items are N/A — these five guards are the
+parts that apply to the actual architecture.
+
+| ID | Guard | Where | Default |
+|----|-------|-------|---------|
+| **G1** | Clock-skew detection | `coindcx_client.measure_clock_skew_ms()`, `engine_live` preflight | warn at 2000ms |
+| **G2** | Per-minute velocity breaker | `risk.py` | 6 orders/min |
+| **G3** | WS thread supervisor (fail-stop) | `engine_ws._supervise_threads()`, `ws_client.is_alive()` | on |
+| **G4** | Proactive rate-limit backpressure | `coindcx_client._apply_backpressure()` | on (header-driven) |
+| **G5** | Reconciler final-status + strict cancel-all | `coindcx_execution.get_order_status()` / `cancel_all_orders()`, `reconciler.py` | strict-cancel off |
+
+- **G1** reads the HTTP `Date` response header (no dedicated server-time endpoint
+  exists) and corrects for ~½ RTT; the preflight check is **advisory** (warns,
+  doesn't block) because Date resolution is ~1s. Tune with `CLOCK_SKEW_MAX_MS`.
+- **G2** tracks a 60s rolling window of opens in `RiskManager.can_trade()` on top
+  of the daily cap; in-memory only (a restart safely resets the window).
+  `MAX_ORDERS_PER_MINUTE=0` disables it.
+- **G3** the `run_loop` checks `ws_feed.is_alive()` / `ws_pm.is_alive()` each tick;
+  a dead thread trips `safe_mode.trip_halt` + the kill switch and stops the engine
+  (never trades on a stale feed). Toggle with `THREAD_SUPERVISOR_ENABLED`.
+- **G4** best-effort: parses `X-RateLimit-Remaining`/`-Limit` (and `Retry-After`
+  on 429) and sleeps a bounded delay when quota drops below ~15%. No-op if the
+  venue omits the headers.
+- **G5** `get_order_status` resolves an order as open/filled/unknown from open
+  orders + recent fills; `cancel_all_orders` flattens the venue book. With
+  `RECONCILE_STRICT_CANCEL=true`, an unresolved desync cancels all venue orders
+  before tripping the kill switch.
+
+Config keys: `CLOCK_SKEW_MAX_MS` (2000), `MAX_ORDERS_PER_MINUTE` (6),
+`THREAD_SUPERVISOR_ENABLED` (true), `RECONCILE_STRICT_CANCEL` (false).
+Tests: `tests/test_production_guards.py`.
+
+### Redis Streams pipeline + Postgres read-model (data modeling)
+
+Optional, **opt-in** decoupling of strategy (producer) from execution (consumer
+group), plus a relational read-model derived from the JSONB event journal:
+
+- **Postgres** stays the source of truth — append-only `events`/`snapshots` JSONB
+  (`storage/postgres_store.py`). A new **projection** (`storage/projection.py`)
+  materializes `active_positions` / `orders` / `fills` with a `mode` (`paper`/`live`)
+  column for UI/analytics; it's a derived view (rebuildable), chained onto the wallet
+  event hook when `PROJECTION_ENABLED=true`.
+- **Redis Streams** (`infra/redis_streams.py`, `execution/signal_bus.py`,
+  `execution/run_consumer.py`) carry signals with at-least-once delivery,
+  idempotency, a pre-execution risk gate, poison-pill → DLQ routing, and PEL crash
+  recovery. Enable with `EXECUTION_BUS=redis` + `REDIS_URL`; run the worker via
+  `python -m crypto_trader.execution.run_consumer`.
+
+Default runtime is unchanged (`inproc`, projection off). Full design, schema, flow,
+config, and caveats: **[`docs/redis_postgres_data_modeling.md`](../docs/redis_postgres_data_modeling.md)**.
+Tests: `tests/test_redis_pipeline.py`.
+
+### Dashboard (read-only realtime UI)
+
+A FastAPI service (`crypto_trader/api/`) reads the projection and relays bot events
+over **SSE** (true realtime via Redis pub/sub — no polling); a SolidJS app (`ui/`)
+renders open positions / PnL / recent fills with a single **All/Live/Paper** toggle.
+Read-only — no trade-mutating endpoints. Run `uvicorn crypto_trader.api.app:app`
+(it serves the built UI at `/`) or `docker compose --profile ui up`. Full guide:
+**[`docs/dashboard.md`](../docs/dashboard.md)**. Tests: `tests/test_api.py`.
 
 ## Network & LLM Logging
 

@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+
+# Ensure project root is in sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import random
+from crypto_trader.infra.redis_streams import RedisStreamBus
+from crypto_trader.execution.signal_bus import SignalPublisher, Signal
+
+def send_test_signals():
+    bus = RedisStreamBus.from_url(os.environ.get("REDIS_URL", "redis://localhost:6382/0"))
+    publisher = SignalPublisher(bus)
+    
+    symbols = ["SOLUSDT", "BTCUSDT", "ETHUSDT", "LINKUSDT", "ADAUSDT"]
+    
+    print("🚀 Sending a burst of test signals for the UI...")
+    for sym in symbols:
+        side = random.choice(["LONG", "SHORT"])
+        qty = 0.01  # Tiny quantity to fit in wallet
+        price = random.uniform(10, 100) # Lower price to fit in wallet
+        
+        sig = Signal(
+            strategy_id="UI_SMOKE",
+            symbol=sym,
+            side=side,
+            quantity=qty,
+            mode="paper",
+            price=price
+        )
+        print(f"  -> {side} {sym} @ {price}")
+        publisher.emit(sig)
+        time.sleep(0.5)
+    
+    print("\n✅ Done. Check your dashboard at http://localhost:3030")
+
+if __name__ == "__main__":
+    send_test_signals()
