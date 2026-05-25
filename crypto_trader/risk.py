@@ -51,9 +51,7 @@ class RiskManager:
         # explicit clear — never auto-resets.
         self.kill_switch: bool = False
         self.kill_switch_reason: Optional[str] = None
-        # Resolve the state path at construction (not import) so tests that patch
-        # Path.home() get an isolated risk_state.json instead of the shared one.
-        self.state_file = Path.home() / ".crypto_trader" / "risk_state.json"
+        self.state_file = DATA_DIR / "risk_state.json"
         self._load_state()
 
     def _today(self) -> date:

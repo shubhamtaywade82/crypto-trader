@@ -148,6 +148,7 @@ def test_software_monitor_holds_at_exact_sl_when_venue_stop_present(tmp_path, mo
 
 def test_reconciler_repairs_missing_stop_without_kill_switch(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("crypto_trader.risk.DATA_DIR", tmp_path)  # isolate risk_state.json
     from crypto_trader.execution.reconciler import Reconciler
     from crypto_trader.risk import RiskManager
 
