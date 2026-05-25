@@ -30,7 +30,7 @@ CONSUMER_PID=$!
 
 # 3. Start Dashboard API
 echo "--- Starting Dashboard API (Background) on port 8088 ---"
-python3 -m crypto_trader.api --port 8088 > api.log 2>&1 &
+python3 -m crypto_trader.api_service --port 8088 > api.log 2>&1 &
 API_PID=$!
 
 # Cleanup on exit

@@ -86,9 +86,27 @@ async def event_stream(request: Request):
     
     async def event_generator():
         # Stream from 'events:broadcast'
-        # On first connect, we might want to send the last few events? 
-        # For now, just new ones.
-        last_id = "$" 
+        # Replay the last 10 events on connect so the UI isn't empty
+        last_id = "0" # Start from beginning of stream (or use XRANGE for limited replay)
+        
+        # To avoid replaying EVERYTHING since forever, we can use $ initially
+        # but let's try replaying the last few messages.
+        try:
+            # Get last 20 messages for initial burst
+            past_events = await r.xrevrange("events:broadcast", max="+", min="-", count=20)
+            for msg_id, data in reversed(past_events):
+                payload = data.get("payload", "{}")
+                yield {
+                    "id": msg_id,
+                    "event": "message",
+                    "data": payload
+                }
+            # Now switch to tailing
+            last_info = await r.xinfo_stream("events:broadcast")
+            last_id = last_info["last-generated-id"]
+        except Exception as e:
+            logger.warning(f"Initial stream replay failed (maybe stream is empty): {e}")
+            last_id = "$"
         while True:
             if await request.is_disconnected():
                 break
