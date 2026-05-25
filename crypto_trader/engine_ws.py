@@ -184,8 +184,18 @@ class WebSocketTradingEngine:
         if event.command == "KILL_ALL" or (event.command == "KILL" and event.params.get("symbol") == self.symbol):
             self._halted = True
             logger.warning(f"🛑 [HALTED] {self.symbol} received KILL command.")
-            # Optional: Close all positions immediately
-            # self.wallet.close_all_positions(reason="REMOTE_KILL")
+            # A remote KILL must flatten the live position, not just block new
+            # entries — otherwise an open position rides on unattended.
+            try:
+                pos = self.wallet.get_open_position(self.symbol)
+                if pos:
+                    mark = self.ws_feed.get_ltp() or self.ws_feed.get_mid_price()
+                    if not mark or mark <= 0:
+                        mark = float(pos.entry_price)
+                    self.wallet.close_position(self.symbol, float(mark), reason="REMOTE_KILL")
+                    logger.warning(f"🛑 [KILL] flattened {self.symbol} on remote command")
+            except Exception as e:
+                logger.error("remote KILL flatten failed for %s: %s", self.symbol, e)
         
         elif event.command == "RESUME_ALL" or (event.command == "RESUME" and event.params.get("symbol") == self.symbol):
             self._halted = False

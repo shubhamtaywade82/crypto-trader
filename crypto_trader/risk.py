@@ -5,8 +5,10 @@ Daily trade limits, consecutive loss tracking, and LLM failure circuit breaker.
 """
 
 import json
+import os
 import time
 import logging
+import tempfile
 from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Tuple, Optional
@@ -16,6 +18,24 @@ logger = logging.getLogger("crypto_trader.risk")
 
 DATA_DIR = Path.home() / ".crypto_trader"
 DATA_DIR.mkdir(exist_ok=True)
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically (temp file + fsync + rename) so a crash mid-write
+    can't leave a truncated/corrupt state file — critical for the kill switch."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class RiskManager:
@@ -190,8 +210,7 @@ class RiskManager:
             "kill_switch": self.kill_switch,
             "kill_switch_reason": self.kill_switch_reason,
         }
-        with open(self.state_file, "w") as f:
-            json.dump(state, f)
+        _atomic_write_json(self.state_file, state)
 
     def _load_state(self):
         if not self.state_file.exists():
@@ -259,8 +278,7 @@ class AdaptiveThresholdManager:
 
     def _save_state(self):
         try:
-            with open(self.state_file, "w") as f:
-                json.dump({"last_trade_time": self.last_trade_time}, f)
+            _atomic_write_json(self.state_file, {"last_trade_time": self.last_trade_time})
         except Exception:
             pass
 
