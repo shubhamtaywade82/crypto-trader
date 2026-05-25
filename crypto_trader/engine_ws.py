@@ -88,7 +88,6 @@ class WebSocketTradingEngine:
             log_responses=ws_logged,
         )
 
-        # Wallet & Risk
         if wallet:
             self.wallet = wallet
         else:
@@ -97,7 +96,15 @@ class WebSocketTradingEngine:
                 initial_balance=initial_balance,
                 leverage=leverage,
             )
-        self.risk_manager = RiskManager()
+        
+        if cfg:
+            self.risk_manager = RiskManager(
+                max_daily_trades=cfg.max_daily_trades,
+                max_orders_per_minute=cfg.max_orders_per_minute,
+                max_margin_ratio=cfg.max_margin_ratio
+            )
+        else:
+            self.risk_manager = RiskManager()
         self.adaptive_threshold = AdaptiveThresholdManager(
             base_threshold=FINAL_SCORE_THRESHOLD,
             min_threshold=0.50,
@@ -206,6 +213,30 @@ class WebSocketTradingEngine:
         self.ws_feed.stop()
         logger.info("[ENGINE] Stopped")
 
+    def _check_authoritative_health(self):
+        """Monitor authoritative exchange metrics (margin ratio) and trigger kill switch if unsafe."""
+        if not self.cfg or not self.cfg.is_live:
+            return
+
+        from .exchanges.coindcx_execution import CoinDCXExecutionEngine
+        if not isinstance(self.wallet.execution_engine, CoinDCXExecutionEngine):
+            return
+
+        try:
+            details = self.wallet.execution_engine.get_cross_margin_details()
+            if details:
+                ratio = float(details.get("margin_ratio_cross", 0) or 0)
+                ok, reason = self.risk_manager.check_margin_ratio(ratio)
+                if not ok:
+                    logger.critical(f"[AUTHORITATIVE GUARD] {reason}")
+                    self.risk_manager.trigger_kill_switch(reason)
+                    self._halted = True
+                    if self.event_bus:
+                        from .events import SystemFailureEvent
+                        self.event_bus.publish(SystemFailureEvent(component="margin_guard", error=reason))
+        except Exception as e:
+            logger.error("Authoritative health check failed: %s", e)
+
     # ── Main Loop ──
 
     def run_loop(self, signal_interval_seconds: int = 300, max_iterations: int = None):
@@ -221,6 +252,9 @@ class WebSocketTradingEngine:
                 # G3: supervise the WS threads — never trade on a dead/stale feed.
                 if not self._supervise_threads():
                     break
+                
+                # Authoritative health check (margin ratio guard)
+                self._check_authoritative_health()
 
                 # Signal generation tick (REST-based)
                 self._signal_tick()

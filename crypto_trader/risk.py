@@ -30,6 +30,7 @@ class RiskManager:
         cooldown_after_loss_minutes: int = 30,
         max_correlated_positions: int = 2,
         max_orders_per_minute: int = 6,
+        max_margin_ratio: float = 0.80,
     ):
         self.max_daily = max_daily_trades
         self.max_consecutive = max_consecutive_losses
@@ -37,6 +38,7 @@ class RiskManager:
         self.max_daily_drawdown_pct = max_daily_drawdown_pct
         self.cooldown_after_loss_seconds = cooldown_after_loss_minutes * 60
         self.max_correlated_positions = max_correlated_positions
+        self.max_margin_ratio = max_margin_ratio
         # G2: per-minute order velocity circuit breaker (runaway-loop guard).
         # In-memory only; a restart resets the 60s window, which is safe.
         self.max_orders_per_minute = max_orders_per_minute
@@ -108,11 +110,17 @@ class RiskManager:
         
         if current_balance is not None and self.peak_balance and self.peak_balance > 0:
             cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
-            peak = float(self.peak_balance) if isinstance(self.peak_balance, Decimal) else float(self.peak_balance)
+            peak = float(self.peak_balance) if self.peak_balance is not None else 0.0
             dd = (peak - cur) / peak
             if dd >= self.max_drawdown_pct:
                 return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
         
+        return True, "OK"
+
+    def check_margin_ratio(self, ratio: float) -> Tuple[bool, str]:
+        """Verify the authoritative exchange margin ratio is within safe bounds."""
+        if ratio >= self.max_margin_ratio:
+            return False, f"Exchange margin ratio too high: {ratio:.2%} >= {self.max_margin_ratio:.2%}"
         return True, "OK"
 
     def check_correlation(self, symbol: str, side: str, active_positions: dict) -> Tuple[bool, str]:

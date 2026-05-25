@@ -55,6 +55,22 @@ interface Health {
   mode?: string;
 }
 
+interface VenueHealth {
+  ok: boolean;
+  details?: {
+    pnl: number;
+    maintenance_margin: number;
+    available_wallet_balance: number;
+    total_wallet_balance: number;
+    total_initial_margin: number;
+    available_balance_cross: number;
+    margin_ratio_cross: number;
+    total_account_equity: number;
+    updated_at: number;
+  };
+  error?: string;
+}
+
 type ConnState = "connecting" | "live" | "reconnecting";
 
 interface Candle {
@@ -89,6 +105,7 @@ function App() {
   const [pnl, setPnl] = createSignal<Pnl>({ mode: "paper", fills: 0, total_fees: 0, total_qty: 0, realized_pnl: 0 });
   const [events, setEvents] = createSignal<any[]>([]);
   const [health, setHealth] = createSignal<Health | null>(null);
+  const [venueHealth, setVenueHealth] = createSignal<VenueHealth | null>(null);
   const [accountBalance, setAccountBalance] = createSignal<number>(1000.0);
 
   // Active terminal context
@@ -281,6 +298,17 @@ function App() {
     }
   };
 
+  const fetchVenueHealth = async () => {
+    if (mode() !== "live") return;
+    try {
+      const res = await fetch(getUrl("/venue/health"));
+      const data = await res.json() as VenueHealth;
+      setVenueHealth(data);
+    } catch (e) {
+      console.warn("Failed to fetch venue health:", e);
+    }
+  };
+
   // Fetch real-time Order Book depth from Binance
   const fetchLiveOrderBook = async (sym: string) => {
     try {
@@ -443,6 +471,9 @@ function App() {
 
       // Fetch live order book
       fetchLiveOrderBook(sym);
+
+      // Fetch venue health if live
+      fetchVenueHealth();
 
       // Age updates
       const h = health();
@@ -1017,6 +1048,43 @@ function App() {
               <span class="account-val" style="color: var(--text-bright);">{formatNum(equity(), 2)} USDT</span>
             </div>
           </div>
+
+          {/* Authoritative Venue Health (Live only) */}
+          <Show when={mode() === 'live'}>
+            <div class="account-info-widget" style="margin-top: 1rem; border-color: var(--color-warn-subtle);">
+              <div class="panel-header" style="background: transparent; border: none; padding: 0; height: auto; min-height: 0; margin-bottom: 4px;">
+                <h3 style="font-size: 9px; color: var(--color-warn);">Authoritative Venue Health</h3>
+              </div>
+              <Show when={venueHealth()?.ok} fallback={<div class="empty-state" style="font-size: 9px; padding: 4px;">{venueHealth()?.error || 'Fetching venue metrics...'}</div>}>
+                <div class="account-row">
+                  <span class="account-label">Venue PnL:</span>
+                  <span class={`account-val ${Number(venueHealth()?.details?.pnl || 0) >= 0 ? 'up' : 'down'}`}>
+                    {formatNum(venueHealth()?.details?.pnl || 0, 4)} USDT
+                  </span>
+                </div>
+                <div class="account-row">
+                  <span class="account-label">Margin Ratio:</span>
+                  <span class={`account-val ${Number(venueHealth()?.details?.margin_ratio_cross || 0) > 0.8 ? 'down' : 'up'}`}>
+                    {(Number(venueHealth()?.details?.margin_ratio_cross || 0) * 100).toFixed(2)}%
+                  </span>
+                </div>
+                <div class="account-row">
+                  <span class="account-label">Maint. Margin:</span>
+                  <span class="account-val">{formatNum(venueHealth()?.details?.maintenance_margin || 0, 4)} USDT</span>
+                </div>
+                <div class="account-row">
+                  <span class="account-label">Total Equity:</span>
+                  <span class="account-val" style="color: var(--text-bright);">{formatNum(venueHealth()?.details?.total_account_equity || 0, 2)} USDT</span>
+                </div>
+                <div class="account-row" style="margin-top: 4px; border-top: 1px solid var(--border-subtle); padding-top: 2px;">
+                  <span class="account-label" style="font-size: 7px; color: var(--text-muted);">Last Sync:</span>
+                  <span class="account-val" style="font-size: 7px; color: var(--text-muted);">
+                    {venueHealth()?.details?.updated_at ? new Date(venueHealth()!.details!.updated_at).toLocaleTimeString() : '—'}
+                  </span>
+                </div>
+              </Show>
+            </div>
+          </Show>
         </aside>
 
         {/* COLUMN 2: ACTIVE INTERACTIVE CHART & TABBED WORKSTATION */}

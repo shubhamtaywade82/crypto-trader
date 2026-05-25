@@ -200,6 +200,16 @@ class CoinDCXExecutionEngine:
                 continue
         return balances
 
+    def get_cross_margin_details(self) -> Optional[dict]:
+        """Fetch full cross-margin account details (pnl, margin_ratio, equity, etc)."""
+        try:
+            res = self.client.get_signed(EP_CROSS_MARGIN, {})
+            if isinstance(res, dict):
+                return res
+        except CoinDCXError as e:
+            logger.debug("cross_margin_details fetch failed: %s", e)
+        return None
+
     def sync_balance(self) -> float:
         """Available trading balance in the configured margin currency.
 

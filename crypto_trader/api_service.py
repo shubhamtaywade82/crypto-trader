@@ -361,6 +361,22 @@ def _get_venue_engine():
     return _venue_engine
 
 
+@app.get("/venue/health")
+def venue_health():
+    """Authoritative CoinDCX account health (cross_margin_details).
+    Includes margin ratio, maintenance margin, and total account PnL."""
+    eng = _get_venue_engine()
+    if eng is None:
+        return {"ok": False, "error": _venue_err or "venue unavailable"}
+    try:
+        details = eng.get_cross_margin_details()
+        if details:
+            return {"ok": True, "details": details}
+        return {"ok": False, "error": "failed to fetch cross margin details"}
+    except Exception as e:
+        logger.error("venue health fetch failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
 @app.get("/venue/account")
 def venue_account(symbol: Optional[str] = Query(None)):
     """Live CoinDCX account snapshot (real balances/positions/open orders).
