@@ -45,6 +45,8 @@ services:
     environment:
       DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
       REDIS_URL: redis://redis:6379/0
+      PROJECTION_ENABLED: "true"
+      UI_EVENTS_ENABLED: "true"
     command: ["python", "-m", "crypto_trader.engine_live", "--tick", "300"]
     restart: unless-stopped
 
@@ -65,6 +67,27 @@ services:
       REDIS_URL: redis://redis:6379/0
       EXECUTION_BUS: redis
     command: ["python", "-m", "crypto_trader.execution.run_consumer"]
+    restart: unless-stopped
+
+  # Read-only realtime dashboard (FastAPI + built SolidJS UI). Serves the UI at
+  # http://localhost:8000 and relays bot events over SSE from Redis pub/sub.
+  # Enable with: docker compose --profile ui up
+  dashboard:
+    profiles: ["ui"]
+    build: .
+    container_name: crypto_trader_ui
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader@postgres:5432/crypto_trader
+      REDIS_URL: redis://redis:6379/0
+    command: ["uvicorn", "crypto_trader.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
     restart: unless-stopped
 
 volumes:

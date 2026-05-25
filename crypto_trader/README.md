@@ -302,6 +302,15 @@ Default runtime is unchanged (`inproc`, projection off). Full design, schema, fl
 config, and caveats: **[`docs/redis_postgres_data_modeling.md`](../docs/redis_postgres_data_modeling.md)**.
 Tests: `tests/test_redis_pipeline.py`.
 
+### Dashboard (read-only realtime UI)
+
+A FastAPI service (`crypto_trader/api/`) reads the projection and relays bot events
+over **SSE** (true realtime via Redis pub/sub — no polling); a SolidJS app (`ui/`)
+renders open positions / PnL / recent fills with a single **All/Live/Paper** toggle.
+Read-only — no trade-mutating endpoints. Run `uvicorn crypto_trader.api.app:app`
+(it serves the built UI at `/`) or `docker compose --profile ui up`. Full guide:
+**[`docs/dashboard.md`](../docs/dashboard.md)**. Tests: `tests/test_api.py`.
+
 ## Network & LLM Logging
 
 To inspect exchange payloads and debug LLM prompts/responses in real-time, you can use the following switches:

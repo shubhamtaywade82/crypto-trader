@@ -114,6 +114,14 @@ class TradingConfig:
     # Postgres relational read-model derived from the JSONB event stream.
     projection_enabled: bool = False
 
+    # ── Dashboard API + realtime UI bridge ──
+    # The bot publishes each domain event to a Redis pub/sub channel; the FastAPI
+    # service relays it over SSE for true realtime (no polling).
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    ui_events_enabled: bool = True          # bot -> Redis pub/sub for the UI
+    ui_events_channel: str = "events:ui"
+
     # ── Production-readiness guards (G1–G5) ──
     # G1: max tolerated local↔venue clock drift (ms) before warning/halting.
     clock_skew_max_ms: int = 2000
@@ -173,6 +181,10 @@ class TradingConfig:
             signal_max_deliveries=_get_int("SIGNAL_MAX_DELIVERIES", 3),
             idempotency_ttl_seconds=_get_int("IDEMPOTENCY_TTL_SECONDS", 300),
             projection_enabled=_get_bool("PROJECTION_ENABLED", False),
+            api_host=_get("API_HOST", "0.0.0.0"),
+            api_port=_get_int("API_PORT", 8000),
+            ui_events_enabled=_get_bool("UI_EVENTS_ENABLED", True),
+            ui_events_channel=_get("UI_EVENTS_CHANNEL", "events:ui"),
             clock_skew_max_ms=_get_int("CLOCK_SKEW_MAX_MS", 2000),
             max_orders_per_minute=_get_int("MAX_ORDERS_PER_MINUTE", 6),
             thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),

@@ -289,7 +289,17 @@ class LiveTradingSystem:
                 logger.error("projection init failed (continuing without it): %s", e)
                 self.projection = None
 
-        if self.event_store is not None or self.projection is not None:
+        # Realtime UI relay: publish each event to Redis pub/sub for the dashboard.
+        ui_publisher = None
+        if self.cfg.ui_events_enabled and self.cfg.redis_url:
+            try:
+                from .api.events_bridge import RedisEventPublisher
+                ui_publisher = RedisEventPublisher(self.cfg.redis_url, self.cfg.ui_events_channel)
+                logger.info("Realtime UI event relay enabled (channel=%s)", self.cfg.ui_events_channel)
+            except Exception as e:
+                logger.error("UI event relay init failed (continuing without it): %s", e)
+
+        if self.event_store is not None or self.projection is not None or ui_publisher is not None:
             prev = self.wallet.event_hook
             def _sink(ev):
                 if self.event_store is not None:
@@ -302,6 +312,8 @@ class LiveTradingSystem:
                         self.projection.apply(ev)
                     except Exception as e:  # projection is derived; never fatal
                         logger.error("projection apply failed: %s", e)
+                if ui_publisher is not None:
+                    ui_publisher(ev)  # already swallows its own errors
                 if prev:
                     prev(ev)
             self.wallet.event_hook = _sink
