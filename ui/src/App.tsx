@@ -32,6 +32,12 @@ interface Gate {
   mode: string; live_enabled: boolean; ack_ok: boolean; halt_file: boolean;
   place_order: boolean; read_only: boolean; live_orders_allowed: boolean;
 }
+interface Venue {
+  ok: boolean; error: string | null;
+  balances: Record<string, number> | null;
+  positions: Record<string, any> | null;
+  open_orders: any[] | null;
+}
 
 const fmt = (n: number | null | undefined, d = 2) =>
   n == null ? "—" : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -63,6 +69,7 @@ function App() {
   const [risk, setRisk] = createSignal<Risk | null>(null);
   const [gate, setGate] = createSignal<Gate | null>(null);
   const [ltp, setLtp] = createSignal<Record<string, number | null>>({});
+  const [venue, setVenue] = createSignal<Venue | null>(null);
 
   const markBySymbol = createMemo(() => {
     const m: Record<string, number | null> = {};
@@ -86,6 +93,11 @@ function App() {
       getJSON<Gate | null>(`/gate`, null),
     ]);
     setAccount(acc); setPositions(pos); setOrders(ord); setFills(fil); setRisk(rsk); setGate(gt);
+    if (m === "live") {
+      setVenue(await getJSON<Venue | null>(`/venue/account`, null));
+    } else {
+      setVenue(null);
+    }
   }
 
   async function refreshLtp() {
@@ -215,6 +227,69 @@ function App() {
           <span class="metric-value">{positions().filter(p => Number(p.qty) > 0).length}</span>
         </div>
       </div>
+
+      {/* Real CoinDCX venue snapshot (live mode only) */}
+      <Show when={mode() === "live"}>
+        <div class="content-panel" style="margin-bottom: 1.5rem;">
+          <div class="panel-header">
+            <h3>CoinDCX Venue — Live Account <span class="version-badge" style="margin-left:8px;">real exchange</span></h3>
+            <span class={`count-tag ${venue()?.ok ? '' : ''}`}>{venue()?.ok ? 'connected' : (venue()?.error || 'unavailable')}</span>
+          </div>
+          <Show when={venue()?.ok} fallback={<div class="empty-state">CoinDCX snapshot unavailable: {venue()?.error || 'no data'}</div>}>
+            <div class="metrics-grid" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); margin-bottom: 1rem;">
+              <For each={Object.entries(venue()?.balances || {})}>
+                {([ccy, amt]) => (
+                  <div class="metric-card">
+                    <span class="metric-label">Balance {ccy}</span>
+                    <span class="metric-value" style="font-size:1.3rem;">{fmt(amt as number, 4)}</span>
+                  </div>
+                )}
+              </For>
+            </div>
+            <div class="table-container">
+              <h4 class="muted" style="margin:0.5rem 0;">Venue Positions</h4>
+              <table>
+                <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th></tr></thead>
+                <tbody>
+                  <For each={Object.values(venue()?.positions || {})}>
+                    {(p: any) => (
+                      <tr>
+                        <td class="bold">{p.symbol}</td>
+                        <td><span class={`side-pill ${String(p.side).toLowerCase()}`}>{p.side}</span></td>
+                        <td>{fmt(Number(p.qty ?? p.quantity), 4)}</td>
+                        <td>{fmt(Number(p.entry_price ?? p.avg_price), 4)}</td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+              <Show when={Object.keys(venue()?.positions || {}).length === 0}>
+                <div class="empty-state">No venue positions.</div>
+              </Show>
+              <h4 class="muted" style="margin:1rem 0 0.5rem;">Venue Open Orders</h4>
+              <table>
+                <thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th></tr></thead>
+                <tbody>
+                  <For each={venue()?.open_orders || []}>
+                    {(o: any) => (
+                      <tr>
+                        <td style="font-size:0.7rem;">{o.id ?? o.order_id}</td>
+                        <td>{o.symbol}</td>
+                        <td>{o.side}</td>
+                        <td>{fmt(Number(o.qty ?? o.quantity ?? o.total_quantity), 4)}</td>
+                        <td>{o.status}</td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+              <Show when={(venue()?.open_orders || []).length === 0}>
+                <div class="empty-state">No venue open orders.</div>
+              </Show>
+            </div>
+          </Show>
+        </div>
+      </Show>
 
       <div class="dashboard-layout">
         <div class="main-column">

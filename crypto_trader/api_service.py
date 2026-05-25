@@ -241,6 +241,56 @@ def get_gate():
     }
 
 
+_venue_engine = None
+_venue_err = None
+
+
+def _get_venue_engine():
+    """Lazily build a READ-ONLY CoinDCX engine (i_understand_real_money=False).
+    Reads (balances/positions/orders) don't pass the live gate, so this never
+    places orders. Returns None if credentials are missing/invalid."""
+    global _venue_engine, _venue_err
+    if _venue_engine is not None or _venue_err is not None:
+        return _venue_engine
+    try:
+        from crypto_trader.config import load_config
+        from crypto_trader.exchanges.coindcx_execution import CoinDCXExecutionEngine
+        cfg = load_config()
+        if not (cfg.coindcx_api_key and cfg.coindcx_api_secret):
+            _venue_err = "no CoinDCX credentials"
+            return None
+        _venue_engine = CoinDCXExecutionEngine(
+            api_key=cfg.coindcx_api_key, api_secret=cfg.coindcx_api_secret,
+            i_understand_real_money=False,
+        )
+    except Exception as e:
+        _venue_err = str(e)
+        logger.error("venue engine init failed: %s", e)
+    return _venue_engine
+
+
+@app.get("/venue/account")
+def venue_account(symbol: Optional[str] = Query(None)):
+    """Live CoinDCX account snapshot (real balances/positions/open orders).
+    This is the authoritative venue state — independent of the bot's projection."""
+    eng = _get_venue_engine()
+    if eng is None:
+        return {"ok": False, "error": _venue_err or "venue unavailable"}
+    try:
+        from crypto_trader.execution.account_sync import AccountSync
+        snap = AccountSync(eng).snapshot(symbol)
+        return {
+            "ok": bool(getattr(snap, "ok", False)),
+            "error": getattr(snap, "error", None),
+            "balances": getattr(snap, "balances", None),
+            "positions": getattr(snap, "positions", None),
+            "open_orders": getattr(snap, "open_orders", None),
+        }
+    except Exception as e:
+        logger.error("venue snapshot failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/positions/detail")
 def positions_detail(mode: str = Query("paper")):
     """Active positions joined with SL/TP from the latest POSITION_OPENED event."""
