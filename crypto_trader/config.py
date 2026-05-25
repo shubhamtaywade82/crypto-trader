@@ -135,6 +135,18 @@ class TradingConfig:
     # G5: on an unresolved venue desync, cancel ALL venue orders to protect capital.
     reconcile_strict_cancel: bool = False
 
+    # ── Market Regime / Session Engine ──
+    # Restrict new entries to institutional kill zones only (London Open, NY Open, etc.).
+    # Default False — keeps the bot trading while you validate regime labels in paper mode.
+    require_kill_zone: bool = False
+    # RVOL thresholds for ExtendedRegime classification.
+    rvol_dead_threshold: float = 0.6    # below this → DEAD_MARKET, no entries
+    rvol_weak_threshold: float = 0.9    # below this → LOW_VOL_CHOP, half size
+    rvol_strong_threshold: float = 1.5  # above this → full/boosted size
+    # Position-size multipliers applied by RegimeClassifier output.
+    regime_size_multiplier_high: float = 1.25  # TREND_EXPANSION
+    regime_size_multiplier_low: float = 0.5    # LOW_VOL_CHOP / MEAN_REVERSION
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -194,6 +206,12 @@ class TradingConfig:
             max_margin_ratio=_get_float("MAX_MARGIN_RATIO", 0.80),
             thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
             reconcile_strict_cancel=_get_bool("RECONCILE_STRICT_CANCEL", False),
+            require_kill_zone=_get_bool("REQUIRE_KILL_ZONE", False),
+            rvol_dead_threshold=_get_float("RVOL_DEAD_THRESHOLD", 0.6),
+            rvol_weak_threshold=_get_float("RVOL_WEAK_THRESHOLD", 0.9),
+            rvol_strong_threshold=_get_float("RVOL_STRONG_THRESHOLD", 1.5),
+            regime_size_multiplier_high=_get_float("REGIME_SIZE_MULTIPLIER_HIGH", 1.25),
+            regime_size_multiplier_low=_get_float("REGIME_SIZE_MULTIPLIER_LOW", 0.5),
         )
 
     @property
