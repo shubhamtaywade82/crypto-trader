@@ -197,6 +197,56 @@ def main():
         initial_balance=total_balance, 
         leverage=args.leverage,
     )
+
+    # ── Database Projections & Event Journal for Dashboard UI ──
+    from crypto_trader.config import load_config
+    cfg = load_config()
+    
+    event_store = None
+    projection = None
+    ui_publisher = None
+    
+    if cfg.database_url:
+        try:
+            from crypto_trader.storage import get_event_store
+            event_store = get_event_store(cfg.database_url)
+            logger.info("Postgres event store initialized for multi-engine")
+        except Exception as e:
+            logger.error("Failed to initialize Postgres event store: %s", e)
+            
+    if cfg.projection_enabled and cfg.database_url:
+        try:
+            from crypto_trader.storage.projection import PostgresProjection
+            projection = PostgresProjection(cfg.database_url, mode=cfg.mode.value)
+            logger.info("Postgres projection read-model enabled for multi-engine")
+        except Exception as e:
+            logger.error("Failed to initialize Postgres projection: %s", e)
+            
+    if cfg.ui_events_enabled and cfg.redis_url:
+        try:
+            from crypto_trader.api.events_bridge import RedisEventPublisher
+            ui_publisher = RedisEventPublisher(cfg.redis_url, cfg.ui_events_channel)
+            logger.info("Realtime UI event relay enabled for multi-engine (channel=%s)", cfg.ui_events_channel)
+        except Exception as e:
+            logger.error("Failed to initialize UI event relay: %s", e)
+            
+    if event_store is not None or projection is not None or ui_publisher is not None:
+        prev_hook = global_wallet.event_hook
+        def _sink(ev):
+            if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
+                ev["payload"]["mode"] = cfg.mode.value
+                
+            if event_store is not None:
+                try: event_store.append(ev)
+                except Exception as e: logger.error("event store append failed: %s", e)
+            if projection is not None:
+                try: projection.apply(ev)
+                except Exception as e: logger.error("projection apply failed: %s", e)
+            if ui_publisher is not None:
+                ui_publisher(ev)
+            if prev_hook:
+                prev_hook(ev)
+        global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
 

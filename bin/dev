@@ -25,11 +25,13 @@ docker compose ps
 
 # 2. Start Execution Consumer
 echo "--- Starting Execution Consumer (Background) ---"
+rm -f consumer.log
 python3 -m crypto_trader.execution.run_consumer > consumer.log 2>&1 &
 CONSUMER_PID=$!
 
 # 3. Start Dashboard API
 echo "--- Starting Dashboard API (Background) on port 8088 ---"
+rm -f api.log
 python3 -m crypto_trader.api_service --port 8088 > api.log 2>&1 &
 API_PID=$!
 
