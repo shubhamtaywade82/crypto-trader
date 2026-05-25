@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Development startup script for crypto-trader v4
+# Development startup script for crypto-trader v4 (Backend Services)
 
 set -e
 
@@ -33,23 +33,21 @@ echo "--- Starting Dashboard API (Background) on port 8088 ---"
 python3 -m crypto_trader.api --port 8088 > api.log 2>&1 &
 API_PID=$!
 
-# 4. Start Frontend
-echo "--- Starting SolidJS Frontend (Vite) on port 3030 ---"
-if [ ! -d "ui/node_modules" ]; then
-  echo "Installing UI dependencies..."
-  cd ui && npm install && cd ..
-fi
-
 # Cleanup on exit
-trap "echo 'Shutting down...'; kill $CONSUMER_PID $API_PID 2>/dev/null; exit" SIGINT SIGTERM
+trap "echo ''; echo 'Shutting down backend services...'; kill $CONSUMER_PID $API_PID 2>/dev/null; exit" SIGINT SIGTERM
 
 echo ""
 echo "===================================================="
-echo "  CRYPTO TRADER v4 DASHBOARD READY"
+echo "  CRYPTO TRADER v4 BACKEND READY"
 echo "  API: http://localhost:8088"
-echo "  UI:  http://localhost:3030"
+echo "  (Logs: consumer.log, api.log)"
 echo "===================================================="
 echo ""
+echo "To start the SolidJS Dashboard UI manually:"
+echo "  cd ui"
+echo "  npm run dev -- --port 3030"
+echo ""
+echo "Keeping backend services alive. Press Ctrl+C to stop."
 
-# Start Vite in the foreground on port 3030
-cd ui && npm run dev -- --port 3030
+# Keep script alive so background processes stay running
+wait
