@@ -7,3 +7,6 @@ python-dotenv>=1.0.0
 # Production event journal (Postgres). psycopg2 is imported lazily; only
 # required when DATABASE_URL is set.
 psycopg2-binary>=2.9.0
+# Redis Streams signal/execution pipeline. Imported lazily; only required when
+# EXECUTION_BUS=redis.
+redis>=5.0.0

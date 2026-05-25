@@ -53,6 +53,7 @@ class LiveTradingSystem:
         self.router = None
         self.reconciler = None
         self.user_stream = None
+        self.projection = None
 
         self.wallet = EnhancedFuturesWallet(
             symbol=self.cfg.symbol,
@@ -278,13 +279,29 @@ class LiveTradingSystem:
         if self.cfg.is_live:
             self.wallet.attach_execution_engine(self.execution_engine, live=True)
             self._maybe_start_user_stream()
-        if self.event_store is not None:
+        # Optional Postgres read-model (projection) derived from the event stream.
+        if self.cfg.projection_enabled and self.cfg.database_url:
+            try:
+                from .storage.projection import PostgresProjection
+                self.projection = PostgresProjection(self.cfg.database_url, mode=self.cfg.mode.value)
+                logger.info("Postgres projection (read-model) enabled")
+            except Exception as e:
+                logger.error("projection init failed (continuing without it): %s", e)
+                self.projection = None
+
+        if self.event_store is not None or self.projection is not None:
             prev = self.wallet.event_hook
             def _sink(ev):
-                try:
-                    self.event_store.append(ev)
-                except Exception as e:  # never let journaling kill trading
-                    logger.error("event store append failed: %s", e)
+                if self.event_store is not None:
+                    try:
+                        self.event_store.append(ev)
+                    except Exception as e:  # never let journaling kill trading
+                        logger.error("event store append failed: %s", e)
+                if self.projection is not None:
+                    try:
+                        self.projection.apply(ev)
+                    except Exception as e:  # projection is derived; never fatal
+                        logger.error("projection apply failed: %s", e)
                 if prev:
                     prev(ev)
             self.wallet.event_hook = _sink

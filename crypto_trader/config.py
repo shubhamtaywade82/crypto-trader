@@ -102,6 +102,18 @@ class TradingConfig:
     coindcx_stream_url: str = "wss://stream.coindcx.com"
     coindcx_stream_channel: str = "coindcx"
 
+    # ── Redis Streams pipeline + Postgres projection (data modeling) ──
+    # Redis decouples strategy (producer) from execution (consumer group) and
+    # gives at-least-once delivery + crash recovery via the Pending Entries List.
+    redis_url: str = ""                       # redis://host:6379/0; empty => disabled
+    execution_bus: str = "inproc"             # "inproc" (default) | "redis"
+    signal_stream: str = "execution:signals"
+    consumer_group: str = "execution_engine"
+    signal_max_deliveries: int = 3            # poison-pill -> DLQ after this many tries
+    idempotency_ttl_seconds: int = 300        # duplicate-suppression window
+    # Postgres relational read-model derived from the JSONB event stream.
+    projection_enabled: bool = False
+
     # ── Production-readiness guards (G1–G5) ──
     # G1: max tolerated local↔venue clock drift (ms) before warning/halting.
     clock_skew_max_ms: int = 2000
@@ -154,6 +166,13 @@ class TradingConfig:
             coindcx_user_stream_enabled=_get_bool("COINDCX_USER_STREAM_ENABLED", False),
             coindcx_stream_url=_get("COINDCX_STREAM_URL", "wss://stream.coindcx.com"),
             coindcx_stream_channel=_get("COINDCX_STREAM_CHANNEL", "coindcx"),
+            redis_url=_get("REDIS_URL"),
+            execution_bus=_get("EXECUTION_BUS", "inproc").lower(),
+            signal_stream=_get("SIGNAL_STREAM", "execution:signals"),
+            consumer_group=_get("CONSUMER_GROUP", "execution_engine"),
+            signal_max_deliveries=_get_int("SIGNAL_MAX_DELIVERIES", 3),
+            idempotency_ttl_seconds=_get_int("IDEMPOTENCY_TTL_SECONDS", 300),
+            projection_enabled=_get_bool("PROJECTION_ENABLED", False),
             clock_skew_max_ms=_get_int("CLOCK_SKEW_MAX_MS", 2000),
             max_orders_per_minute=_get_int("MAX_ORDERS_PER_MINUTE", 6),
             thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
@@ -167,6 +186,10 @@ class TradingConfig:
     @property
     def has_coindcx_credentials(self) -> bool:
         return bool(self.coindcx_api_key and self.coindcx_api_secret)
+
+    @property
+    def redis_enabled(self) -> bool:
+        return self.execution_bus == "redis" and bool(self.redis_url)
 
     def validate(self) -> List[str]:
         """Return a list of human-readable problems. Empty list == OK."""

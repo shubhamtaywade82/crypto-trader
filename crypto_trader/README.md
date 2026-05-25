@@ -282,6 +282,26 @@ Config keys: `CLOCK_SKEW_MAX_MS` (2000), `MAX_ORDERS_PER_MINUTE` (6),
 `THREAD_SUPERVISOR_ENABLED` (true), `RECONCILE_STRICT_CANCEL` (false).
 Tests: `tests/test_production_guards.py`.
 
+### Redis Streams pipeline + Postgres read-model (data modeling)
+
+Optional, **opt-in** decoupling of strategy (producer) from execution (consumer
+group), plus a relational read-model derived from the JSONB event journal:
+
+- **Postgres** stays the source of truth — append-only `events`/`snapshots` JSONB
+  (`storage/postgres_store.py`). A new **projection** (`storage/projection.py`)
+  materializes `active_positions` / `orders` / `fills` with a `mode` (`paper`/`live`)
+  column for UI/analytics; it's a derived view (rebuildable), chained onto the wallet
+  event hook when `PROJECTION_ENABLED=true`.
+- **Redis Streams** (`infra/redis_streams.py`, `execution/signal_bus.py`,
+  `execution/run_consumer.py`) carry signals with at-least-once delivery,
+  idempotency, a pre-execution risk gate, poison-pill → DLQ routing, and PEL crash
+  recovery. Enable with `EXECUTION_BUS=redis` + `REDIS_URL`; run the worker via
+  `python -m crypto_trader.execution.run_consumer`.
+
+Default runtime is unchanged (`inproc`, projection off). Full design, schema, flow,
+config, and caveats: **[`docs/redis_postgres_data_modeling.md`](../docs/redis_postgres_data_modeling.md)**.
+Tests: `tests/test_redis_pipeline.py`.
+
 ## Network & LLM Logging
 
 To inspect exchange payloads and debug LLM prompts/responses in real-time, you can use the following switches:
