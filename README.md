@@ -15,6 +15,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 ```
 
 ### Core Components
+
 - **Hybrid Data/Execution:** Low-latency Binance WebSocket data coupled with authoritative CoinDCX REST execution.
 - **Decoupled Pipeline:** Redis Streams provide at-least-once delivery, crash recovery (PEL), and worker idempotency.
 - **Event-Sourced Wallet:** Comprehensive position lifecycle tracking with 1% TDS accounting (F2), venue-resident stops (F1), and partial close support.
@@ -40,12 +41,14 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 The system is now unified into a single development orchestrator.
 
 ### 1. Prerequisites
+
 - Python 3.8+
 - Node.js 18+ (for UI)
 - Docker & Docker Compose
 - CoinDCX API Key/Secret (for Live mode)
 
 ### 2. Setup
+
 ```bash
 cp .env.example .env
 # Update .env with your credentials and configuration
@@ -53,18 +56,80 @@ pip install -r crypto_trader/requirements.txt
 ```
 
 ### 3. Launch Backend Stack
+
 Starts Postgres, Redis, the Execution Consumer, and the Dashboard API.
+
 ```bash
 ./bin/dev
 ```
 
 ### 4. Launch Dashboard UI (Manual)
+
 ```bash
 cd ui
 npm install
 npm run dev -- --port 3030
 ```
-Access the dashboard at **http://localhost:3030**.
+
+Access the dashboard at **<http://localhost:3030>**.
+
+---
+
+## ▶️ Running the Bot
+
+### Fastest: one command (paper-safe)
+
+```bash
+./bin/start                 # infra + API + multi-symbol bot (MODE defaults to paper)
+./bin/start --tick 60       # extra args forwarded to the bot
+```
+
+Then start the UI (separate terminal): `cd ui && npm run dev -- --port 3030`.
+
+### Manual / split processes
+
+```bash
+./bin/dev                   # backend only: infra + execution consumer + API (:8088)
+./bin/bot                   # multi-symbol trading bot (uses WATCHLIST), e.g. ./bin/bot --tick 60
+python3 bin/test_ui         # fire tiny paper signals to verify the UI/API pipeline
+```
+
+### Going LIVE (real money)
+
+Paper-soak first. Then set in `.env`:
+
+```
+MODE=live
+LIVE_TRADING_ENABLED=true
+LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST
+PLACE_ORDER=true
+COINDCX_API_KEY=...   COINDCX_API_SECRET=...
+COINDCX_MARGIN_CURRENCY=USDT     # or INR
+```
+
+Validate the gate before trading (single-symbol gated entrypoint):
+
+```bash
+python3 -m crypto_trader.engine_live --self-test-only
+```
+
+Orders are blocked unless ALL hold: `LIVE_TRADING_ENABLED=true` **and** the exact
+`LIVE_TRADING_ACK` phrase **and** no `~/.crypto_trader/HALT` file **and** `PLACE_ORDER=true`.
+
+### Emergency controls
+
+| Action | Command |
+|:--- | :--- |
+| Halt all live orders instantly | `touch ~/.crypto_trader/HALT` |
+| Resume | `rm ~/.crypto_trader/HALT` |
+| Clear kill-switch + loss streak (after review) | `./bin/clear_risk` |
+| Telegram (if configured) | `/kill` · `/resume` · `/status` · `/pnl` |
+
+> ⚠️ Known gaps before public/live deploy: Telegram `/kill` has **no sender allowlist**;
+> the dashboard API binds `0.0.0.0` with open CORS and no auth; do **not** set
+> `EXECUTION_BUS=redis` in `docker-compose` yet (the `bot` and `execution-worker`
+> services share one consumer group and would split entries across two wallets).
+> `./bin/bot` / `./bin/start` (multi_engine) use the in-process direct path and are unaffected.
 
 ---
 
@@ -73,6 +138,7 @@ Access the dashboard at **http://localhost:3030**.
 Antigravity is built for capital preservation through multiple layers of defense:
 
 ### Production Guards (G)
+
 - **G1 Clock Skew:** Warnings/Halts if local clock drifts from venue (>2000ms).
 - **G2 Velocity Breaker:** Limits order frequency (default: 6 orders/min).
 - **G3 Thread Supervisor:** Halts the engine if WebSocket or Position Manager threads die.
@@ -80,6 +146,7 @@ Antigravity is built for capital preservation through multiple layers of defense
 - **G5 Strict Reconciliation:** Optional cancel-all-on-desync behavior.
 
 ### Hardened Features (F)
+
 - **F1 Venue Stops:** Automatic placement of resting Stop-Loss orders on the exchange.
 - **F2 TDS Accounting:** Models the 1% Indian TDS on sell-legs for accurate equity curves.
 - **F3 Basis Guard:** Rejects entries if Binance/CoinDCX prices diverge beyond threshold.
@@ -92,15 +159,20 @@ Antigravity is built for capital preservation through multiple layers of defense
 
 | Script | Purpose |
 |:--- | :--- |
-| `./bin/dev` | Launches the full backend stack (Infra + Consumer + API). |
+| `./bin/start` | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
+| `./bin/dev` | Launches the backend stack (Infra + Consumer + API). |
 | `./bin/bot` | Launches **only** the multi-symbol trading bot. |
 | `./bin/test_ui` | Fires a burst of tiny test signals to verify the UI/API pipeline. |
+| `./bin/clear_risk` | Clears the kill-switch and resets the consecutive-loss counter. |
 
 ### Sending Test Signals
+
 While `./bin/dev` and the UI are running, run this in a new terminal:
+
 ```bash
 python3 bin/test_ui
 ```
+
 This will open positions in your paper wallet and you will see them appear instantly on the dashboard.
 
 ---
@@ -122,6 +194,7 @@ This will open positions in your paper wallet and you will see them appear insta
 ## ⚠️ Disclaimer
 
 This software is for **educational and paper-trading purposes only**.
+
 - Cryptocurrency futures trading involves significant risk of loss.
 - High leverage is extremely aggressive.
 - Always test on testnet or in simulation before deploying real capital.
