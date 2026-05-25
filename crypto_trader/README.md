@@ -122,6 +122,129 @@ Every entry logs:
 - Spread at entry
 - Slippage %
 
+## Live Trading (CoinDCX) — Hybrid Execution & Hardening
+
+> **For the next agent:** this section documents how live trading actually works
+> and the five hardening features (F1–F5). Read it before touching the order path.
+
+### Topology: Binance = data, CoinDCX = execution
+
+Market data comes from **Binance** (REST + WebSocket); **all order placement
+happens on CoinDCX**. A `MarketDataRouter` uses Binance as primary and CoinDCX
+public data as fallback (15s staleness gate), so the signal loop survives a
+Binance geo-block (HTTP 451).
+
+The **single supported live entrypoint** is `engine_live.py`:
+
+```bash
+# Always start here for paper/testnet/live — it runs a startup self-test gate.
+python -m crypto_trader.engine_live                   # MODE from .env
+python -m crypto_trader.engine_live --self-test-only  # run the gate and exit
+```
+
+`MODE` selects the execution adapter: `paper` → `PaperExecutionEngine`,
+`testnet`/`live` → `CoinDCXExecutionEngine`. Live orders are gated three ways
+(`safe_mode`): `LIVE_TRADING_ENABLED=true` +
+`LIVE_TRADING_ACK="I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"` + no
+`~/.crypto_trader/HALT` file.
+
+### Critical fact: the wallet is the live order site
+
+Live orders do **not** go through `OrderManager` in the running loop. The wallet
+(`EnhancedFuturesWallet`) is the single submission site: `open_position` /
+`close_position` / `partial_close` call `_venue_fill()` (→
+`execution_engine.place_order(...)`) when `live_execution` is on. **Put any new
+venue order logic in the wallet position lifecycle**, mirroring `_venue_fill`.
+
+Position state is **reducer-authoritative**: positions are rebuilt from the event
+log on every `_emit_event`, so anything that must survive a restart has to flow
+through a reducer event (see F1's `PROTECTIVE_ORDERS_PLACED`).
+
+### The five hardening features
+
+| ID | Feature | Where | Default |
+|----|---------|-------|---------|
+| **F1** | Venue-resident protective stops | `wallet.py`, `reconciler.py`, `ws_client.py` | on (`COINDCX_VENUE_SL_ENABLED`) |
+| **F2** | TDS PnL accounting | `wallet.py`, `journal.py`, `events.py` | on for INR margin |
+| **F3** | Cross-venue basis guard | `engine_ws.py` | on (`BASIS_GUARD_ENABLED`) |
+| **F4** | Paper execution-degradation | `wallet.py` | on in paper mode |
+| **F5** | CoinDCX private/user stream | `exchanges/coindcx_user_stream.py`, `engine_live.py` | off |
+
+**F1 — Venue-resident protective stops.** After an entry fills live, the wallet
+rests a `STOP_MARKET` (and optional `TAKE_PROFIT`) on CoinDCX via
+`_place_protective_orders(pos)` — opposite side, full filled qty — so a crash
+can't leave a naked position. Order IDs live in
+`EnhancedPosition.protective_orders` (`{"sl": id, "tp": id}`) and are carried
+through the `PROTECTIVE_ORDERS_PLACED` reducer event. Stops are cancelled on close
+and cancelled+re-placed on partial close. The software SL monitor becomes a
+**backup**: `_software_sl_level(pos)` only fires `SOFTWARE_SL_BACKUP_BPS` beyond
+the real SL when a venue stop rests (prevents double-exit). The reconciler
+re-places a missing stop (`missing_protective_stop`, repaired, no kill switch) and
+cancels orphans (`orphan_order`). CoinDCX has no `reduce_only`/`client_order_id`;
+an opposite-side order nets the one-way position.
+
+**F2 — TDS accounting.** India's 1% TDS is charged on the **sell leg** only
+(LONG → at close, SHORT → at open) via `_calculate_tds(...)` and a dedicated
+`TDS_CHARGED` event (kept separate from fees for tax reporting). Net PnL =
+gross − fees − TDS. Surfaced as `tds_paid` on the position/journal and `tds` on
+`TradeClosedEvent`. Pure accounting — also runs in paper mode.
+
+**F3 — Cross-venue basis guard.** Signals fire on Binance price but fills happen
+on CoinDCX. `_basis_guard()` computes `(coindcx_mark − binance_mark)/binance_mark`,
+rejects the entry (publishing `SignalRejectedEvent`) when `|basis| >
+MAX_CROSS_VENUE_BASIS`, and nudges the entry trigger toward the fill venue by
+`ENTRY_BASIS_BUFFER`. If CoinDCX data is unavailable it **skips** the guard (never
+blocks on a missing fallback feed).
+
+**F4 — Paper execution-degradation.** In paper mode `_execution_price` uses a
+calibrated CoinDCX spread penalty (`PAPER_CDCX_SPREAD_COEFF`) instead of the tiny
+fixed bump, and `open_position` rejects fills deviating more than
+`PAPER_COLLAR_PCT` from the intended price (CoinDCX's 10% market-order collar) with
+an `ORDER_REJECTED` event. Combined with F2's TDS, paper equity curves stop being
+artificially profitable.
+
+**F5 — CoinDCX private/user stream (optional, default-off).** `CoinDCXUserStream`
+(socket.io, needs `python-socketio<5`) streams account events; on a fill that
+matches a resting protective order it books the exit instantly via
+`wallet.apply_external_fill(..., reduce_only=True)`. It **augments, never
+replaces** the REST `get_fills` + reconciler path: if the dependency is missing or
+the socket drops, the system runs REST-only. `close_position` is idempotent, so a
+later REST reconcile of the same exit is a no-op.
+
+### Configuration (all in `.env` / `config.TradingConfig`)
+
+| Env var | Default | Feature | Meaning |
+|---|---|---|---|
+| `COINDCX_VENUE_SL_ENABLED` | `true` | F1 | Rest a venue stop after entry |
+| `COINDCX_VENUE_TP_ENABLED` | `false` | F1 | Also rest a venue take-profit |
+| `COINDCX_REQUIRE_VENUE_SL` | `false` | F1 | Trip HALT if SL placement fails |
+| `SOFTWARE_SL_BACKUP_BPS` | `15` | F1 | Software SL backup buffer past the real SL |
+| `COINDCX_TDS_ENABLED` | INR→on | F2 | Deduct 1% TDS on sells |
+| `COINDCX_TDS_RATE` | `0.01` | F2 | TDS rate |
+| `BASIS_GUARD_ENABLED` | `true` | F3 | Enable the basis guard |
+| `MAX_CROSS_VENUE_BASIS` | `0.005` | F3 | Reject entry beyond this abs(basis) |
+| `ENTRY_BASIS_BUFFER` | `0.0005` | F3 | Trigger nudge toward the fill venue |
+| `PAPER_CDCX_SPREAD_COEFF` | `0.0015` | F4 | Paper per-side fill penalty |
+| `PAPER_COLLAR_PCT` | `0.10` | F4 | Paper market-order collar |
+| `COINDCX_USER_STREAM_ENABLED` | `false` | F5 | Enable the private socket.io stream |
+| `COINDCX_STREAM_URL` | `wss://stream.coindcx.com` | F5 | Stream endpoint |
+| `COINDCX_STREAM_CHANNEL` | `coindcx` | F5 | Join channel name |
+
+### Tests & verification
+
+```bash
+pytest                                            # full suite
+pytest tests/test_protective_stops.py             # F1
+pytest tests/test_tds_and_paper_degradation.py    # F2 + F4
+pytest tests/test_basis_guard.py                  # F3
+pytest tests/test_coindcx_user_stream.py          # F5
+python -m crypto_trader.engine_live --self-test-only   # E2E gate
+```
+
+`tests/test_coindcx_execution.py` has the reusable `_FakeClient` + `gate_open`
+fixtures; `tests/test_protective_stops.py` has a `FakeEngine` for the wallet's
+live order path.
+
 ## Network & LLM Logging
 
 To inspect exchange payloads and debug LLM prompts/responses in real-time, you can use the following switches:
