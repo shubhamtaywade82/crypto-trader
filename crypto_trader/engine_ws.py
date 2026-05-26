@@ -580,7 +580,7 @@ class WebSocketTradingEngine:
                 # could leave an unmanaged live position. Fail safe: HALT, trip
                 # the kill switch, and reconcile against the venue rather than
                 # letting the loop crash and abandon a naked position.
-                logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e)
+                logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e, exc_info=True)
                 self._halted = True
                 if getattr(self, "risk_manager", None) is not None:
                     self.risk_manager.trigger_kill_switch(f"entry failure: {e}")

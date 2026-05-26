@@ -35,8 +35,9 @@ AI Agents MUST respect these guards when modifying code:
 - `MODE=paper` is the default. **NEVER** set `MODE=live` in test environments.
 - Infrastructure ports: **Postgres: 5435**, **Redis: 6382**.
 - Unified Orchestration:
-    - `./bin/dev`: Starts backend (Infra, Consumer, API).
-    - `./bin/bot`: Starts only the Trading Engine.
+    - `./bin/dev`: Starts backend (Infra, Consumer, API). Pre-emptively cleans up orphaned processes.
+    - `./bin/bot`: Starts only the Trading Engine. Pre-emptively cleans up orphaned processes.
+    - `./bin/start`: Unified launcher for full stack (Infra, API, Bot). Pre-emptively cleans up orphaned processes.
     - `./bin/test_ui`: Simulates signal burst for UI validation.
 
 ## 📂 Key Files

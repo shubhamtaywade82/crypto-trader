@@ -107,6 +107,10 @@ class TelegramService:
                 logger.error(f"Failed to send Telegram message: {e}")
 
     def _format_event(self, event: Event) -> Optional[str]:
+        from typing import Any
+        def _esc(val: Any) -> str:
+            return str(val).replace("_", r"\_")
+
         if isinstance(event, TradeOpenedEvent):
             return (
                 f"🟢 *LONG OPENED* — {event.symbol}\n\n"
@@ -118,7 +122,7 @@ class TelegramService:
                 f"Leverage: {event.leverage}x\n"
                 f"Margin: ${event.margin:.2f}\n"
                 f"Notional: ${event.notional:.2f}\n\n"
-                f"Regime: {event.regime}\n"
+                f"Regime: {_esc(event.regime)}\n"
                 f"Tech Score: {event.tech_score:.2f}\n"
                 f"LLM: {event.llm_decision}\n\n"
                 f"Funding: {event.funding:+.4%}\n"
@@ -131,7 +135,7 @@ class TelegramService:
             return (
                 f"{emoji} *POSITION CLOSED* — {event.symbol}\n\n"
                 f"PnL: ${event.realized_pnl:+.2f} ({event.pnl_percent:+.2f}%)\n"
-                f"Reason: {event.reason}\n\n"
+                f"Reason: {_esc(event.reason)}\n\n"
                 f"Held: {event.duration_minutes:.1f}m\n"
                 f"MFE: {event.mfe:+.2%}\n"
                 f"MAE: {event.mae:+.2%}\n\n"
@@ -142,7 +146,7 @@ class TelegramService:
         if isinstance(event, RiskHaltEvent):
             return (
                 f"🛑 *TRADING HALTED*\n\n"
-                f"Reason: {event.reason}\n"
+                f"Reason: {_esc(event.reason)}\n"
                 f"Daily PnL: {event.daily_pnl:+.2f} USDT\n"
                 f"Trades today: {event.trades_today}\n\n"
                 f"Cooldown until next UTC session."
@@ -158,7 +162,7 @@ class TelegramService:
         if isinstance(event, SignalRejectedEvent):
             return (
                 f"⚠️ *SIGNAL REJECTED* — {event.symbol}\n\n"
-                f"Reason: {event.reason}\n"
+                f"Reason: {_esc(event.reason)}\n"
                 f"Tech Score: {event.tech_score:.2f}\n"
                 f"Final Score: {event.final_score:.2f}\n"
                 f"Threshold: {event.threshold:.2f}"
@@ -167,8 +171,8 @@ class TelegramService:
         if isinstance(event, RegimeChangeEvent):
             return (
                 f"📊 *REGIME CHANGE* — {event.symbol}\n\n"
-                f"Previous: {event.old_regime}\n"
-                f"Current: {event.new_regime}\n\n"
+                f"Previous: {_esc(event.old_regime)}\n"
+                f"Current: {_esc(event.new_regime)}\n\n"
                 f"ATR Expansion: {event.atr_expansion:+.1%}\n"
                 f"OI Spike: {event.oi_spike:+.1%}"
             )
