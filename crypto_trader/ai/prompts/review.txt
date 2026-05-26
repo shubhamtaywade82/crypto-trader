@@ -1,0 +1,12 @@
+POST-TRADE REVIEW MODE
+
+Analyze the completed trade and provide structured feedback.
+
+Evaluate:
+1. Entry quality vs setup criteria
+2. SL placement vs actual invalidation
+3. TP targets vs liquidity levels hit
+4. Timing relative to session and structure
+5. What to repeat vs avoid next time
+
+Output format must match the standard JSON schema with action = NO_TRADE and use warnings/reason_codes for feedback.

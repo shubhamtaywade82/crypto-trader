@@ -446,6 +446,96 @@ class LiveTradingSystem:
         )
 
 
+def run_venue_preflight(
+    symbols: List[str],
+    wallet,
+    execution_engine,
+    risk: "RiskManager",
+    bus: "EventBus",
+    cfg: "TradingConfig",
+) -> bool:
+    """Shared preflight gate used by both LiveTradingSystem and multi_engine.
+
+    Checks (in order):
+    1. Safe-mode gate (LIVE_TRADING_ENABLED + ACK + no HALT file)
+    2. CoinDCX auth + available margin balance
+    3. Per-symbol: venue leverage cap vs ``cfg.max_leverage``
+    4. Per-symbol: boot reconciliation
+    5. Kill-switch already latched
+
+    Returns ``True`` when all checks pass, ``False`` otherwise.
+    """
+    from . import safe_mode
+
+    logger.info("Running venue preflight checks for %d symbol(s): %s", len(symbols), ", ".join(symbols))
+
+    # 1. Safe-mode gate
+    if not safe_mode.is_live_enabled():
+        logger.critical(
+            "LIVE TRADING BLOCKED — Safe-mode gate is closed. "
+            "Ensure %s=true, %s='%s', and no active HALT file exists.",
+            safe_mode.LIVE_ENV_VAR, safe_mode.ACK_ENV_VAR, safe_mode.ACK_PHRASE,
+        )
+        return False
+
+    # 2. CoinDCX auth + balance
+    mc = cfg.coindcx_margin_currency
+    usdt_equiv = 0.0
+    try:
+        avail = float(execution_engine.sync_balance())
+        conv = float(execution_engine.get_usdt_conversion()) or 1.0
+        usdt_equiv = avail / conv if mc != "USDT" else avail
+        logger.info("[PREFLIGHT] coindcx_auth OK: avail %s %s (~%.2f USDT)", avail, mc, usdt_equiv)
+    except Exception as e:
+        logger.critical("[PREFLIGHT] CoinDCX authentication failed: %s", e)
+        return False
+
+    # 3 + 4. Per-symbol checks
+    for sym in symbols:
+        # Leverage cap
+        try:
+            spec = execution_engine.mapper.get_spec(sym)
+            lev_ok = cfg.max_leverage <= spec.max_leverage
+            if not lev_ok:
+                logger.critical(
+                    "[PREFLIGHT] %s leverage cap FAIL: configured %sx > venue max %sx",
+                    sym, cfg.max_leverage, spec.max_leverage,
+                )
+                return False
+            logger.info("[PREFLIGHT] %s leverage_cap OK: %sx <= %sx", sym, cfg.max_leverage, spec.max_leverage)
+        except Exception as e:
+            logger.critical("[PREFLIGHT] %s failed to fetch instrument spec: %s", sym, e)
+            return False
+
+        # Reconciliation
+        try:
+            from .execution.reconciler import Reconciler
+            reconciler = Reconciler(wallet, execution_engine, risk, bus=bus,
+                                    strict_cancel=getattr(cfg, "reconcile_strict_cancel", False))
+            mismatches = reconciler.reconcile(sym)
+            unresolved = [m for m in mismatches if not m.repaired]
+            if reconciler.snapshot_failed:
+                logger.critical("[PREFLIGHT] %s reconciliation FAIL: venue snapshot unavailable", sym)
+                return False
+            if unresolved:
+                logger.critical(
+                    "[PREFLIGHT] %s reconciliation FAIL: %d unresolved mismatch(es)", sym, len(unresolved)
+                )
+                return False
+            logger.info("[PREFLIGHT] %s reconciliation OK", sym)
+        except Exception as e:
+            logger.critical("[PREFLIGHT] %s reconciliation crashed: %s", sym, e)
+            return False
+
+    # 5. Kill switch
+    if risk.kill_switch:
+        logger.critical("[PREFLIGHT] Kill switch already active: %s", risk.kill_switch_reason)
+        return False
+
+    logger.info("All venue preflight checks passed.")
+    return True
+
+
 def main():
     import argparse
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

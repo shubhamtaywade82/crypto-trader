@@ -15,7 +15,6 @@ from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
 from crypto_trader.risk import RiskManager
-from crypto_trader.execution.reconciler import Reconciler
 from crypto_trader import safe_mode
 
 # Load environment variables for Telegram
@@ -102,62 +101,20 @@ def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
 
     return []
 
-def run_preflight_checks(symbols: List[str], wallet: EnhancedFuturesWallet, execution_engine: CoinDCXExecutionEngine, risk: RiskManager, bus) -> bool:
-    logger.info("Initializing pre-flight state reconciliation and gate checks...")
-    
-    # 1. Safe-mode gate check
-    if not safe_mode.is_live_enabled():
-        logger.critical(
-            f"LIVE TRADING BLOCKED — Safe-mode gate is closed. "
-            f"Ensure {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', and no active HALT file exists."
-        )
-        return False
-
-    # 2. Authentication and margin check
-    try:
-        margin_currency = os.getenv("COINDCX_MARGIN_CURRENCY", "USDT").upper()
-        avail = float(execution_engine.sync_balance())
-        conv = float(execution_engine.get_usdt_conversion()) or 1.0
-        usdt_equiv = avail / conv if margin_currency != "USDT" else avail
-        logger.info(f"[SELF-TEST] CoinDCX auth OK: available balance {avail} {margin_currency} (~{usdt_equiv:.2f} USDT)")
-    except Exception as e:
-        logger.critical(f"[SELF-TEST] CoinDCX authentication failed: {e}")
-        return False
-
-    # 3. Symbol specific checks (reconciliation & leverage caps)
-    for sym in symbols:
-        # Leverage limit check
-        try:
-            spec = execution_engine.mapper.get_spec(sym)
-            max_lev = int(os.getenv("MAX_LEVERAGE", "2"))
-            if max_lev > spec.max_leverage:
-                logger.critical(f"[SELF-TEST] {sym} leverage limit failed: configured {max_lev}x exceeds venue max {spec.max_leverage}x")
-                return False
-        except Exception as e:
-            logger.critical(f"[SELF-TEST] Failed to fetch instrument spec for {sym}: {e}")
-            return False
-
-        # State reconciliation
-        try:
-            reconciler = Reconciler(wallet, execution_engine, risk, bus=bus)
-            mismatches = reconciler.reconcile(sym)
-            unresolved = [m for m in mismatches if not m.repaired]
-            if reconciler.snapshot_failed:
-                logger.critical(f"[SELF-TEST] {sym} reconciliation failed: venue snapshot unavailable")
-                return False
-            if unresolved:
-                logger.critical(f"[SELF-TEST] {sym} has {len(unresolved)} unresolved reconciliation mismatch(es). Aborting startup.")
-                return False
-        except Exception as e:
-            logger.critical(f"[SELF-TEST] {sym} reconciliation crashed: {e}")
-            return False
-
-    if risk.kill_switch:
-        logger.critical(f"[SELF-TEST] Risk Manager kill switch is active: {risk.kill_switch_reason}. Aborting startup.")
-        return False
-
-    logger.info("All pre-flight checks and reconciliation passed. Ready for trading.")
-    return True
+def run_preflight_checks(
+    symbols: List[str],
+    wallet: EnhancedFuturesWallet,
+    execution_engine: CoinDCXExecutionEngine,
+    risk: RiskManager,
+    bus,
+    cfg=None,
+) -> bool:
+    """Delegate all preflight logic to the canonical ``run_venue_preflight`` in engine_live."""
+    from .engine_live import run_venue_preflight
+    if cfg is None:
+        from .config import load_config
+        cfg = load_config()
+    return run_venue_preflight(symbols, wallet, execution_engine, risk, bus, cfg)
 
 def run_engine(engine: WebSocketTradingEngine):
     try:
@@ -264,7 +221,7 @@ def main():
 
     # Run pre-flight checks and state reconciliation in live mode
     if live_enabled and execution_engine is not None:
-        if not run_preflight_checks(symbols, global_wallet, execution_engine, global_risk, bus):
+        if not run_preflight_checks(symbols, global_wallet, execution_engine, global_risk, bus, cfg):
             logger.critical("Multi-engine startup aborted due to pre-flight self-test or reconciliation failure.")
             sys.exit(1)
     

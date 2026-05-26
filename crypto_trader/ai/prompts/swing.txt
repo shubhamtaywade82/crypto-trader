@@ -1,0 +1,16 @@
+SWING MODE ACTIVE
+
+Focus: 1H-4H setups with 1-3 day holds.
+Minimum RR: 1:2.5
+Maximum hold time: 48-72 hours.
+
+Prefer:
+- Higher timeframe BOS/CHOCH confluence
+- Institutional order block retest entries
+- Funding rate alignment with trade direction
+- Open interest expansion confirming trend
+
+Avoid:
+- Counter-trend swing entries
+- Entries in high funding environments (>0.01%)
+- Entries near daily/weekly resistance without confluence
