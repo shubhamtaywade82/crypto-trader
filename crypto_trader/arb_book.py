@@ -87,13 +87,12 @@ class ArbBook:
 
     def __init__(self, namespace: str = "default", data_dir: Optional[Path] = None,
                  database_url: str = ""):
-        import os as _os
         self.namespace = namespace
         self.dir = data_dir or DATA_DIR
         self.dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.dir / f"arb_{namespace}.db"
         self.journal_path = self.dir / f"arb_events_{namespace}.jsonl"
-        self._database_url = database_url or _os.getenv("DATABASE_URL", "")
+        self._database_url = database_url  # never auto-read from env; callers pass it explicitly
         self._open: Dict[str, ArbPosition] = {}
         self._init_db()
         self._load_open()
