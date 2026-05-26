@@ -64,36 +64,14 @@ class OrderManager:
         expires_at: Optional[int] = None,
     ) -> Order:
         coid = make_client_order_id(symbol, intent, nonce=nonce)
-
-        existing = self.lifecycles.get(coid)
-        if existing and not existing.terminal:
-            raise DuplicateOrderError(f"order {coid} already in-flight ({existing.state.value})")
-
-        if not reduce_only and self._has_working_entry(symbol):
-            raise DuplicateOrderError(f"working entry already exists for {symbol}")
-
+        self._guard_duplicate_submission(coid, symbol, reduce_only)
         lifecycle = self.lifecycles.setdefault(coid, OrderLifecycle(coid))
 
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                lifecycle.transition(OrderState.SUBMITTED)
-                order = self.engine.place_order(
-                    symbol, side, quantity, order_type,
-                    trigger_price=trigger_price, limit_price=limit_price,
-                    reduce_only=reduce_only, expires_at=expires_at,
-                    client_order_id=coid,
-                )
-                self._on_submitted(order, coid, symbol, side, order_type, quantity, reduce_only)
-                self._publish_fill(order, coid, symbol, side)
-                return order
-            except Exception as e:  # transport/venue failure
-                last_exc = e
-                logger.warning("submit attempt %d failed for %s: %s", attempt + 1, coid, e)
-                if attempt < self.max_retries:
-                    time.sleep(self.backoff_base ** attempt)
-        lifecycle.transition(OrderState.FAILED)
-        raise last_exc if last_exc else RuntimeError("order submission failed")
+        return self._execute_with_retry(
+            lifecycle, coid, symbol, side, quantity, order_type,
+            trigger_price=trigger_price, limit_price=limit_price,
+            reduce_only=reduce_only, expires_at=expires_at,
+        )
 
     def cancel(self, exchange_order_id: str, client_order_id: Optional[str] = None) -> bool:
         ok = self.engine.cancel_order(exchange_order_id)
@@ -102,6 +80,52 @@ class OrderManager:
             if not lc.terminal:
                 lc.transition(OrderState.CANCELLED)
         return ok
+
+    # ── duplicate / pre-flight guards ────────────────────────────────────────
+    def _guard_duplicate_submission(self, coid: str, symbol: str, reduce_only: bool) -> None:
+        """Reject if the same client order ID is already in-flight or a working
+        entry already exists for the symbol."""
+        existing = self.lifecycles.get(coid)
+        if existing and not existing.terminal:
+            raise DuplicateOrderError(f"order {coid} already in-flight ({existing.state.value})")
+        if not reduce_only and self._has_working_entry(symbol):
+            raise DuplicateOrderError(f"working entry already exists for {symbol}")
+
+    # ── retry orchestration ──────────────────────────────────────────────────
+    def _execute_with_retry(
+        self, lifecycle, coid, symbol, side, quantity, order_type, **kwargs
+    ) -> Order:
+        """Attempt placement up to max_retries+1 times with exponential backoff."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._place_single_attempt(
+                    lifecycle, coid, symbol, side, quantity, order_type, **kwargs,
+                )
+            except Exception as e:  # transport/venue failure
+                last_exc = e
+                logger.warning("submit attempt %d failed for %s: %s", attempt + 1, coid, e)
+                if attempt < self.max_retries:
+                    self._sleep_backoff(attempt)
+        lifecycle.transition(OrderState.FAILED)
+        raise last_exc if last_exc else RuntimeError("order submission failed")
+
+    def _place_single_attempt(
+        self, lifecycle, coid, symbol, side, quantity, order_type, **kwargs
+    ) -> Order:
+        """Execute one placement attempt: submit → update lifecycle → publish."""
+        lifecycle.transition(OrderState.SUBMITTED)
+        order = self.engine.place_order(
+            symbol, side, quantity, order_type,
+            client_order_id=coid, **kwargs,
+        )
+        self._update_lifecycle_from_venue(order, coid, symbol, side, order_type, quantity,
+                                          reduce_only=kwargs.get("reduce_only", False))
+        self._publish_fill(order, coid, symbol, side)
+        return order
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        time.sleep(self.backoff_base ** attempt)
 
     # ── internals ────────────────────────────────────────────────────────────
     def _has_working_entry(self, symbol: str) -> bool:
@@ -112,22 +136,29 @@ class OrderManager:
                 return True
         return False
 
-    def _on_submitted(self, order, coid, symbol, side, order_type, quantity, reduce_only):
+    def _update_lifecycle_from_venue(self, order, coid, symbol, side, order_type, quantity, reduce_only):
+        """Map the venue's order status to the local lifecycle state and publish."""
         lc = self.lifecycles[coid]
-        if order.status.value == "FILLED":
-            lc.transition(OrderState.FILLED)
-        elif order.status.value == "PARTIALLY_FILLED":
-            lc.transition(OrderState.PARTIAL)
-        elif order.status.value in ("REJECTED", "EXPIRED", "CANCELLED"):
-            lc.transition(OrderState(order.status.value))
-        else:
-            lc.transition(OrderState.ACKED)
+        target_state = self._resolve_venue_state(order)
+        lc.transition(target_state)
         if self.bus:
             self.bus.publish(OrderSubmittedEvent(
                 symbol=symbol, side=side.value, client_order_id=coid,
                 exchange_order_id=order.id, order_type=order_type.value,
                 quantity=float(quantity), reduce_only=reduce_only,
             ))
+
+    @staticmethod
+    def _resolve_venue_state(order) -> OrderState:
+        """Translate the venue's order status string to a local OrderState."""
+        status = order.status.value
+        if status == "FILLED":
+            return OrderState.FILLED
+        if status == "PARTIALLY_FILLED":
+            return OrderState.PARTIAL
+        if status in ("REJECTED", "EXPIRED", "CANCELLED"):
+            return OrderState(status)
+        return OrderState.ACKED
 
     def _publish_fill(self, order: Order, coid: str, symbol: str, side: PositionSide):
         """Announce a venue fill. Booking into the wallet's event log is the

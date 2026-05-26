@@ -128,46 +128,78 @@ class SignalConsumer:
 
     # ── per-message handling ──────────────────────────────────────────────────
     def _handle(self, msg_id: str, data: dict) -> None:
-        # Poison-pill guard: stop re-delivering a message that keeps failing.
+        if self._route_poison_pill(msg_id, data):
+            return
+
+        signal = self._parse_signal(msg_id, data)
+        if signal is None:
+            return
+
+        if self._is_duplicate(signal, msg_id):
+            return
+
+        if self._is_blocked_by_risk_gate(signal, msg_id):
+            return
+
+        adapter = self._resolve_adapter(signal, msg_id, data)
+        if adapter is None:
+            return
+
+        self._execute_and_ack(adapter, signal, msg_id)
+
+    def _route_poison_pill(self, msg_id: str, data: dict) -> bool:
+        """Poison-pill guard: stop re-delivering a message that keeps failing."""
         if self.bus.delivery_count(self.stream, self.group, msg_id) > self.max_deliveries:
             self.bus.to_dlq(self.dlq_stream, data, reason=f"max_deliveries>{self.max_deliveries}")
             self.bus.ack(self.stream, self.group, msg_id)
             logger.error("signal %s exceeded delivery limit -> DLQ", msg_id)
-            return
+            return True
+        return False
+
+    def _parse_signal(self, msg_id: str, data: dict) -> Optional[Signal]:
+        """Safely deserialize the stream payload into a Signal."""
         try:
-            signal = Signal.from_payload(data)
+            return Signal.from_payload(data)
         except Exception as e:  # malformed payload is a poison pill
             self.bus.to_dlq(self.dlq_stream, data, reason=f"malformed: {e}")
             self.bus.ack(self.stream, self.group, msg_id)
-            return
+            return None
 
-        # Idempotency: skip a signal that already COMPLETED (marker set on success).
-        # The marker is intentionally not a pre-claim, so a failed attempt retries.
+    def _is_duplicate(self, signal: Signal, msg_id: str) -> bool:
+        """Idempotency: skip a signal that already COMPLETED (marker set on success).
+        The marker is intentionally not a pre-claim, so a failed attempt retries."""
         idem_key = f"idem:{signal.strategy_id}:{signal.timestamp}"
         if self.bus.is_processed(idem_key):
             logger.info("duplicate signal %s suppressed (already executed)", signal.signal_id)
             self.bus.ack(self.stream, self.group, msg_id)
-            return
+            return True
+        return False
 
-        # Risk gate runs BEFORE the adapter; a veto is terminal (acked, not retried).
+    def _is_blocked_by_risk_gate(self, signal: Signal, msg_id: str) -> bool:
+        """Risk gate runs BEFORE the adapter; a veto is terminal (acked, not retried)."""
         if self.risk_gate is not None and not self.risk_gate(signal):
             logger.warning("risk gate vetoed signal %s (%s %s)", signal.signal_id, signal.side, signal.symbol)
             self.bus.ack(self.stream, self.group, msg_id)
-            return
+            return True
+        return False
 
+    def _resolve_adapter(self, signal: Signal, msg_id: str, data: dict) -> Optional[SignalAdapter]:
+        """Look up the mode-specific adapter; route to DLQ if unknown."""
         adapter = self.adapters.get(signal.mode)
         if adapter is None:
             self.bus.to_dlq(self.dlq_stream, data, reason=f"unknown mode '{signal.mode}'")
             self.bus.ack(self.stream, self.group, msg_id)
-            return
+        return adapter
 
-        # Execute. On failure we DO NOT ack -> message stays in the PEL and is
-        # retried on the next pass, eventually DLQ'd by the poison-pill guard.
+    def _execute_and_ack(self, adapter: SignalAdapter, signal: Signal, msg_id: str) -> None:
+        """Execute. On failure we DO NOT ack -> message stays in the PEL and is
+        retried on the next pass, eventually DLQ'd by the poison-pill guard."""
         try:
             adapter.execute(signal)
         except Exception as e:
             logger.error("adapter failed for signal %s (will retry): %s", signal.signal_id, e)
             return
+        idem_key = f"idem:{signal.strategy_id}:{signal.timestamp}"
         self.bus.mark_processed(idem_key, self.idempotency_ttl)
         self.bus.ack(self.stream, self.group, msg_id)
         logger.debug("signal %s executed and acked", signal.signal_id)
