@@ -1,0 +1,16 @@
+INTRADAY MODE ACTIVE
+
+Focus: 15m-1H setups only.
+Frequency: Every 15m candle close or BOS/CHOCH event.
+Minimum RR: 1:2
+Maximum hold time: 6-16 hours.
+
+Prefer:
+- Pullback entries to EMA21 within 4H trend
+- Liquidity sweeps with structure confirmation
+- Volume-confirmed breakouts with immediate follow-through
+
+Avoid:
+- Entries during Asian session dead zones
+- Extended price from VWAP > 1.5%
+- Chop or low-volume environments

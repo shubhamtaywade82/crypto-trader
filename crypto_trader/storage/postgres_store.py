@@ -65,11 +65,14 @@ class PostgresEventStore:
             )
 
     def load_events(self, limit: Optional[int] = None) -> List[dict]:
-        q = "SELECT ts, type, payload FROM events ORDER BY id ASC"
-        if limit:
-            q += f" LIMIT {int(limit)}"
         with self.conn.cursor() as cur:
-            cur.execute(q)
+            if limit:
+                cur.execute(
+                    "SELECT ts, type, payload FROM events ORDER BY id ASC LIMIT %s",
+                    (int(limit),),
+                )
+            else:
+                cur.execute("SELECT ts, type, payload FROM events ORDER BY id ASC")
             rows = cur.fetchall()
         return [{"ts": r[0], "event_type": r[1], "payload": r[2]} for r in rows]
 

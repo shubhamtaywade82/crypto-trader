@@ -17,6 +17,7 @@ import time
 import uuid
 import logging
 import argparse
+from dataclasses import dataclass, field as dc_field
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,7 +35,7 @@ from .regime import (
     RegimeClassifier, RegimeContext, calculate_rvol, compute_ema,
 )
 from .session import get_session_context, TradingSession
-from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD
+from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD, build_advisor
 from .journal import TradeJournal
 from .structure import MarketStructureAnalyzer
 
@@ -43,6 +44,28 @@ logger = logging.getLogger("crypto_trader.engine_ws")
 DEFAULT_SYMBOL = "SOLUSDT"
 LEVERAGE = 5
 FUNDING_EXTREME = 0.0005
+DEFAULT_SL_PCT = 0.007
+DEFAULT_TP1_PCT = 0.010
+DEFAULT_TP2_PCT = 0.020
+
+
+@dataclass
+class EntryContext:
+    """Bundles all inputs for entry evaluation/execution — replaces 11-13 positional args."""
+    setup: dict
+    final_score: float
+    llm_weight: float
+    explanation: str
+    mark_price: float
+    funding_rate: float
+    oi_delta: float
+    taker_ratio: float
+    tech_score: float
+    regime: object          # MarketRegime
+    regime_score: float
+    advice: object          # Optional[LLMAdvice]
+    dynamic_threshold: float
+    regime_ctx: object = None   # Optional[RegimeContext]
 
 
 class WebSocketTradingEngine:
@@ -141,6 +164,12 @@ class WebSocketTradingEngine:
         self.playbook_ares = PlaybookAres()
         self.playbook_volx = PlaybookVolExhaust()
         self.playbook_sweep = PlaybookSweepMSS()
+        self._playbook_registry: dict = {
+            pb.name: pb for pb in [
+                self.playbook_a, self.playbook_b, self.playbook_ares,
+                self.playbook_volx, self.playbook_sweep,
+            ]
+        }
 
         # Regime / Session engine
         _rc_kwargs = {}
@@ -160,33 +189,7 @@ class WebSocketTradingEngine:
         # LLM
         self.advisor = None
         self._llm_thread = None
-        if use_llm:
-            use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
-
-            if use_cloud:
-                resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
-                resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
-                resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
-                logger.info(f"[LLM] Mode: CLOUD (Target: {resolved_host})")
-            else:
-                resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-                resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
-                resolved_key = os.getenv("OLLAMA_API_KEY", "")
-                logger.info("[LLM] Mode: LOCAL")
-
-            use_openai = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
-
-            self.advisor = OllamaAdvisor(
-                host=resolved_host,
-                model=resolved_model,
-                api_key=resolved_key,
-                use_openai=use_openai,
-                log_llm=llm_logged
-            )
-            if self.advisor.is_ready():
-                logger.info(f"[LLM] Connected to {resolved_model}")
-            else:
-                logger.warning("[LLM] Ollama unavailable. Technical-only mode.")
+        self.advisor = build_advisor(use_llm, llm_host=llm_host, llm_model=llm_model, llm_logged=llm_logged)
 
         # WebSocket position manager (high-frequency exits)
         self.ws_pm = WebSocketPositionManager(
@@ -221,7 +224,7 @@ class WebSocketTradingEngine:
         """Handle incoming commands from EventBus (e.g., Telegram)."""
         if event.command == "KILL_ALL" or (event.command == "KILL" and event.params.get("symbol") == self.symbol):
             self._halted = True
-            logger.warning(f"🛑 [HALTED] {self.symbol} received KILL command.")
+            logger.warning("[KILL] [HALTED] %s received KILL command.", self.symbol)
             # A remote KILL must flatten the live position, not just block new
             # entries — otherwise an open position rides on unattended.
             try:
@@ -231,17 +234,17 @@ class WebSocketTradingEngine:
                     if not mark or mark <= 0:
                         mark = float(pos.entry_price)
                     self.wallet.close_position(self.symbol, float(mark), reason="REMOTE_KILL")
-                    logger.warning(f"🛑 [KILL] flattened {self.symbol} on remote command")
+                    logger.warning("[KILL] flattened %s on remote command", self.symbol)
             except Exception as e:
                 logger.error("remote KILL flatten failed for %s: %s", self.symbol, e)
         
         elif event.command == "RESUME_ALL" or (event.command == "RESUME" and event.params.get("symbol") == self.symbol):
             self._halted = False
-            logger.info(f"✅ [RESUMED] {self.symbol} received RESUME command.")
+            logger.info("[RESUMED] %s received RESUME command.", self.symbol)
 
         elif event.command == "STATUS":
             # Engine will respond via logs or potentially publish a StatusEvent
-            logger.info(f"📊 [STATUS] {self.symbol} | Halted: {self._halted} | Pos: {self.wallet.get_open_position(self.symbol) is not None}")
+            logger.info("[STATUS] %s | Halted: %s | Pos: %s", self.symbol, self._halted, self.wallet.get_open_position(self.symbol) is not None)
 
     # ── Lifecycle ──
 
@@ -376,8 +379,8 @@ class WebSocketTradingEngine:
         try:
             from . import safe_mode
             safe_mode.trip_halt(reason)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.critical("[SUPERVISOR] Failed to trip HALT file: %s", e)
         if getattr(self, "risk_manager", None) is not None:
             self.risk_manager.trigger_kill_switch(reason)
         if self.event_bus:
@@ -389,11 +392,27 @@ class WebSocketTradingEngine:
     def _signal_tick(self):
         """Generate signals using REST data (runs every 5 min)."""
         if self._halted:
-            logger.debug(f"[SIGNAL-TICK] {self.symbol} is halted. Skipping.")
+            logger.debug("[SIGNAL-TICK] %s is halted. Skipping.", self.symbol)
             return
 
-        logger.info(f"--- Signal Tick: {self.symbol} ---")
+        logger.info("--- Signal Tick: %s ---", self.symbol)
 
+        data = self._fetch_market_data()
+        if data is None:
+            return
+
+        result = self._compute_regime_context(data)
+        if result is None:
+            return
+        regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx = result
+
+        structure, structure_ltf = self._compute_market_structure(data)
+        self._start_llm_async(data, regime, regime_score, regime_ctx, session_ctx, rvol)
+        self._evaluate_and_enter(data, regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx, structure, structure_ltf)
+        self.wallet.print_summary()
+
+    def _fetch_market_data(self):
+        """Fetch all REST and WebSocket market data. Returns dict or None to skip tick."""
         try:
             # Fetch historical data via REST
             df_4h = self.data_feed.get_klines(self.symbol, "4h", limit=200)
@@ -411,17 +430,32 @@ class WebSocketTradingEngine:
 
             if mark_price <= 0:
                 logger.warning(f"[WS-ENGINE] Invalid mark price {mark_price}. Skipping signal tick.")
-                return
+                return None
 
         except StaleCandlesError as e:
             # A3: fallback klines too old — never generate a signal from stale
             # technicals. Skip the whole tick (already the behaviour; explicit
             # for clarity/observability).
             logger.warning(f"[WS-ENGINE] Stale klines — skipping signal tick: {e}")
-            return
+            return None
         except Exception as e:
             logger.error(f"Data fetch failed — skipping signal tick: {e}")
-            return
+            return None
+
+        return {
+            "df_4h": df_4h, "df_1h": df_1h, "df_15m": df_15m, "df_5m": df_5m,
+            "mark_price": mark_price, "funding_rate": funding_rate,
+            "oi_data": oi_data, "taker_ratio": taker_ratio,
+        }
+
+    def _compute_regime_context(self, data: dict):
+        """Build session context, check kill zone gate, and compute extended regime.
+
+        Returns (regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx)
+        or None if the tick should be skipped (kill zone gate).
+        """
+        df_4h = data["df_4h"]
+        df_1h = data["df_1h"]
 
         # 1. Session context
         session_ctx = get_session_context()
@@ -435,7 +469,7 @@ class WebSocketTradingEngine:
         require_kz = getattr(self.cfg, "require_kill_zone", False) if self.cfg else False
         if require_kz and not session_ctx.is_kill_zone:
             logger.info("[SIGNAL-TICK] Outside kill zone — skipping (REQUIRE_KILL_ZONE=True)")
-            return
+            return None
 
         # 2. Regime analysis
         regime, regime_score, df_4h = self.regime_analyzer.analyze(df_4h)
@@ -455,8 +489,8 @@ class WebSocketTradingEngine:
                 liq_vol = float(liq_df["quoteQty"].sum())
                 # Normalise against a rough baseline of 1M USDT liquidations
                 liquidation_intensity = min(liq_vol / 1_000_000, 1.0)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[SIGNAL-TICK] liquidation fetch skipped: %s", e)
 
         # Spread estimate for chaos detection (use WS spread if available)
         ws_spread_pct = 0.0
@@ -465,8 +499,8 @@ class WebSocketTradingEngine:
             _mid = self.ws_feed.get_mid_price()
             if _mid > 0:
                 ws_spread_pct = (_spread / _mid) * 100
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[SIGNAL-TICK] spread fetch skipped: %s", e)
 
         # Extended regime classification
         adx_val = float(df_4h["adx"].iloc[-1]) if "adx" in df_4h.columns else 0.0
@@ -485,6 +519,16 @@ class WebSocketTradingEngine:
             f"extended={regime_ctx.extended.value} | "
             f"rvol={rvol:.2f} | adx={adx_val:.1f} | size_x={regime_ctx.size_multiplier:.2f}"
         )
+
+        return regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx
+
+    def _compute_market_structure(self, data: dict):
+        """Run SMC market structure analysis on 1H and 15M frames.
+
+        Returns (structure, structure_ltf). Returns (None, None) on exception.
+        """
+        df_1h = data["df_1h"]
+        df_15m = data["df_15m"]
 
         # 3. Market structure analysis (SMC signals for playbook gating)
         structure = None
@@ -506,29 +550,64 @@ class WebSocketTradingEngine:
             structure = None
             structure_ltf = None
 
-        # 4. Start LLM async (pass extended regime for richer context)
+        return structure, structure_ltf
+
+    def _start_llm_async(self, data: dict, regime, regime_score, regime_ctx, session_ctx, rvol):
+        """Start the LLM advice thread asynchronously (step 4)."""
         if self.use_llm and self.advisor:
             pos = self.wallet.get_open_position(self.symbol)
             open_positions = [pos.to_dict()] if pos else []
             if self._llm_thread is None or not self._llm_thread.is_alive():
                 self._llm_thread = self.advisor.get_advice_async(
                     symbol=self.symbol,
-                    df_5m=df_5m,
-                    df_15m=df_15m,
-                    df_1h=df_1h,
-                    df_4h=df_4h,
+                    df_5m=data["df_5m"],
+                    df_15m=data["df_15m"],
+                    df_1h=data["df_1h"],
+                    df_4h=data["df_4h"],
                     regime=regime.value,
                     regime_score=regime_score,
-                    mark_price=mark_price,
-                    funding_rate=funding_rate,
-                    oi_delta=oi_delta,
-                    taker_ratio=taker_ratio,
+                    mark_price=data["mark_price"],
+                    funding_rate=data["funding_rate"],
+                    oi_delta=0.0,
+                    taker_ratio=data["taker_ratio"],
                     open_positions=open_positions,
                     market_regime=regime_ctx.extended.value,
                     session=session_ctx.session.value,
                     is_kill_zone=session_ctx.is_kill_zone,
                     rvol=rvol,
                 )
+
+    def _update_open_position(self, data: dict, regime, session_ctx):
+        """Update an open position if one exists (step 5.5 — AI/regime reversal exits)."""
+        pos = self.wallet.get_open_position(self.symbol)
+        if pos:
+            df_1h = data["df_1h"]
+            mark_price = data["mark_price"]
+            df_1h["ema9"] = compute_ema(df_1h["close"], 9)
+            ema9_val = df_1h["ema9"].iloc[-1]
+            ema9_1h = float(ema9_val) if pd.notna(ema9_val) else None
+            candle_close_time = int(df_1h["close_time"].iloc[-1].timestamp() * 1000)
+
+            advice = self.advisor.get_last_advice() if (self.use_llm and self.advisor) else None
+            current_llm_advice = advice.to_dict() if advice else None
+
+            self.wallet.update_positions(
+                self.symbol,
+                mark_price,
+                candle_close_time,
+                ema9_1h,
+                current_llm_advice=current_llm_advice,
+                current_regime=regime.value if regime else None,
+            )
+
+    def _evaluate_and_enter(self, data: dict, regime, regime_score, df_4h, rvol, adx_val,
+                            regime_ctx, session_ctx, structure, structure_ltf):
+        """Perform risk check, update open position, then evaluate entry if no position open."""
+        mark_price = data["mark_price"]
+        funding_rate = data["funding_rate"]
+        taker_ratio = data["taker_ratio"]
+        df_1h = data["df_1h"]
+        df_15m = data["df_15m"]
 
         # 5. Risk check
         self.risk_manager.update_peak_balance(self.wallet.margin_balance)
@@ -553,24 +632,7 @@ class WebSocketTradingEngine:
         self._halt_published = False
 
         # 5.5 Update position if open (to check AI and regime reversal exits)
-        pos = self.wallet.get_open_position(self.symbol)
-        if pos:
-            df_1h["ema9"] = compute_ema(df_1h["close"], 9)
-            ema9_val = df_1h["ema9"].iloc[-1]
-            ema9_1h = float(ema9_val) if pd.notna(ema9_val) else None
-            candle_close_time = int(df_1h["close_time"].iloc[-1].timestamp() * 1000)
-
-            advice = self.advisor.get_last_advice() if (self.use_llm and self.advisor) else None
-            current_llm_advice = advice.to_dict() if advice else None
-
-            self.wallet.update_positions(
-                self.symbol,
-                mark_price,
-                candle_close_time,
-                ema9_1h,
-                current_llm_advice=current_llm_advice,
-                current_regime=regime.value if regime else None,
-            )
+        self._update_open_position(data, regime, session_ctx)
 
         # 6. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:
@@ -585,7 +647,7 @@ class WebSocketTradingEngine:
             latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
             try:
                 self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                                    funding_rate, oi_delta, taker_ratio, structure=structure,
+                                    funding_rate, 0.0, taker_ratio, structure=structure,
                                     adx_1h=latest_adx, regime_ctx=regime_ctx,
                                     session_ctx=session_ctx, structure_ltf=structure_ltf)
             except Exception as e:
@@ -606,9 +668,6 @@ class WebSocketTradingEngine:
                 if self.event_bus:
                     from .events import SystemFailureEvent
                     self.event_bus.publish(SystemFailureEvent(component="entry", error=str(e)))
-
-        # 6. Print summary
-        self.wallet.print_summary()
 
     # Regime → allowed strategy order. Empty list means no entries.
     _REGIME_STRATEGY_MAP: dict = {
@@ -749,10 +808,22 @@ class WebSocketTradingEngine:
             return
 
         # Execute entry using WebSocket LTP for precise price
-        self._execute_entry(setup, final_score, llm_weight, explanation,
-                           mark_price, funding_rate, oi_delta, taker_ratio,
-                           setup["score"], regime, regime_score, advice, dynamic_threshold,
-                           regime_ctx=regime_ctx)
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=final_score,
+            llm_weight=llm_weight,
+            explanation=explanation,
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=oi_delta,
+            taker_ratio=taker_ratio,
+            tech_score=tech_score,
+            regime=regime,
+            regime_score=regime_score,
+            advice=advice,
+            dynamic_threshold=dynamic_threshold,
+            regime_ctx=regime_ctx,
+        ))
 
     def _coindcx_market_data(self):
         if self._coindcx_md is None:
@@ -793,11 +864,51 @@ class WebSocketTradingEngine:
             return False, basis
         return True, basis
 
-    def _execute_entry(self, setup, final_score, llm_weight, explanation,
-                      mark_price, funding_rate, oi_delta, taker_ratio,
-                      tech_score, regime, regime_score, advice, dynamic_threshold,
-                      regime_ctx: Optional[RegimeContext] = None):
-        """Execute entry using real-time WebSocket prices."""
+    def _execute_entry(self, ctx_or_setup, final_score=None, llm_weight=None,
+                      explanation=None, mark_price=None, funding_rate=None,
+                      oi_delta=None, taker_ratio=None, tech_score=None,
+                      regime=None, regime_score=None, advice=None,
+                      dynamic_threshold=None, regime_ctx=None):
+        """Execute entry using real-time WebSocket prices.
+
+        Accepts either an EntryContext as the sole positional argument (new API)
+        or the legacy keyword-argument form (kept for backwards compatibility).
+        """
+        if isinstance(ctx_or_setup, EntryContext):
+            ctx = ctx_or_setup
+        else:
+            ctx = EntryContext(
+                setup=ctx_or_setup,
+                final_score=final_score,
+                llm_weight=llm_weight if llm_weight is not None else 0.0,
+                explanation=explanation if explanation is not None else "",
+                mark_price=mark_price if mark_price is not None else 0.0,
+                funding_rate=funding_rate if funding_rate is not None else 0.0,
+                oi_delta=oi_delta if oi_delta is not None else 0.0,
+                taker_ratio=taker_ratio if taker_ratio is not None else 1.0,
+                tech_score=tech_score if tech_score is not None else 0.0,
+                regime=regime,
+                regime_score=regime_score if regime_score is not None else 0.0,
+                advice=advice,
+                dynamic_threshold=dynamic_threshold if dynamic_threshold is not None else 0.75,
+                regime_ctx=regime_ctx,
+            )
+
+        setup = ctx.setup
+        final_score = ctx.final_score
+        llm_weight = ctx.llm_weight
+        explanation = ctx.explanation
+        mark_price = ctx.mark_price
+        funding_rate = ctx.funding_rate
+        oi_delta = ctx.oi_delta
+        taker_ratio = ctx.taker_ratio
+        tech_score = ctx.tech_score
+        regime = ctx.regime
+        regime_score = ctx.regime_score
+        advice = ctx.advice
+        dynamic_threshold = ctx.dynamic_threshold
+        regime_ctx = ctx.regime_ctx
+
         # A1: never enter on stale data. If the WS feed has no fresh price within
         # the staleness budget, veto the entry rather than fall back to a possibly
         # seconds-old price. (Exits are separately gated in ws_pm.)
@@ -840,7 +951,7 @@ class WebSocketTradingEngine:
         # proportional stop distance rather than discarding it for a flat default.
         is_long = setup["side"] == PositionSide.LONG
         pb_entry = float(setup.get("entry_price") or 0)
-        default_sl_pct, default_tp_pct = 0.007, 0.010
+        default_sl_pct, default_tp_pct = DEFAULT_SL_PCT, DEFAULT_TP1_PCT
 
         def _reanchor(level_price, fallback_pct, is_stop):
             """Map a playbook level to the actual entry, keeping its ratio."""

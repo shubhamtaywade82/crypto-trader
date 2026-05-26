@@ -85,18 +85,28 @@ class ArbPosition:
 class ArbBook:
     """Event-sourced store for funding-arb positions (own SQLite DB + JSONL)."""
 
-    def __init__(self, namespace: str = "default", data_dir: Optional[Path] = None):
+    def __init__(self, namespace: str = "default", data_dir: Optional[Path] = None,
+                 database_url: str = ""):
         self.namespace = namespace
         self.dir = data_dir or DATA_DIR
         self.dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.dir / f"arb_{namespace}.db"
         self.journal_path = self.dir / f"arb_events_{namespace}.jsonl"
+        self._database_url = database_url  # never auto-read from env; callers pass it explicitly
         self._open: Dict[str, ArbPosition] = {}
         self._init_db()
         self._load_open()
 
     # ── persistence ──
+    def _pg_conn(self):
+        import psycopg2
+        return psycopg2.connect(self._database_url)
+
     def _init_db(self):
+        if self._database_url:
+            # Tables are created by WalletStore.init_schema() when database_url is set.
+            # Nothing to do here; arb_events and arb_positions already exist.
+            return
         con = sqlite3.connect(self.db_path)
         try:
             con.execute("PRAGMA journal_mode=WAL")
@@ -116,15 +126,27 @@ class ArbBook:
     def _emit(self, event_type: str, arb_id: str, payload: dict):
         ts = int(time.time() * 1000)
         rec = {"ts": ts, "arb_id": arb_id, "event_type": event_type, "payload": payload}
-        con = sqlite3.connect(self.db_path)
-        try:
-            con.execute(
-                "INSERT INTO arb_events (ts, arb_id, event_type, payload) VALUES (?,?,?,?)",
-                (ts, arb_id, event_type, json.dumps(payload, default=str)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        if self._database_url:
+            conn = self._pg_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO arb_events (ts, arb_id, event_type, payload) VALUES (%s,%s,%s,%s)",
+                    (ts, arb_id, event_type, json.dumps(payload, default=str)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            con = sqlite3.connect(self.db_path)
+            try:
+                con.execute(
+                    "INSERT INTO arb_events (ts, arb_id, event_type, payload) VALUES (?,?,?,?)",
+                    (ts, arb_id, event_type, json.dumps(payload, default=str)),
+                )
+                con.commit()
+            finally:
+                con.close()
         try:
             with self.journal_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
@@ -132,26 +154,53 @@ class ArbBook:
             logger.warning("arb journal append failed: %s", e)
 
     def _snapshot(self, arb: ArbPosition):
-        con = sqlite3.connect(self.db_path)
-        try:
-            con.execute(
-                "INSERT INTO arb_positions (arb_id, symbol, state, snapshot, updated_ts) "
-                "VALUES (?,?,?,?,?) ON CONFLICT(arb_id) DO UPDATE SET "
-                "state=excluded.state, snapshot=excluded.snapshot, updated_ts=excluded.updated_ts",
-                (arb.arb_id, arb.symbol, arb.state, json.dumps(arb.to_dict()), int(time.time() * 1000)),
-            )
-            con.commit()
-        finally:
-            con.close()
+        if self._database_url:
+            conn = self._pg_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO arb_positions (arb_id, symbol, state, snapshot, updated_ts) "
+                    "VALUES (%s,%s,%s,%s,%s) ON CONFLICT(arb_id) DO UPDATE SET "
+                    "state=EXCLUDED.state, snapshot=EXCLUDED.snapshot, updated_ts=EXCLUDED.updated_ts",
+                    (arb.arb_id, arb.symbol, arb.state, json.dumps(arb.to_dict()),
+                     int(time.time() * 1000)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            con = sqlite3.connect(self.db_path)
+            try:
+                con.execute(
+                    "INSERT INTO arb_positions (arb_id, symbol, state, snapshot, updated_ts) "
+                    "VALUES (?,?,?,?,?) ON CONFLICT(arb_id) DO UPDATE SET "
+                    "state=excluded.state, snapshot=excluded.snapshot, updated_ts=excluded.updated_ts",
+                    (arb.arb_id, arb.symbol, arb.state, json.dumps(arb.to_dict()),
+                     int(time.time() * 1000)),
+                )
+                con.commit()
+            finally:
+                con.close()
 
     def _load_open(self):
-        con = sqlite3.connect(self.db_path)
-        try:
-            rows = con.execute(
-                "SELECT snapshot FROM arb_positions WHERE state != ?", (ST_CLOSED,)
-            ).fetchall()
-        finally:
-            con.close()
+        if self._database_url:
+            conn = self._pg_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT snapshot FROM arb_positions WHERE state != %s", (ST_CLOSED,)
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        else:
+            con = sqlite3.connect(self.db_path)
+            try:
+                rows = con.execute(
+                    "SELECT snapshot FROM arb_positions WHERE state != ?", (ST_CLOSED,)
+                ).fetchall()
+            finally:
+                con.close()
         for (snap,) in rows:
             try:
                 arb = ArbPosition.from_dict(json.loads(snap))

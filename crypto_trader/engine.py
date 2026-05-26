@@ -21,7 +21,7 @@ from .risk import RiskManager, LLMCircuitBreaker, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB
 from .regime import MarketRegimeAnalyzer, compute_ema
 from .structure import MarketStructureAnalyzer
-from .llm_advisor import OllamaAdvisor
+from .llm_advisor import OllamaAdvisor, build_advisor
 from .journal import TradeJournal
 from .market_state import OpenInterestTracker
 
@@ -87,33 +87,7 @@ class TradingEngine:
         # LLM
         self.advisor = None
         self._llm_thread = None
-        if use_llm:
-            use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
-            
-            if use_cloud:
-                resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
-                resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
-                resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
-                logger.info(f"[LLM] Mode: CLOUD (Target: {resolved_host})")
-            else:
-                resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-                resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
-                resolved_key = os.getenv("OLLAMA_API_KEY", "")
-                logger.info("[LLM] Mode: LOCAL")
-
-            use_openai = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
-            
-            self.advisor = OllamaAdvisor(
-                host=resolved_host,
-                model=resolved_model,
-                api_key=resolved_key,
-                use_openai=use_openai,
-                log_llm=llm_logged
-            )
-            if self.advisor.is_ready():
-                logger.info(f"[LLM] Connected to {resolved_model}")
-            else:
-                logger.warning("[LLM] Ollama unavailable. Technical-only mode.")
+        self.advisor = build_advisor(use_llm, llm_host=llm_host, llm_model=llm_model, llm_logged=llm_logged)
 
     def run_once(self) -> dict:
         """Single trading tick."""

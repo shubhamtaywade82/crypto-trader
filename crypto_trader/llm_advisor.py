@@ -20,7 +20,7 @@ import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from pathlib import Path
+from pathlib import Path, Path as _Path
 from enum import Enum
 
 import requests
@@ -144,6 +144,14 @@ Output JSON:
   "technical_alignment": -1.0 to 1.0,
   "veto_reason": null | "specific reason"
 }"""
+
+
+def _load_system_prompt() -> str:
+    """Load the institutional system prompt from the ai/prompts directory."""
+    prompt_path = _Path(__file__).parent / "ai" / "prompts" / "system.txt"
+    if prompt_path.exists():
+        return prompt_path.read_text(encoding="utf-8").strip()
+    return SYSTEM_PROMPT  # fallback to embedded prompt if file missing
 
 
 def _build_structure_block(tf_name: str, df: pd.DataFrame) -> str:
@@ -494,6 +502,66 @@ class LLMResponseParser:
         )
 
 
+def _decision_to_advice(decision, symbol: str, latency_ms: float) -> "LLMAdvice":
+    """Convert LLMDecision (new AI subsystem) → LLMAdvice (existing interface)."""
+    action = decision.action
+
+    if action == "LONG":
+        bias = LLMBias.BULLISH
+        recommended_bias = "long_only"
+        sentiment_score = min(1.0, decision.confidence)
+        veto = False
+        veto_reason = None
+    elif action == "SHORT":
+        bias = LLMBias.BEARISH
+        recommended_bias = "short_only"
+        sentiment_score = -min(1.0, decision.confidence)
+        veto = False
+        veto_reason = None
+    else:  # NO_TRADE
+        bias = LLMBias.NEUTRAL
+        recommended_bias = "none"
+        sentiment_score = 0.0
+        veto = True
+        veto_reason = decision.invalidation or "NO_TRADE decision from LLM router"
+
+    # Map risk_reward to risk level
+    rr = decision.risk_reward or 0.0
+    if rr >= 3.0:
+        risk_level = LLMRiskLevel.LOW
+    elif rr >= 2.0:
+        risk_level = LLMRiskLevel.MEDIUM
+    elif rr >= 1.0:
+        risk_level = LLMRiskLevel.HIGH
+    else:
+        risk_level = LLMRiskLevel.EXTREME
+
+    technical_alignment = (
+        min(1.0, decision.confidence) if action == "LONG"
+        else (-min(1.0, decision.confidence) if action == "SHORT" else 0.0)
+    )
+
+    key_factors = list(decision.warnings or []) + list(decision.reason_codes or [])
+    if decision.setup_type:
+        key_factors.insert(0, decision.setup_type)
+
+    return LLMAdvice(
+        timestamp=int(time.time()),
+        symbol=symbol,
+        bias=bias,
+        confidence=decision.confidence,
+        sentiment_score=sentiment_score,
+        risk_level=risk_level,
+        key_factors=key_factors[:5],
+        recommended_bias=recommended_bias,
+        technical_alignment=technical_alignment,
+        veto=veto,
+        veto_reason=veto_reason,
+        latency_ms=latency_ms,
+        raw_response=decision.action,
+    )
+
+
 class OllamaAdvisor:
     """High-level advisor with async support, cache, and circuit breaker."""
 
@@ -523,7 +591,28 @@ class OllamaAdvisor:
         self._last_advice: Optional[LLMAdvice] = None
         self._lock = threading.Lock()
 
+        # Wire to the new AI subsystem router (cloud/local fallback, caching, telemetry)
+        self._router = None
+        try:
+            from crypto_trader.ai.router import build_router
+            self._router = build_router(
+                cloud_host=os.getenv("CLOUD_OLLAMA_HOST", "https://api.ollama.com"),
+                cloud_model=os.getenv("CLOUD_OLLAMA_MODEL", "qwen3.5:cloud"),
+                cloud_api_key=os.getenv("CLOUD_OLLAMA_API_KEY", ""),
+                local_host=host,
+                local_model=model,
+            )
+            logger.info("[LLM] AI subsystem router initialized (cloud+local)")
+        except Exception as e:
+            logger.warning("[LLM] AI subsystem router unavailable, using legacy client: %s", e)
+
     def is_ready(self) -> bool:
+        if self._router is not None:
+            # Router is ready if local provider is healthy (cloud is optional bonus)
+            try:
+                return self._router.local.health() and self.circuit_breaker.can_use()
+            except Exception:
+                pass
         return self.client.is_available() and self.circuit_breaker.can_use()
 
     def get_advice(
@@ -550,6 +639,7 @@ class OllamaAdvisor:
             logger.warning("[LLM] Circuit breaker active. LLM disabled.")
             return None
 
+        # Build the rich user prompt (unchanged — still uses multi-TF SMC data)
         prompt = build_prompt(
             symbol, df_5m, df_15m, df_1h, df_4h, regime, regime_score, mark_price,
             funding_rate, oi_delta, taker_ratio, open_positions,
@@ -557,17 +647,75 @@ class OllamaAdvisor:
             is_kill_zone=is_kill_zone, rvol=rvol,
         )
 
+        # ── Router path (new AI subsystem) ──
+        if self._router is not None:
+            try:
+                from crypto_trader.ai.state_builder import StateBuilder
+                from crypto_trader.ai.schemas import MarketStatePayload
+
+                # Determine trading mode from regime
+                mode = "swing" if regime_score < 0.6 or "TREND" not in regime.upper() else "intraday"
+
+                # Build compact state for router cache key and schema validation
+                if df_15m is not None and df_4h is not None and len(df_15m) >= 20 and len(df_4h) >= 20:
+                    state = StateBuilder.build(
+                        symbol=symbol,
+                        timeframe="15m",
+                        mode=mode,
+                        df_ltf=df_15m,
+                        df_htf=df_4h,
+                        mark_price=mark_price,
+                        funding_rate=funding_rate,
+                        oi_delta=oi_delta,
+                        risk_budget=1.0,
+                    )
+                else:
+                    # Minimal fallback state when DFs not available
+                    state = MarketStatePayload(
+                        symbol=symbol, timeframe="15m", mode=mode,
+                        price=mark_price, htf_trend="unclear",
+                        market_structure="RANGE", volatility_regime="chop",
+                        funding_rate=funding_rate, open_interest_change=oi_delta,
+                        volume_anomaly=False, liquidity_sweep=False, risk_budget_pct=1.0,
+                    )
+
+                system_prompt = _load_system_prompt()
+
+                start = time.perf_counter()
+                decision = self._router.route(state, system_prompt, prompt, timeout_s=int(self.client.timeout))
+                latency_ms = (time.perf_counter() - start) * 1000
+
+                advice = _decision_to_advice(decision, symbol, latency_ms)
+                self.circuit_breaker.record_success()
+                # Also write to existing journal for continuity
+                self.journal.log(symbol, prompt, decision.action, advice)
+
+                with self._lock:
+                    self._last_advice = advice
+
+                logger.info(
+                    "[LLM] %s | %s | conf=%.2f | score=%+.2f | risk=%s | lat=%.0fms | veto=%s",
+                    symbol, advice.bias.value, advice.confidence, advice.sentiment_score,
+                    advice.risk_level.value, latency_ms, advice.veto,
+                )
+                return advice
+
+            except Exception as e:
+                logger.warning("[LLM] Router path failed, falling back to legacy client: %s", e)
+                # Fall through to legacy path below
+
+        # ── Legacy path (OllamaClient direct) — fallback ──
         if not force_refresh:
             cached = self.cache.get(symbol, prompt)
             if cached:
                 if self.log_llm:
-                    logger.info(f"[LLM Cache Hit] Reused cached advice for {symbol}")
+                    logger.info("[LLM Cache Hit] Reused cached advice for %s", symbol)
                 with self._lock:
                     self._last_advice = cached
                 return cached
 
         if self.log_llm:
-            logger.info(f"[LLM Prompt] Sent to model '{self.client.model}':\n{prompt}\n" + "="*50)
+            logger.info("[LLM Prompt] Sent to model '%s':\n%s\n%s", self.client.model, prompt, "="*50)
 
         start = time.perf_counter()
         raw = self.client.generate(prompt)
@@ -579,10 +727,8 @@ class OllamaAdvisor:
                 return self._last_advice
 
         if self.log_llm:
-            resp_str = str(raw)
-            if resp_str and len(resp_str) > 1000:
-                resp_str = resp_str[:1000] + "... (truncated)"
-            logger.info(f"[LLM Response] Received raw output:\n{resp_str}\n" + "="*50)
+            resp_str = str(raw)[:1000]
+            logger.info("[LLM Response] Received raw output:\n%s\n%s", resp_str, "="*50)
 
         advice = self.parser.parse(raw, symbol)
         if advice is None:
@@ -599,9 +745,9 @@ class OllamaAdvisor:
             self._last_advice = advice
 
         logger.info(
-            f"[LLM] {symbol} | {advice.bias.value} | conf={advice.confidence:.2f} | "
-            f"score={advice.sentiment_score:+.2f} | risk={advice.risk_level.value} | "
-            f"lat={latency_ms:.0f}ms | veto={advice.veto}"
+            "[LLM] %s | %s | conf=%.2f | score=%+.2f | risk=%s | lat=%.0fms | veto=%s",
+            symbol, advice.bias.value, advice.confidence, advice.sentiment_score,
+            advice.risk_level.value, latency_ms, advice.veto,
         )
         return advice
 
@@ -655,3 +801,40 @@ class OllamaAdvisor:
 
         final_score = tech_component + llm_component
         return round(final_score, 3), llm_weight, explanation
+
+
+def build_advisor(
+    use_llm: bool,
+    llm_host: str = None,
+    llm_model: str = None,
+    llm_logged: bool = False,
+) -> "OllamaAdvisor | None":
+    """Factory: build OllamaAdvisor from config/env. Returns None if use_llm=False or unavailable."""
+    if not use_llm:
+        return None
+    import os
+    use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
+    if use_cloud:
+        resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
+        resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
+        resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
+        import logging; logging.getLogger("crypto_trader.llm_advisor").info("[LLM] Mode: CLOUD (Target: %s)", resolved_host)
+    else:
+        resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+        resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+        resolved_key = os.getenv("OLLAMA_API_KEY", "")
+        import logging; logging.getLogger("crypto_trader.llm_advisor").info("[LLM] Mode: LOCAL")
+    use_openai = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
+    advisor = OllamaAdvisor(
+        host=resolved_host,
+        model=resolved_model,
+        api_key=resolved_key,
+        use_openai=use_openai,
+        log_llm=llm_logged,
+    )
+    import logging; _log = logging.getLogger("crypto_trader.llm_advisor")
+    if advisor.is_ready():
+        _log.info("[LLM] Connected to %s", resolved_model)
+    else:
+        _log.warning("[LLM] Ollama unavailable. Technical-only mode.")
+    return advisor

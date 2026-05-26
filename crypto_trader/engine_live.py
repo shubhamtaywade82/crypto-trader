@@ -73,6 +73,7 @@ class LiveTradingSystem:
             venue_tp_enabled=self.cfg.venue_tp_enabled,
             require_venue_sl=self.cfg.require_venue_sl,
             software_sl_backup_bps=self.cfg.software_sl_backup_bps,
+            database_url=self.cfg.database_url,
         )
 
     # ── construction ──────────────────────────────────────────────────────
@@ -97,8 +98,10 @@ class LiveTradingSystem:
         return MarketDataRouter.from_config(self.cfg, bus=self.bus)
 
     def _build_event_store(self):
+        from pathlib import Path
         from .storage import get_event_store
-        return get_event_store(self.cfg.database_url)
+        sqlite_fallback = str(Path.home() / ".crypto_trader" / "event_journal.db")
+        return get_event_store(self.cfg.database_url, sqlite_path=sqlite_fallback)
 
     # ── self-test gate ────────────────────────────────────────────────────
     def preflight(self) -> List[Check]:
@@ -369,25 +372,15 @@ class LiveTradingSystem:
             except Exception as e:
                 logger.error("UI event relay init failed (continuing without it): %s", e)
 
-        if self.event_store is not None or self.projection is not None or ui_publisher is not None:
-            prev = self.wallet.event_hook
-            def _sink(ev):
-                if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
-                    ev["payload"]["mode"] = self.cfg.mode.value
-                if self.event_store is not None:
-                    try:
-                        self.event_store.append(ev)
-                    except Exception as e:  # never let journaling kill trading
-                        logger.error("event store append failed: %s", e)
-                if self.projection is not None:
-                    try:
-                        self.projection.apply(ev)
-                    except Exception as e:  # projection is derived; never fatal
-                        logger.error("projection apply failed: %s", e)
-                if ui_publisher is not None:
-                    ui_publisher(ev)  # already swallows its own errors
-                if prev:
-                    prev(ev)
+        from .infra.event_routing import build_event_sink
+        _sink = build_event_sink(
+            event_store=self.event_store,
+            projection=self.projection,
+            ui_publisher=ui_publisher,
+            mode=self.cfg.mode.value,
+            prev_hook=self.wallet.event_hook,
+        )
+        if _sink is not None:
             self.wallet.event_hook = _sink
 
         # Decoupled execution bus (opt-in via EXECUTION_BUS=redis + REDIS_URL):
@@ -444,13 +437,103 @@ class LiveTradingSystem:
             )
             perp_engine = self.execution_engine  # live CoinDCX futures adapter
 
-        book = ArbBook(namespace=self.cfg.symbol)
+        book = ArbBook(namespace=self.cfg.symbol, database_url=self.cfg.database_url)
         logger.warning("[ARB] funding arbitrage ENABLED for %s (notional=%.2f USDT)",
                        self.cfg.symbol, self.cfg.funding_arb_notional_usdt)
         return FundingArbManager(
             self.cfg.symbol, spot_engine, perp_engine, book, self.cfg,
             mark_fn=mark_fn, funding_fn=funding_fn,
         )
+
+
+def run_venue_preflight(
+    symbols: List[str],
+    wallet,
+    execution_engine,
+    risk: "RiskManager",
+    bus: "EventBus",
+    cfg: "TradingConfig",
+) -> bool:
+    """Shared preflight gate used by both LiveTradingSystem and multi_engine.
+
+    Checks (in order):
+    1. Safe-mode gate (LIVE_TRADING_ENABLED + ACK + no HALT file)
+    2. CoinDCX auth + available margin balance
+    3. Per-symbol: venue leverage cap vs ``cfg.max_leverage``
+    4. Per-symbol: boot reconciliation
+    5. Kill-switch already latched
+
+    Returns ``True`` when all checks pass, ``False`` otherwise.
+    """
+    from . import safe_mode
+
+    logger.info("Running venue preflight checks for %d symbol(s): %s", len(symbols), ", ".join(symbols))
+
+    # 1. Safe-mode gate
+    if not safe_mode.is_live_enabled():
+        logger.critical(
+            "LIVE TRADING BLOCKED — Safe-mode gate is closed. "
+            "Ensure %s=true, %s='%s', and no active HALT file exists.",
+            safe_mode.LIVE_ENV_VAR, safe_mode.ACK_ENV_VAR, safe_mode.ACK_PHRASE,
+        )
+        return False
+
+    # 2. CoinDCX auth + balance
+    mc = cfg.coindcx_margin_currency
+    usdt_equiv = 0.0
+    try:
+        avail = float(execution_engine.sync_balance())
+        conv = float(execution_engine.get_usdt_conversion()) or 1.0
+        usdt_equiv = avail / conv if mc != "USDT" else avail
+        logger.info("[PREFLIGHT] coindcx_auth OK: avail %s %s (~%.2f USDT)", avail, mc, usdt_equiv)
+    except Exception as e:
+        logger.critical("[PREFLIGHT] CoinDCX authentication failed: %s", e)
+        return False
+
+    # 3 + 4. Per-symbol checks
+    for sym in symbols:
+        # Leverage cap
+        try:
+            spec = execution_engine.mapper.get_spec(sym)
+            lev_ok = cfg.max_leverage <= spec.max_leverage
+            if not lev_ok:
+                logger.critical(
+                    "[PREFLIGHT] %s leverage cap FAIL: configured %sx > venue max %sx",
+                    sym, cfg.max_leverage, spec.max_leverage,
+                )
+                return False
+            logger.info("[PREFLIGHT] %s leverage_cap OK: %sx <= %sx", sym, cfg.max_leverage, spec.max_leverage)
+        except Exception as e:
+            logger.critical("[PREFLIGHT] %s failed to fetch instrument spec: %s", sym, e)
+            return False
+
+        # Reconciliation
+        try:
+            from .execution.reconciler import Reconciler
+            reconciler = Reconciler(wallet, execution_engine, risk, bus=bus,
+                                    strict_cancel=getattr(cfg, "reconcile_strict_cancel", False))
+            mismatches = reconciler.reconcile(sym)
+            unresolved = [m for m in mismatches if not m.repaired]
+            if reconciler.snapshot_failed:
+                logger.critical("[PREFLIGHT] %s reconciliation FAIL: venue snapshot unavailable", sym)
+                return False
+            if unresolved:
+                logger.critical(
+                    "[PREFLIGHT] %s reconciliation FAIL: %d unresolved mismatch(es)", sym, len(unresolved)
+                )
+                return False
+            logger.info("[PREFLIGHT] %s reconciliation OK", sym)
+        except Exception as e:
+            logger.critical("[PREFLIGHT] %s reconciliation crashed: %s", sym, e)
+            return False
+
+    # 5. Kill switch
+    if risk.kill_switch:
+        logger.critical("[PREFLIGHT] Kill switch already active: %s", risk.kill_switch_reason)
+        return False
+
+    logger.info("All venue preflight checks passed.")
+    return True
 
 
 def main():

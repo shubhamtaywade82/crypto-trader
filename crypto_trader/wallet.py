@@ -10,7 +10,6 @@ import os
 import time
 import logging
 import threading
-import sqlite3
 import gzip
 import base64
 import hashlib
@@ -425,6 +424,7 @@ class EnhancedFuturesWallet:
         venue_tp_enabled: bool = False,
         require_venue_sl: bool = False,
         software_sl_backup_bps: int = 15,
+        database_url: str = "",
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -468,6 +468,14 @@ class EnhancedFuturesWallet:
         self.events_file = DATA_DIR / f"wallet_events_{safe_ns}_{safe_symbol}.jsonl"
         self.db_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.db"
 
+        from .storage.wallet_store import WalletStore
+        self._wallet_store = WalletStore(
+            database_url=database_url,
+            sqlite_path=str(self.db_file),
+            namespace=safe_ns,
+            symbol=safe_symbol,
+        )
+
         self.initial_balance: Decimal = self._to_decimal(initial_balance)
         self.wallet_balance: Decimal = self.initial_balance
         self.unrealized_pnl_total: Decimal = Decimal("0")
@@ -495,12 +503,11 @@ class EnhancedFuturesWallet:
         events_empty = True
         if self.events_file.exists() and self.events_file.stat().st_size > 0:
             events_empty = False
-        elif self.db_file.exists():
+        else:
             try:
-                with sqlite3.connect(self.db_file) as conn:
-                    count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-                    if count > 0:
-                        events_empty = False
+                count = self._wallet_store.count_events()
+                if count > 0:
+                    events_empty = False
             except Exception:
                 pass
 
@@ -1462,18 +1469,13 @@ class EnhancedFuturesWallet:
         json_compatible_state = self._to_json_compatible(state)
         self._atomic_write_json(self.state_file, json_compatible_state)
         encoded_state = self._encode_snapshot(json_compatible_state)
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute(
-                "INSERT INTO snapshots (ts, wallet_balance, realized_pnl_total, state_json) VALUES (?, ?, ?, ?)",
-                (self._now_ms(), str(self.wallet_balance), str(self.realized_pnl_total), encoded_state)
-            )
-            # Safe rotation
-            rows = conn.execute("SELECT id FROM snapshots ORDER BY ts DESC LIMIT ?", (self.max_snapshots,)).fetchall()
-            ids_to_keep = [r[0] for r in rows]
-            if ids_to_keep:
-                placeholders = ",".join(["?"] * len(ids_to_keep))
-                conn.execute(f"DELETE FROM snapshots WHERE id NOT IN ({placeholders})", ids_to_keep)
-            conn.commit()
+        self._wallet_store.save_snapshot(
+            self._now_ms(),
+            str(self.wallet_balance),
+            str(self.realized_pnl_total),
+            encoded_state,
+            max_snapshots=self.max_snapshots,
+        )
 
     def _atomic_write_json(self, path: Path, state: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1494,110 +1496,25 @@ class EnhancedFuturesWallet:
 
 
     def _init_db(self):
-        self.db_file.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                symbol TEXT,
-                namespace TEXT,
-                payload_json TEXT NOT NULL
-            )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                order_type TEXT NOT NULL,
-                quantity TEXT NOT NULL,
-                filled_quantity TEXT NOT NULL,
-                avg_fill_price TEXT NOT NULL,
-                status TEXT NOT NULL,
-                reduce_only INTEGER NOT NULL DEFAULT 0,
-                trigger_price TEXT,
-                limit_price TEXT,
-                expires_at INTEGER,
-                updated_ts INTEGER NOT NULL
-            )
-            """)
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS fills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                quantity TEXT NOT NULL,
-                fill_price TEXT NOT NULL,
-                fee TEXT NOT NULL,
-                ts INTEGER NOT NULL,
-                sequence INTEGER NOT NULL
-            )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills(order_id)")
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS funding (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                rate TEXT NOT NULL,
-                notional TEXT NOT NULL,
-                amount TEXT NOT NULL,
-                ts INTEGER NOT NULL
-            )
-            """)
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS fees (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                reason TEXT,
-                amount TEXT NOT NULL,
-                ts INTEGER NOT NULL
-            )
-            """)
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts INTEGER NOT NULL,
-                wallet_balance TEXT NOT NULL,
-                realized_pnl_total TEXT NOT NULL,
-                state_json TEXT NOT NULL
-            )
-            """)
-            conn.commit()
+        # Schema is now managed by WalletStore (initialized before _init_db is called).
+        pass
 
     def _append_event_db(self, event: dict):
         payload_json = json.dumps(event.get("payload", {}), default=self._serialize_decimals)
-        with sqlite3.connect(self.db_file) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute(
-                "INSERT INTO events (ts, event_type, symbol, namespace, payload_json) VALUES (?, ?, ?, ?, ?)",
-                (
-                    int(event.get("ts", 0)),
-                    event.get("event_type"),
-                    event.get("symbol"),
-                    event.get("namespace"),
-                    payload_json,
-                ),
-            )
-            conn.commit()
+        self._wallet_store.append_event(
+            int(event.get("ts", 0)),
+            event.get("event_type"),
+            event.get("symbol"),
+            event.get("namespace"),
+            payload_json,
+        )
 
     def _iter_events(self):
-        if self.db_file.exists():
-            with sqlite3.connect(self.db_file) as conn:
-                rows = conn.execute(
-                    "SELECT ts, event_type, symbol, namespace, payload_json FROM events ORDER BY ts ASC, id ASC"
-                ).fetchall()
-            for ts, et, sym, ns, payload_json in rows:
-                yield {"ts": ts, "event_type": et, "symbol": sym, "namespace": ns, "payload": json.loads(payload_json)}
-            return
-
-        if self.events_file.exists():
+        rows = self._wallet_store.iter_events()
+        for ts, et, sym, ns, payload_json in rows:
+            yield {"ts": ts, "event_type": et, "symbol": sym, "namespace": ns, "payload": json.loads(payload_json)}
+        # JSONL fallback for legacy migration (only when store is empty)
+        if not rows and self.events_file.exists():
             with open(self.events_file, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
@@ -2019,9 +1936,7 @@ class EnhancedFuturesWallet:
     def run_funding_scheduler(self, symbol: str, funding_rate: Decimal, interval_ms: int, now_ms: Optional[int] = None) -> Decimal:
         """Apply funding if interval has elapsed since last application for symbol."""
         now = int(now_ms if now_ms is not None else self._now_ms())
-        with sqlite3.connect(self.db_file) as conn:
-            row = conn.execute("SELECT MAX(ts) FROM funding WHERE symbol = ?", (symbol,)).fetchone()
-            last_ts = int(row[0]) if row and row[0] is not None else 0
+        last_ts = self._wallet_store.get_funding_last_ts(symbol)
         if now - last_ts < int(interval_ms):
             return Decimal("0")
         return self.apply_funding(symbol, self._to_decimal(funding_rate))
@@ -2120,98 +2035,59 @@ class EnhancedFuturesWallet:
     def get_position_timeline(self, symbol: str) -> List[dict]:
         """Returns a chronological list of events for the specified symbol."""
         timeline = []
-        if self.db_file.exists():
-            try:
-                with sqlite3.connect(self.db_file) as conn:
-                    rows = conn.execute(
-                        "SELECT ts, event_type, symbol, namespace, payload_json FROM events WHERE symbol=? ORDER BY ts ASC, id ASC",
-                        (symbol,)
-                    ).fetchall()
-                for ts, et, sym, ns, payload_json in rows:
-                    timeline.append({
-                        "ts": ts,
-                        "event_type": et,
-                        "symbol": sym,
-                        "namespace": ns,
-                        "payload": json.loads(payload_json)
-                    })
-                return timeline
-            except Exception as e:
-                logger.warning(f"Failed to get position timeline from DB: {e}")
-        
-        # Fallback to events file
-        for event in self._iter_events():
-            if event.get("symbol") == symbol:
-                timeline.append(event)
+        try:
+            rows = self._wallet_store.get_events_by_symbol(symbol)
+            for ts, et, sym, ns, payload_json in rows:
+                timeline.append({
+                    "ts": ts,
+                    "event_type": et,
+                    "symbol": sym,
+                    "namespace": ns,
+                    "payload": json.loads(payload_json)
+                })
+        except Exception as e:
+            logger.warning(f"Failed to get position timeline from DB: {e}")
         return timeline
 
     def get_invariant_events(self, limit: int = 100) -> List[dict]:
         """Returns the list of recent INVARIANT_VIOLATION events."""
         violations = []
-        if self.db_file.exists():
-            try:
-                with sqlite3.connect(self.db_file) as conn:
-                    rows = conn.execute(
-                        "SELECT ts, event_type, symbol, namespace, payload_json FROM events WHERE event_type='INVARIANT_VIOLATION' ORDER BY ts DESC LIMIT ?",
-                        (limit,)
-                    ).fetchall()
-                for ts, et, sym, ns, payload_json in rows:
-                    violations.append({
-                        "ts": ts,
-                        "event_type": et,
-                        "symbol": sym,
-                        "namespace": ns,
-                        "payload": json.loads(payload_json)
-                    })
-                violations.reverse()
-                return violations
-            except Exception as e:
-                logger.warning(f"Failed to get invariant events from DB: {e}")
-        
-        for event in self._iter_events():
-            if event.get("event_type") == "INVARIANT_VIOLATION":
-                violations.append(event)
-        return violations[-limit:]
+        try:
+            rows = self._wallet_store.get_events_by_type("INVARIANT_VIOLATION", limit)
+            for ts, et, sym, ns, payload_json in rows:
+                violations.append({
+                    "ts": ts,
+                    "event_type": et,
+                    "symbol": sym,
+                    "namespace": ns,
+                    "payload": json.loads(payload_json)
+                })
+            violations.reverse()
+        except Exception as e:
+            logger.warning(f"Failed to get invariant events from DB: {e}")
+        return violations
 
     def get_funding_history(self, symbol: str) -> List[dict]:
         """Returns chronological list of funding payments/events for a symbol."""
         history = []
-        if self.db_file.exists():
-            try:
-                with sqlite3.connect(self.db_file) as conn:
-                    rows = conn.execute(
-                        "SELECT ts, rate, notional, amount FROM funding WHERE symbol=? ORDER BY ts ASC",
-                        (symbol,)
-                    ).fetchall()
-                for ts, rate, notional, amount in rows:
-                    history.append({
-                        "ts": ts,
-                        "symbol": symbol,
-                        "rate": Decimal(rate),
-                        "notional": Decimal(notional),
-                        "amount": Decimal(amount)
-                    })
-                return history
-            except Exception as e:
-                logger.warning(f"Failed to get funding history from DB: {e}")
-        
-        for event in self._iter_events():
-            if event.get("event_type") == "FUNDING_APPLIED":
-                p = event.get("payload", {})
-                if event.get("symbol") == symbol or p.get("symbol") == symbol:
-                    history.append({
-                        "ts": event.get("ts"),
-                        "symbol": symbol,
-                        "rate": Decimal(str(p.get("rate", "0"))),
-                        "notional": Decimal(str(p.get("notional", "0"))),
-                        "amount": Decimal(str(p.get("amount", "0")))
-                    })
+        try:
+            rows = self._wallet_store.get_funding_history(symbol)
+            for ts, rate, notional, amount in rows:
+                history.append({
+                    "ts": ts,
+                    "symbol": symbol,
+                    "rate": Decimal(rate),
+                    "notional": Decimal(notional),
+                    "amount": Decimal(amount)
+                })
+        except Exception as e:
+            logger.warning(f"Failed to get funding history from DB: {e}")
         return history
 
     def replay_until(self, ts: int) -> PortfolioState:
         """Replay all events in order up to timestamp `ts` (inclusive) and returns the state."""
         state = PortfolioState(wallet_balance=self.initial_balance)
-        if not self.events_file.exists() and not self.db_file.exists():
+        if not self.events_file.exists() and self._wallet_store.count_events() == 0:
             return state
 
         last_ts = -1
@@ -2359,7 +2235,7 @@ class EnhancedFuturesWallet:
     def replay_portfolio_state(self) -> PortfolioState:
         """Rebuild a minimal portfolio view from event log only."""
         state = PortfolioState(wallet_balance=self.initial_balance)
-        if not self.events_file.exists() and not self.db_file.exists():
+        if not self.events_file.exists() and self._wallet_store.count_events() == 0:
             return state
 
         last_ts = -1
@@ -2434,42 +2310,7 @@ class EnhancedFuturesWallet:
         et = event.get("event_type")
         payload = event.get("payload", {})
         ts = int(event.get("ts", self._now_ms()))
-        with sqlite3.connect(self.db_file) as conn:
-            if et == "ORDER_CREATED":
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO orders
-                    (order_id, symbol, side, order_type, quantity, filled_quantity, avg_fill_price, status, reduce_only, trigger_price, limit_price, expires_at, updated_ts)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        payload.get("order_id"), payload.get("symbol"), payload.get("side"), payload.get("order_type", "MARKET"),
-                        str(payload.get("quantity", "0")), "0", "0", payload.get("status", "NEW"),
-                        1 if payload.get("reduce_only", False) else 0,
-                        str(payload.get("trigger_price")) if payload.get("trigger_price") is not None else None,
-                        str(payload.get("limit_price")) if payload.get("limit_price") is not None else None,
-                        payload.get("expires_at"), ts,
-                    ),
-                )
-            elif et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED", "ORDER_CANCELLED", "ORDER_REJECTED", "ORDER_EXPIRED"):
-                oid = payload.get("order_id")
-                if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
-                    conn.execute(
-                        "INSERT INTO fills (order_id, symbol, side, quantity, fill_price, fee, ts, sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (oid, payload.get("symbol"), payload.get("side"), str(payload.get("quantity", "0")), str(payload.get("fill_price", "0")), str(payload.get("fee", "0")), ts, int(payload.get("sequence", 1))),
-                    )
-                row = conn.execute("SELECT quantity, filled_quantity FROM orders WHERE order_id = ?", (oid,)).fetchone()
-                if row:
-                    qty = Decimal(str(row[0])); filled = Decimal(str(row[1]))
-                    if et in ("ORDER_FILLED", "ORDER_PARTIALLY_FILLED"):
-                        filled += Decimal(str(payload.get("quantity", "0")))
-                    status = payload.get("status") or ("CANCELLED" if et=="ORDER_CANCELLED" else "REJECTED" if et=="ORDER_REJECTED" else "EXPIRED" if et=="ORDER_EXPIRED" else "FILLED")
-                    conn.execute("UPDATE orders SET filled_quantity=?, avg_fill_price=?, status=?, updated_ts=? WHERE order_id=?", (str(filled), str(payload.get("fill_price", "0")), status, ts, oid))
-            elif et == "FUNDING_APPLIED":
-                conn.execute("INSERT INTO funding (symbol, rate, notional, amount, ts) VALUES (?, ?, ?, ?, ?)", (payload.get("symbol"), str(payload.get("rate", "0")), str(payload.get("notional", "0")), str(payload.get("amount", "0")), ts))
-            elif et == "FEE_CHARGED":
-                conn.execute("INSERT INTO fees (symbol, reason, amount, ts) VALUES (?, ?, ?, ?)", (payload.get("symbol"), payload.get("reason"), str(payload.get("amount", "0")), ts))
-            conn.commit()
+        self._wallet_store.persist_domain_event(et, payload, ts)
 
     @staticmethod
     def _sanitize_path_component(value: str) -> str:
@@ -2526,14 +2367,9 @@ class EnhancedFuturesWallet:
             logger.warning(f"Failed to load state: {e}")
 
     def _load_from_db_snapshot_and_replay(self) -> bool:
-        if not self.db_file.exists():
-            return False
         start_time = time.time()
         try:
-            with sqlite3.connect(self.db_file) as conn:
-                row = conn.execute(
-                    "SELECT ts, wallet_balance, realized_pnl_total, state_json FROM snapshots ORDER BY ts DESC LIMIT 1"
-                ).fetchone()
+            row = self._wallet_store.get_latest_snapshot()
             if not row:
                 return False
             snap_ts, wallet_balance, realized_pnl_total, state_json = row

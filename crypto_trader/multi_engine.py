@@ -15,7 +15,6 @@ from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
 from crypto_trader.risk import RiskManager
-from crypto_trader.execution.reconciler import Reconciler
 from crypto_trader import safe_mode
 
 # Load environment variables for Telegram
@@ -102,62 +101,20 @@ def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
 
     return []
 
-def run_preflight_checks(symbols: List[str], wallet: EnhancedFuturesWallet, execution_engine: CoinDCXExecutionEngine, risk: RiskManager, bus) -> bool:
-    logger.info("Initializing pre-flight state reconciliation and gate checks...")
-    
-    # 1. Safe-mode gate check
-    if not safe_mode.is_live_enabled():
-        logger.critical(
-            f"LIVE TRADING BLOCKED — Safe-mode gate is closed. "
-            f"Ensure {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', and no active HALT file exists."
-        )
-        return False
-
-    # 2. Authentication and margin check
-    try:
-        margin_currency = os.getenv("COINDCX_MARGIN_CURRENCY", "USDT").upper()
-        avail = float(execution_engine.sync_balance())
-        conv = float(execution_engine.get_usdt_conversion()) or 1.0
-        usdt_equiv = avail / conv if margin_currency != "USDT" else avail
-        logger.info(f"[SELF-TEST] CoinDCX auth OK: available balance {avail} {margin_currency} (~{usdt_equiv:.2f} USDT)")
-    except Exception as e:
-        logger.critical(f"[SELF-TEST] CoinDCX authentication failed: {e}")
-        return False
-
-    # 3. Symbol specific checks (reconciliation & leverage caps)
-    for sym in symbols:
-        # Leverage limit check
-        try:
-            spec = execution_engine.mapper.get_spec(sym)
-            max_lev = int(os.getenv("MAX_LEVERAGE", "2"))
-            if max_lev > spec.max_leverage:
-                logger.critical(f"[SELF-TEST] {sym} leverage limit failed: configured {max_lev}x exceeds venue max {spec.max_leverage}x")
-                return False
-        except Exception as e:
-            logger.critical(f"[SELF-TEST] Failed to fetch instrument spec for {sym}: {e}")
-            return False
-
-        # State reconciliation
-        try:
-            reconciler = Reconciler(wallet, execution_engine, risk, bus=bus)
-            mismatches = reconciler.reconcile(sym)
-            unresolved = [m for m in mismatches if not m.repaired]
-            if reconciler.snapshot_failed:
-                logger.critical(f"[SELF-TEST] {sym} reconciliation failed: venue snapshot unavailable")
-                return False
-            if unresolved:
-                logger.critical(f"[SELF-TEST] {sym} has {len(unresolved)} unresolved reconciliation mismatch(es). Aborting startup.")
-                return False
-        except Exception as e:
-            logger.critical(f"[SELF-TEST] {sym} reconciliation crashed: {e}")
-            return False
-
-    if risk.kill_switch:
-        logger.critical(f"[SELF-TEST] Risk Manager kill switch is active: {risk.kill_switch_reason}. Aborting startup.")
-        return False
-
-    logger.info("All pre-flight checks and reconciliation passed. Ready for trading.")
-    return True
+def run_preflight_checks(
+    symbols: List[str],
+    wallet: EnhancedFuturesWallet,
+    execution_engine: CoinDCXExecutionEngine,
+    risk: RiskManager,
+    bus,
+    cfg=None,
+) -> bool:
+    """Delegate all preflight logic to the canonical ``run_venue_preflight`` in engine_live."""
+    from .engine_live import run_venue_preflight
+    if cfg is None:
+        from .config import load_config
+        cfg = load_config()
+    return run_venue_preflight(symbols, wallet, execution_engine, risk, bus, cfg)
 
 def run_engine(engine: WebSocketTradingEngine):
     try:
@@ -203,28 +160,31 @@ def main():
         )
         logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
         
-    # Create one shared wallet for all engines
-    global_wallet = EnhancedFuturesWallet(
-        symbol="GLOBAL", 
-        initial_balance=total_balance, 
-        leverage=args.leverage,
-    )
-
     # ── Database Projections & Event Journal for Dashboard UI ──
     from crypto_trader.config import load_config
     cfg = load_config()
+
+    # Create one shared wallet for all engines
+    global_wallet = EnhancedFuturesWallet(
+        symbol="GLOBAL",
+        initial_balance=total_balance,
+        leverage=args.leverage,
+        database_url=cfg.database_url,
+    )
     
     event_store = None
     projection = None
     ui_publisher = None
     
-    if cfg.database_url:
-        try:
-            from crypto_trader.storage import get_event_store
-            event_store = get_event_store(cfg.database_url)
-            logger.info("Postgres event store initialized for multi-engine")
-        except Exception as e:
-            logger.error("Failed to initialize Postgres event store: %s", e)
+    try:
+        from pathlib import Path as _Path
+        from crypto_trader.storage import get_event_store
+        _sqlite_fallback = str(_Path.home() / ".crypto_trader" / "event_journal.db")
+        event_store = get_event_store(cfg.database_url, sqlite_path=_sqlite_fallback)
+        logger.info("Event store initialized for multi-engine (%s)",
+                    "Postgres" if cfg.database_url else "SQLite fallback")
+    except Exception as e:
+        logger.error("Failed to initialize event store: %s", e)
             
     if cfg.projection_enabled and cfg.database_url:
         try:
@@ -246,29 +206,22 @@ def main():
         except Exception as e:
             logger.error("Failed to initialize UI event relay: %s", e)
             
-    if event_store is not None or projection is not None or ui_publisher is not None:
-        prev_hook = global_wallet.event_hook
-        def _sink(ev):
-            if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
-                ev["payload"]["mode"] = cfg.mode.value
-                
-            if event_store is not None:
-                try: event_store.append(ev)
-                except Exception as e: logger.error("event store append failed: %s", e)
-            if projection is not None:
-                try: projection.apply(ev)
-                except Exception as e: logger.error("projection apply failed: %s", e)
-            if ui_publisher is not None:
-                ui_publisher(ev)
-            if prev_hook:
-                prev_hook(ev)
+    from crypto_trader.infra.event_routing import build_event_sink
+    _sink = build_event_sink(
+        event_store=event_store,
+        projection=projection,
+        ui_publisher=ui_publisher,
+        mode=cfg.mode.value,
+        prev_hook=global_wallet.event_hook,
+    )
+    if _sink is not None:
         global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
 
     # Run pre-flight checks and state reconciliation in live mode
     if live_enabled and execution_engine is not None:
-        if not run_preflight_checks(symbols, global_wallet, execution_engine, global_risk, bus):
+        if not run_preflight_checks(symbols, global_wallet, execution_engine, global_risk, bus, cfg):
             logger.critical("Multi-engine startup aborted due to pre-flight self-test or reconciliation failure.")
             sys.exit(1)
     

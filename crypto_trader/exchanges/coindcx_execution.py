@@ -22,6 +22,7 @@ Notes on CoinDCX semantics:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -397,7 +398,6 @@ class CoinDCXExecutionEngine:
         the fill can't be confirmed — the caller must NOT book a zero-price
         position. A confirmed terminal cancel/reject is surfaced too.
         """
-        import time as _t
         if order.avg_fill_price and order.avg_fill_price > 0 and order.filled_quantity and order.filled_quantity > 0:
             return order
         oid = str(order.id or "")
@@ -405,7 +405,7 @@ class CoinDCXExecutionEngine:
             raise CoinDCXError("market order create returned no order id — cannot confirm fill")
         last_status = "unknown"
         for i in range(attempts):
-            _t.sleep(delay_s)
+            time.sleep(delay_s)
             try:
                 fills = [f for f in self.get_fills(symbol, days=1)
                          if str(f.get("exchange_order_id")) == oid]
