@@ -94,46 +94,84 @@ class RiskManager:
         self._save_state()
         logger.info("[KILL SWITCH] Cleared")
 
-    def can_trade(self, current_balance: Optional[float] = None, initial_daily_balance: Optional[float] = None) -> Tuple[bool, str]:
-        if self.kill_switch:
-            return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
+    def _to_float(self, val: any) -> float:
+        return float(val) if isinstance(val, Decimal) else float(val)
 
+    def _is_kill_switch_active(self) -> bool:
+        return self.kill_switch
+
+    def _reset_daily_stats_if_new_day(self) -> None:
         today = self._today()
         if self.last_trade_date != today:
             self.daily_count = 0
             self.daily_pnl = 0.0
             self.last_trade_date = today
 
-        if self.daily_count >= self.max_daily:
+    def _has_reached_daily_limit(self) -> bool:
+        return self.daily_count >= self.max_daily
+
+    def _has_reached_velocity_limit(self) -> bool:
+        if self.max_orders_per_minute <= 0:
+            return False
+        now = time.time()
+        self._recent_open_times = [t for t in self._recent_open_times if now - t < 60.0]
+        return len(self._recent_open_times) >= self.max_orders_per_minute
+
+    def _is_daily_drawdown_limit_hit(self, initial_daily_balance: Optional[float]) -> bool:
+        if not initial_daily_balance:
+            return False
+        return self.daily_pnl <= -initial_daily_balance * self.max_daily_drawdown_pct
+
+    def _is_consecutive_loss_halt_active(self) -> bool:
+        return self.consecutive_losses >= self.max_consecutive
+
+    def _check_cooldown_status(self) -> Tuple[bool, str]:
+        if not self.last_loss_time:
+            return False, ""
+        elapsed = time.time() - self.last_loss_time
+        if elapsed < self.cooldown_after_loss_seconds:
+            remaining = int((self.cooldown_after_loss_seconds - elapsed) // 60) + 1
+            return True, f"Cooldown after loss active ({remaining}m remaining)"
+        return False, ""
+
+    def _is_max_drawdown_reached(self, current_balance: Optional[float]) -> bool:
+        if current_balance is None or not self.peak_balance or self.peak_balance <= 0:
+            return False
+        cur = self._to_float(current_balance)
+        peak = float(self.peak_balance)
+        dd = (peak - cur) / peak
+        return dd >= self.max_drawdown_pct
+
+    def can_trade(self, current_balance: Optional[float] = None, initial_daily_balance: Optional[float] = None) -> Tuple[bool, str]:
+        if self._is_kill_switch_active():
+            return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
+
+        self._reset_daily_stats_if_new_day()
+
+        if self._has_reached_daily_limit():
             return False, f"Daily trade limit reached ({self.max_daily})"
 
         # G2: velocity circuit breaker — block runaway bursts within a 60s window.
-        if self.max_orders_per_minute > 0:
-            now = time.time()
-            self._recent_open_times = [t for t in self._recent_open_times if now - t < 60.0]
-            if len(self._recent_open_times) >= self.max_orders_per_minute:
-                return False, (f"Velocity limit reached "
-                               f"({len(self._recent_open_times)}/{self.max_orders_per_minute} orders/min)")
+        if self._has_reached_velocity_limit():
+            return False, (f"Velocity limit reached "
+                           f"({len(self._recent_open_times)}/{self.max_orders_per_minute} orders/min)")
         
         # Kill switch: 5% daily drawdown
-        if initial_daily_balance and self.daily_pnl <= -initial_daily_balance * self.max_daily_drawdown_pct:
+        if self._is_daily_drawdown_limit_hit(initial_daily_balance):
             return False, f"Daily drawdown limit hit: {self.daily_pnl:.2f} ({self.max_daily_drawdown_pct*100:.1f}%)"
 
-        if self.consecutive_losses >= self.max_consecutive:
+        if self._is_consecutive_loss_halt_active():
             return False, f"Consecutive loss halt ({self.max_consecutive}) — manual reset required"
         
-        if self.last_loss_time:
-            elapsed = time.time() - self.last_loss_time
-            if elapsed < self.cooldown_after_loss_seconds:
-                remaining = int((self.cooldown_after_loss_seconds - elapsed) // 60) + 1
-                return False, f"Cooldown after loss active ({remaining}m remaining)"
+        is_cooldown, cooldown_msg = self._check_cooldown_status()
+        if is_cooldown:
+            return False, cooldown_msg
         
-        if current_balance is not None and self.peak_balance and self.peak_balance > 0:
-            cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
-            peak = float(self.peak_balance) if self.peak_balance is not None else 0.0
+        if self._is_max_drawdown_reached(current_balance):
+            cur = self._to_float(current_balance)
+            peak = float(self.peak_balance)
             dd = (peak - cur) / peak
-            if dd >= self.max_drawdown_pct:
-                return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
+            return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
         
         return True, "OK"
 
@@ -163,11 +201,7 @@ class RiskManager:
         return True, "OK"
 
     def record_open(self):
-        today = self._today()
-        if self.last_trade_date != today:
-            self.daily_count = 0
-            self.daily_pnl = 0.0
-            self.last_trade_date = today
+        self._reset_daily_stats_if_new_day()
         self.daily_count += 1
         self._recent_open_times.append(time.time())  # G2 velocity tracking
         self._save_state()
@@ -185,13 +219,14 @@ class RiskManager:
         self._save_state()
 
     def update_peak_balance(self, current_balance: float):
-        cur = float(current_balance) if isinstance(current_balance, Decimal) else float(current_balance)
+        cur = self._to_float(current_balance)
         if cur <= 0:
             return
         peak = float(self.peak_balance) if self.peak_balance is not None else None
         if peak is None or cur > peak:
             self.peak_balance = cur
             self._save_state()
+
 
     def reset_consecutive_losses(self):
         """Manual reset after reviewing strategy."""
@@ -253,22 +288,31 @@ class AdaptiveThresholdManager:
         self.state_file = DATA_DIR / "adaptive_threshold.json"
         self._load_state()
 
+    def _hours_since_last_trade(self) -> float:
+        return (time.time() - self.last_trade_time) / 3600.0
+
+    def _calculate_decayed_threshold(self, hours_since: float) -> float:
+        excess_hours = hours_since - self.target_interval
+        decay = excess_hours * self.decay_rate
+        return max(self.min_threshold, self.base_threshold - decay)
+
+    def _log_decay_if_active(self, current: float, hours_since: float) -> None:
+        if current < self.base_threshold:
+            logger.debug(f"[ADAPTIVE] Threshold decayed: {self.base_threshold:.2f} -> {current:.2f} ({hours_since:.1f}h since trade)")
+
     def get_threshold(self) -> float:
         """Calculate current threshold based on time since last trade."""
-        hours_since = (time.time() - self.last_trade_time) / 3600.0
+        hours_since = self._hours_since_last_trade()
         
         # Start decaying only after we've passed the target interval
         if hours_since <= self.target_interval:
             return self.base_threshold
         
-        excess_hours = hours_since - self.target_interval
-        decay = excess_hours * self.decay_rate
-        current = max(self.min_threshold, self.base_threshold - decay)
-        
-        if current < self.base_threshold:
-            logger.debug(f"[ADAPTIVE] Threshold decayed: {self.base_threshold:.2f} -> {current:.2f} ({hours_since:.1f}h since trade)")
+        current = self._calculate_decayed_threshold(hours_since)
+        self._log_decay_if_active(current, hours_since)
         
         return round(current, 3)
+
 
     def record_trade(self):
         """Reset the clock and threshold."""

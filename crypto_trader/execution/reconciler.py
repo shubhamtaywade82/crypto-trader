@@ -78,10 +78,18 @@ class Reconciler:
 
     # ── comparison ───────────────────────────────────────────────────────────
     def _compare(self, snap: AccountSnapshot) -> List[ReconciliationMismatchEvent]:
-        out: List[ReconciliationMismatchEvent] = []
         internal = self._internal_positions()
         venue = snap.positions
 
+        out: List[ReconciliationMismatchEvent] = []
+        out.extend(self._find_ghost_positions(internal, venue))
+        out.extend(self._find_quantity_drifts(internal, venue))
+        out.extend(self._find_missing_positions(internal, venue))
+        out.extend(self._reconcile_protective_orders(snap, venue))
+        return out
+
+    def _find_ghost_positions(self, internal: dict, venue: dict) -> List[ReconciliationMismatchEvent]:
+        out: List[ReconciliationMismatchEvent] = []
         for sym, ipos in internal.items():
             if sym not in venue:
                 out.append(ReconciliationMismatchEvent(
@@ -89,16 +97,24 @@ class Reconciler:
                     internal=str(ipos["quantity"]), exchange="0",
                     detail="internal position not present on venue",
                 ))
-                continue
-            iq = Decimal(str(ipos["quantity"]))
-            vq = Decimal(str(venue[sym]["quantity"]))
-            if iq > 0 and abs(iq - vq) / iq > self.qty_tolerance:
-                out.append(ReconciliationMismatchEvent(
-                    symbol=sym, kind="position_qty",
-                    internal=str(iq), exchange=str(vq),
-                    detail="quantity drift beyond tolerance",
-                ))
+        return out
 
+    def _find_quantity_drifts(self, internal: dict, venue: dict) -> List[ReconciliationMismatchEvent]:
+        out: List[ReconciliationMismatchEvent] = []
+        for sym, ipos in internal.items():
+            if sym in venue:
+                iq = Decimal(str(ipos["quantity"]))
+                vq = Decimal(str(venue[sym]["quantity"]))
+                if iq > 0 and abs(iq - vq) / iq > self.qty_tolerance:
+                    out.append(ReconciliationMismatchEvent(
+                        symbol=sym, kind="position_qty",
+                        internal=str(iq), exchange=str(vq),
+                        detail="quantity drift beyond tolerance",
+                    ))
+        return out
+
+    def _find_missing_positions(self, internal: dict, venue: dict) -> List[ReconciliationMismatchEvent]:
+        out: List[ReconciliationMismatchEvent] = []
         for sym, vpos in venue.items():
             if sym not in internal and Decimal(str(vpos["quantity"])) > 0:
                 out.append(ReconciliationMismatchEvent(
@@ -106,8 +122,6 @@ class Reconciler:
                     internal="0", exchange=str(vpos["quantity"]),
                     detail="venue position missing internally",
                 ))
-
-        out.extend(self._reconcile_protective_orders(snap, venue))
         return out
 
     # ── protective-order reconciliation (F1) ──────────────────────────────────
@@ -118,10 +132,16 @@ class Reconciler:
         * Open order tied to no internal position -> cancel it (orphan).
         Repairs do not trip the kill switch (``repaired=True``).
         """
-        out: List[ReconciliationMismatchEvent] = []
         open_ids = {str(o.get("exchange_order_id")) for o in snap.open_orders if o.get("exchange_order_id")}
         tracked_ids: set = set()
 
+        out: List[ReconciliationMismatchEvent] = []
+        out.extend(self._sync_protective_stops(venue, open_ids, tracked_ids))
+        out.extend(self._cancel_orphan_orders(snap, tracked_ids))
+        return out
+
+    def _sync_protective_stops(self, venue: dict, open_ids: set, tracked_ids: set) -> List[ReconciliationMismatchEvent]:
+        out: List[ReconciliationMismatchEvent] = []
         for sym, pos in self.wallet.positions.items():
             if getattr(pos, "status", "") != "OPEN":
                 continue
@@ -140,8 +160,10 @@ class Reconciler:
                     repaired=bool(replaced),
                     detail="venue protective stop missing; re-placed" if replaced else "venue protective stop missing; re-place failed",
                 ))
+        return out
 
-        # Orphan orders: open on the venue, not one of ours, no internal position.
+    def _cancel_orphan_orders(self, snap: AccountSnapshot, tracked_ids: set) -> List[ReconciliationMismatchEvent]:
+        out: List[ReconciliationMismatchEvent] = []
         internal_syms = {s for s, p in self.wallet.positions.items() if getattr(p, "status", "") == "OPEN"}
         for o in snap.open_orders:
             oid = str(o.get("exchange_order_id") or "")
@@ -161,6 +183,7 @@ class Reconciler:
                     detail="venue order with no internal position; cancelled" if ok else "orphan order; cancel failed",
                 ))
         return out
+
 
     def _internal_positions(self) -> dict:
         result = {}

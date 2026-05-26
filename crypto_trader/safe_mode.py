@@ -45,13 +45,25 @@ def order_execution_enabled() -> bool:
     return _env_true_default(PLACE_ORDER_ENV, True)
 
 
+def _has_halt_file() -> bool:
+    return HALT_FILE.exists()
+
+
+def _is_live_env_enabled() -> bool:
+    return _env_true(LIVE_ENV_VAR)
+
+
+def _is_ack_phrase_correct() -> bool:
+    return os.getenv(ACK_ENV_VAR, "") == ACK_PHRASE
+
+
 def is_live_enabled() -> bool:
     """Returns True only if every gate is open."""
-    if HALT_FILE.exists():
+    if _has_halt_file():
         return False
-    if not _env_true(LIVE_ENV_VAR):
+    if not _is_live_env_enabled():
         return False
-    if os.getenv(ACK_ENV_VAR, "") != ACK_PHRASE:
+    if not _is_ack_phrase_correct():
         return False
     return True
 
@@ -76,11 +88,11 @@ def assert_live_allowed(
         reasons.append(f"env {PLACE_ORDER_ENV}=false (read-only live mode — no order execution)")
     if not constructor_ack:
         reasons.append(f"constructor flag i_understand_real_money not set on {venue}ExecutionEngine")
-    if not _env_true(LIVE_ENV_VAR):
+    if not _is_live_env_enabled():
         reasons.append(f"env {LIVE_ENV_VAR} != true")
-    if os.getenv(ACK_ENV_VAR, "") != ACK_PHRASE:
+    if not _is_ack_phrase_correct():
         reasons.append(f"env {ACK_ENV_VAR} != '{ACK_PHRASE}'")
-    if HALT_FILE.exists():
+    if _has_halt_file():
         reasons.append(f"HALT file present at {HALT_FILE}")
 
     if reasons:
@@ -94,6 +106,7 @@ def assert_live_allowed(
     logger.warning(
         "LIVE %s on %s symbol=%s — gate OPEN, sending to exchange", op, venue, symbol
     )
+
 
 
 def trip_halt(reason: str = "manual") -> None:

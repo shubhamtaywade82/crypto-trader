@@ -77,15 +77,22 @@ class OrderLifecycle:
         self.state = state
 
     def transition(self, target: OrderState) -> OrderState:
-        if self.state == target and target == OrderState.PARTIAL:
+        if self._is_repeated_partial_fill(target):
             return self.state  # repeated partial fills are allowed
-        if not can_transition(self.state, target):
+        if not self._can_transition_to(target):
             raise InvalidTransition(
                 f"{self.client_order_id}: illegal {self.state.value} -> {target.value}"
             )
         self.state = target
         return self.state
 
+    def _is_repeated_partial_fill(self, target: OrderState) -> bool:
+        return self.state == OrderState.PARTIAL and target == OrderState.PARTIAL
+
+    def _can_transition_to(self, target: OrderState) -> bool:
+        return can_transition(self.state, target)
+
     @property
     def terminal(self) -> bool:
         return is_terminal(self.state)
+
