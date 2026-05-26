@@ -6,7 +6,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 
 ## 🏗️ High-Level Architecture
 
-```
+```text
 [ Market Data ] ─────▶ [ Strategy Engine ] ─────▶ [ Redis Streams ]
 (Binance WS)           (Regime/SMC Analysis)       (Signal Queue)
                                                           │
@@ -30,7 +30,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 | :------------------- | :------------------------------------------------------- |
 | `crypto_trader/`     | Core Python package (Engines, Exchanges, Risk, Storage). |
 | `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
-| `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `test_ui`).  |
+| `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `start`, `test_ui`). |
 | `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382).   |
 | `docs/`              | Detailed architectural deep-dives.                       |
 
@@ -128,8 +128,8 @@ Antigravity is built for capital preservation through multiple layers of defense
 - **G1 Clock Skew:** Warnings/Halts if local clock drifts from venue (>2000ms).
 - **G2 Velocity Breaker:** Limits order frequency (default: 6 orders/min).
 - **G3 Thread Supervisor:** Halts the engine if WebSocket or Position Manager threads die.
-- **G4 Authoritative Margin Guard:** Instant kill-switch if CoinDCX `margin_ratio_cross` exceeds 80%.
-- **G5 Strict Reconciliation:** Optional cancel-all-on-desync behavior.
+- **G4 Authoritative Margin Guard:** Instant kill-switch if CoinDCX `margin_ratio_cross` exceeds config limit (default 80%).
+- **G5 Strict Reconciliation:** Reconciles real exchange positions against event-sourced wallet; optional cancel-all-on-desync behavior.
 
 ### Hardened Features (F)
 
@@ -172,8 +172,8 @@ This will open positions in your paper wallet and you will see them appear insta
 | `MAX_LEVERAGE`     | `2`       | Hard leverage cap (Max 2x for safety).      |
 | `MAX_DAILY_TRADES` | `2`       | Daily safety limit for trades.              |
 | `MAX_MARGIN_RATIO` | `0.80`    | Exchange liquidation guard threshold.       |
-| `DATABASE_URL`     | `:5435`   | Postgres connection string.                 |
-| `REDIS_URL`        | `:6382`   | Redis connection string.                    |
+| `DATABASE_URL`     | `postgresql://trader:trader@localhost:5435/crypto_trader` | Postgres connection string. |
+| `REDIS_URL`        | `redis://localhost:6382/0`   | Redis connection string. |
 
 ---
 

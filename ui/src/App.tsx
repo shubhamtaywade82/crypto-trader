@@ -1,4 +1,6 @@
 import { createSignal, For, onMount, onCleanup, createEffect, Show } from 'solid-js';
+import { createChart, CandlestickSeries, HistogramSeries } from 'lightweight-charts';
+import type { IChartApi, ISeriesApi, UTCTimestamp, IPriceLine } from 'lightweight-charts';
 import './App.css';
 
 // ── types & interfaces ──────────────────────────────────────────────────────
@@ -113,8 +115,13 @@ function App() {
   const [timeframe, setTimeframe] = createSignal<string>("5m");
   const [chartData, setChartData] = createSignal<Candle[]>([]);
   const [hoveredCandle, setHoveredCandle] = createSignal<Candle | null>(null);
-  const [crosshairPos, setCrosshairPos] = createSignal<{ x: number; y: number } | null>(null);
   const [activeTab, setActiveTab] = createSignal<"positions" | "orders" | "fills" | "logs">("positions");
+
+  let chartContainerRef: HTMLDivElement | undefined;
+  let chartInstance: IChartApi | undefined;
+  let candleSeries: ISeriesApi<"Candlestick"> | undefined;
+  let volumeSeries: ISeriesApi<"Histogram"> | undefined;
+  let activePriceLine: IPriceLine | undefined;
 
   // Order placement state
   const [orderSide, setOrderSide] = createSignal<"buy" | "sell">("buy");
@@ -780,138 +787,187 @@ function App() {
   const realizedBalance = () => accountBalance();
   const equity = () => realizedBalance() + unrealizedPnL();
 
-  const renderChartSVG = () => {
-    const data = chartData();
-    const count = data.length;
-    if (count === 0) return null;
-    
-    // Layout Dimensions
-    const svgWidth = 800;
-    const svgHeight = 350;
-    const rightMargin = 60;
-    const bottomMargin = 25;
-    const volumeHeight = 50;
+  // Initialize TradingView Lightweight Charts on mount
+  onMount(() => {
+    if (!chartContainerRef) return;
 
-    const chartWidth = svgWidth - rightMargin;
-    const chartHeight = svgHeight - bottomMargin;
-
-    // Scales & Price Bounds
-    const prices = data.flatMap(c => [c.high, c.low]);
-    const maxPrice = Math.max(...prices) * 1.002;
-    const minPrice = Math.min(...prices) * 0.998;
-    const priceRange = maxPrice - minPrice || 1;
-
-    const getX = (idx: number) => (idx / (count - 1)) * chartWidth;
-    const getY = (price: number) => chartHeight - ((price - minPrice) / priceRange) * (chartHeight - 30) - 15;
-
-    const maxVol = Math.max(...data.map(c => c.volume)) || 1;
-    const getVolHeight = (vol: number) => (vol / maxVol) * volumeHeight;
-
-    // Horizontal grid lines
-    const numGridLines = 5;
-    const gridLines = Array.from({ length: numGridLines }, (_, i) => {
-      const priceVal = minPrice + (priceRange / (numGridLines - 1)) * i;
-      const y = getY(priceVal);
-      return { y, price: priceVal };
+    // Create the lightweight chart instance
+    chartInstance = createChart(chartContainerRef, {
+      layout: {
+        background: { color: '#0b0e14' },
+        textColor: '#94a3b8',
+        fontSize: 11,
+        fontFamily: "Inter, system-ui, sans-serif",
+      },
+      grid: {
+        vertLines: { color: '#161c28', style: 1 },
+        horzLines: { color: '#161c28', style: 1 },
+      },
+      crosshair: {
+        mode: 1, // Normal crosshair
+        vertLine: {
+          color: '#3b82f6',
+          width: 1,
+          style: 3, // Dotted
+          labelBackgroundColor: '#1e293b',
+        },
+        horzLine: {
+          color: '#3b82f6',
+          width: 1,
+          style: 3, // Dotted
+          labelBackgroundColor: '#3b82f6',
+        },
+      },
+      rightPriceScale: {
+        borderColor: '#1b2230',
+        scaleMargins: {
+          top: 0.1,
+          bottom: 0.25,
+        },
+      },
+      timeScale: {
+        borderColor: '#1b2230',
+        timeVisible: true,
+        secondsVisible: false,
+      },
     });
 
-    // Render path for Moving Average SMA 20
-    const maPoints = data
-      .map((c, idx) => (c.ma ? `${getX(idx).toFixed(1)},${getY(c.ma).toFixed(1)}` : ""))
-      .filter(Boolean)
-      .join(" ");
+    // Add Candlestick Series using lightweight-charts v5 addSeries API
+    candleSeries = chartInstance.addSeries(CandlestickSeries, {
+      upColor: '#00e676',
+      downColor: '#ff3d00',
+      borderUpColor: '#00e676',
+      borderDownColor: '#ff3d00',
+      wickUpColor: '#00e676',
+      wickDownColor: '#ff3d00',
+    });
 
-    return (
-      <svg class="chart-svg" viewBox={`0 0 ${svgWidth} ${svgHeight}`} preserveAspectRatio="none">
-        {/* Grid Lines */}
-        <For each={gridLines}>
-          {(grid) => (
-            <>
-              <line class="grid-line" x1="0" y1={grid.y} x2={chartWidth} y2={grid.y} />
-              <text class="axis-text" x={chartWidth + 5} y={grid.y + 3}>
-                {grid.price.toFixed(selectedSymbol().includes("XRP") ? 4 : 2)}
-              </text>
-            </>
-          )}
-        </For>
+    // Add Volume Series overlay using lightweight-charts v5 addSeries API
+    volumeSeries = chartInstance.addSeries(HistogramSeries, {
+      priceFormat: {
+        type: 'volume',
+      },
+      priceScaleId: '', // Overlay pane
+    });
 
-        {/* Moving Average Line */}
-        <Show when={maPoints}>
-          <path class="ma-line" d={`M ${maPoints}`} />
-        </Show>
+    volumeSeries?.priceScale().applyOptions({
+      scaleMargins: {
+        top: 0.8, // 80% from top (overlay at bottom 20%)
+        bottom: 0,
+      },
+    });
 
-        {/* Candlesticks & Volumes */}
-        <For each={data}>
-          {(c, idx) => {
-            const x = getX(idx());
-            const yOpen = getY(c.open);
-            const yClose = getY(c.close);
-            const yHigh = getY(c.high);
-            const yLow = getY(c.low);
-            
-            const candleColorClass = c.close >= c.open ? "up" : "down";
-            const candleWidth = Math.max(3, (chartWidth / count) - 2);
+    // ResizeObserver to resize chart dynamically
+    const resizeObserver = new ResizeObserver((entries) => {
+      if (entries.length === 0 || !chartInstance) return;
+      const { width, height } = entries[0].contentRect;
+      chartInstance.resize(width, height);
+    });
 
-            // Volume bar params
-            const vHeight = getVolHeight(c.volume);
-            const vY = chartHeight - vHeight;
+    resizeObserver.observe(chartContainerRef);
 
-            return (
-              <g>
-                {/* Wick */}
-                <line 
-                  class={`candle-wick ${candleColorClass}`} 
-                  x1={x} y1={yHigh} 
-                  x2={x} y2={yLow} 
-                />
-                {/* Candle Body */}
-                <rect 
-                  class={`candle-body ${candleColorClass}`}
-                  x={x - candleWidth / 2} 
-                  y={Math.min(yOpen, yClose)} 
-                  width={candleWidth} 
-                  height={Math.max(1.5, Math.abs(yOpen - yClose))} 
-                />
-                {/* Volume Bar */}
-                <rect 
-                  class={`volume-bar ${candleColorClass}`}
-                  x={x - candleWidth / 2}
-                  y={vY}
-                  width={candleWidth}
-                  height={vHeight}
-                />
-              </g>
-            );
-          }}
-        </For>
+    // Crosshair movement listener to update HUD details
+    chartInstance.subscribeCrosshairMove((param) => {
+      if (!param || !param.time || param.point === undefined || !candleSeries || !volumeSeries) {
+        setHoveredCandle(null);
+        return;
+      }
 
-        {/* Crosshair guidelines */}
-        <Show when={crosshairPos()}>
-          {(pos) => {
-            // Draw crosshair at target client coordinates
-            return (
-              <g pointer-events="none">
-                <line class="crosshair-line" x1={pos().x} y1="0" x2={pos().x} y2={chartHeight} />
-                <line class="crosshair-line" x1="0" y1={pos().y} x2={chartWidth} y2={pos().y} />
-                
-                {/* Y-axis hovering price box */}
-                <rect x={chartWidth} y={pos().y - 8} width={60} height={16} fill="#3b82f6" rx="2" />
-                <text 
-                  x={chartWidth + 5} 
-                  y={pos().y + 3} 
-                  fill="#ffffff" 
-                  font-family="monospace" 
-                  font-size="9"
-                >
-                  {(maxPrice - ((pos().y / chartHeight) * priceRange)).toFixed(selectedSymbol().includes("XRP") ? 4 : 2)}
-                </text>
-              </g>
-            );
-          }}
-        </Show>
-      </svg>
-    );
-  };
+      const rawCandle = param.seriesData.get(candleSeries);
+      const rawVolumeObj = param.seriesData.get(volumeSeries);
+
+      if (rawCandle) {
+        const candleData = rawCandle as any;
+        const volumeData = rawVolumeObj as any;
+        
+        setHoveredCandle({
+          time: Number(param.time) * 1000,
+          open: Number(candleData.open),
+          high: Number(candleData.high),
+          low: Number(candleData.low),
+          close: Number(candleData.close),
+          volume: volumeData ? Number(volumeData.value) : 0,
+        });
+      } else {
+        setHoveredCandle(null);
+      }
+    });
+
+    onCleanup(() => {
+      resizeObserver.disconnect();
+      if (chartInstance) {
+        chartInstance.remove();
+        chartInstance = undefined;
+        candleSeries = undefined;
+        volumeSeries = undefined;
+      }
+    });
+  });
+
+  // Track the last loaded symbol and interval to fit content only on change
+  let lastSymbolAndTf = "";
+
+  // Sync historical & real-time klines with chart series
+  createEffect(() => {
+    const data = chartData();
+    const sym = selectedSymbol();
+    const tf = timeframe();
+    
+    if (!candleSeries || !volumeSeries || data.length === 0) return;
+
+    // Convert millisecond timestamps to second timestamps for lightweight-charts
+    const formattedCandles = data.map((c) => ({
+      time: (c.time / 1000) as UTCTimestamp,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }));
+
+    const formattedVolume = data.map((c) => ({
+      time: (c.time / 1000) as UTCTimestamp,
+      value: c.volume,
+      color: c.close >= c.open ? 'rgba(0, 230, 118, 0.25)' : 'rgba(255, 61, 0, 0.25)',
+    }));
+
+    candleSeries.setData(formattedCandles);
+    volumeSeries.setData(formattedVolume);
+
+    const currentKey = `${sym}-${tf}`;
+    if (currentKey !== lastSymbolAndTf) {
+      chartInstance?.timeScale().fitContent();
+      lastSymbolAndTf = currentKey;
+    }
+  });
+
+  // Dynamically render active position average entry price line
+  createEffect(() => {
+    const sym = selectedSymbol();
+    const posList = positions();
+    
+    if (!candleSeries) return;
+
+    if (activePriceLine) {
+      candleSeries.removePriceLine(activePriceLine);
+      activePriceLine = undefined;
+    }
+
+    const activePos = posList.find(p => p.symbol === sym && p.status.toUpperCase() === "OPEN");
+
+    if (activePos && activePos.avg_price > 0) {
+      const isLong = activePos.side.toLowerCase() === "buy" || activePos.side.toLowerCase() === "long";
+      const lineConfig = {
+        price: activePos.avg_price,
+        color: isLong ? '#00e676' : '#ff3d00',
+        lineWidth: 1.5 as any,
+        lineStyle: 2, // Dashed
+        axisLabelVisible: true,
+        title: `POSITION (${activePos.side.toUpperCase()}) - ${activePos.qty} qty`,
+      };
+      
+      activePriceLine = candleSeries.createPriceLine(lineConfig);
+    }
+  });
 
   // Selected symbol ticker helper
   const selectedTicker = () => watchlist().find(w => w.symbol === selectedSymbol()) || watchlist()[0];
@@ -1117,28 +1173,7 @@ function App() {
             </div>
 
             {/* Interactive SVG Chart Canvas */}
-            <div 
-              class="chart-draw-area"
-              onMouseMove={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const x = e.clientX - rect.left;
-                const y = e.clientY - rect.top;
-                setCrosshairPos({ x, y });
-
-                // Find nearest candle
-                const numCandles = chartData().length;
-                if (numCandles > 0) {
-                  const chartWidth = rect.width - 60; // 60px right margin for y-axis
-                  const candleWidth = chartWidth / numCandles;
-                  const idx = Math.min(numCandles - 1, Math.max(0, Math.floor(x / candleWidth)));
-                  setHoveredCandle(chartData()[idx]);
-                }
-              }}
-              onMouseLeave={() => {
-                setCrosshairPos(null);
-                setHoveredCandle(null);
-              }}
-            >
+            <div class="chart-draw-area" style="position: relative;">
               {/* Chart HUD */}
               <div class="hud-overlay">
                 <Show when={hoveredCandle() || chartData()[chartData().length - 1]} fallback={<span>Loading Chart Data...</span>}>
@@ -1154,10 +1189,18 @@ function App() {
                 </Show>
               </div>
 
-              {/* SVG Layout */}
-              <Show when={chartData().length > 0} fallback={<div class="empty-row-state">Loading Chart Data...</div>}>
-                {renderChartSVG()}
+              {/* Fallback Loader */}
+              <Show when={chartData().length === 0}>
+                <div class="empty-row-state" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 10;">
+                  Loading Chart Data...
+                </div>
               </Show>
+
+              {/* Lightweight Chart Container */}
+              <div 
+                ref={chartContainerRef} 
+                style="width: 100%; height: 100%; position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 1;"
+              ></div>
             </div>
           </section>
 
