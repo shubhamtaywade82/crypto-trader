@@ -23,13 +23,18 @@ engine_live (writer)                       FastAPI service (reader)        Solid
 
 ## Endpoints
 
+All `/api/*` endpoints require a bearer token when `API_DASHBOARD_TOKEN` is set (see
+**Config** below). Pass `Authorization: Bearer <token>` in the request header. If the
+env var is empty, auth is skipped (local dev mode).
+
 | Endpoint | Description |
 |---|---|
 | `GET /` | The built SolidJS app (or a JSON placeholder if not built yet) |
 | `GET /api/health` | DB status + bot heartbeat age + mode |
+| `GET /api/watchlist` | Active symbol watchlist loaded from config |
 | `GET /api/positions?mode=` | Open positions (`mode` = `live`/`paper`, omit for all) |
-| `GET /api/orders?mode=&limit=` | Recent orders |
-| `GET /api/fills?mode=&limit=` | Recent fills |
+| `GET /api/orders?mode=&limit=` | Recent orders (`limit` bounded 1–500, default 50) |
+| `GET /api/fills?mode=&limit=` | Recent fills (`limit` bounded 1–500, default 50) |
 | `GET /api/pnl?mode=` | Per-mode fills/fees/volume rollup |
 | `GET /api/stream` | SSE: realtime bot events relayed from Redis |
 
@@ -73,6 +78,8 @@ into the Python image, so the dashboard image serves the UI with no extra steps.
 | Env var | Default | Meaning |
 |---|---|---|
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8000` | Bind address/port |
+| `API_DASHBOARD_TOKEN` | `` (empty) | Bearer token for all `/api/*` routes. Empty = no auth (dev). |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins (e.g. `http://localhost:3030,https://my.domain`). |
 | `UI_EVENTS_ENABLED` | `true` | Bot publishes events to Redis for the UI |
 | `UI_EVENTS_CHANNEL` | `events:ui` | Redis pub/sub channel |
 | `PROJECTION_ENABLED` | `false` | Bot must populate the read-model the UI reads |
@@ -81,8 +88,13 @@ into the Python image, so the dashboard image serves the UI with no extra steps.
 ## Security
 
 - **Read-only** — no trade-mutating endpoints exist.
-- **No auth** (per spec). It binds `0.0.0.0` for container access; do **not** expose
-  it to the public internet without putting it behind auth/TLS (e.g. a reverse proxy).
+- **Bearer token auth** — set `API_DASHBOARD_TOKEN=your_secret` in `.env` to protect all
+  `/api/*` routes. When set, requests without a matching `Authorization: Bearer <token>`
+  header receive `401 Unauthorized`. Leave unset for unauthenticated local dev access.
+- **CORS** — configurable via `ALLOWED_ORIGINS` (comma-separated). Defaults to `*`
+  (open) for local dev; restrict to specific origins for production deployments.
+- Binds `0.0.0.0` for container access — always put behind TLS/reverse proxy when
+  exposed beyond localhost.
 
 ## Files
 - API: `crypto_trader/api/app.py`, `repo.py`, `events_bridge.py`

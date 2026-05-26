@@ -7,11 +7,21 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 ## 🏗️ High-Level Architecture
 
 ```text
-[ Market Data ] ─────▶ [ Strategy Engine ] ─────▶ [ Redis Streams ]
-(Binance WS)           (Regime/SMC Analysis)       (Signal Queue)
-                                                          │
-[ SolidJS UI ] ◀────── [ FastAPI Bridge ] ◀───── [ Execution Consumer ]
-(Live Dashboard)       (SSE/Broadcast)             (CoinDCX Execution)
+[ Binance WS ] ──▶ [ WebSocketTradingEngine ]
+                        │
+                        ├──▶ [ Regime Classifier ] ──▶ [ Playbook Registry ]
+                        │                                    │
+                        ├──▶ [ AI Advisory Router ] ◀───────┘
+                        │    (cloud: qwen3.5 / local fallback)
+                        │
+                        ▼
+                   [ Signal Bus ] ──▶ [ Redis Streams ]
+                                           │
+[ SolidJS UI ] ◀── [ FastAPI Dashboard ] ◀── [ Execution Consumer ]
+                    (bearer token auth)         (CoinDCX Execution)
+                                               │
+                                        [ Postgres ]
+                                   (events · wallet · arb)
 ```
 
 ### Core Components
@@ -20,7 +30,9 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 - **Decoupled Pipeline:** Redis Streams provide at-least-once delivery, crash recovery (PEL), and worker idempotency.
 - **Event-Sourced Wallet:** Comprehensive position lifecycle tracking with 1% TDS accounting (F2), venue-resident stops (F1), and partial close support.
 - **Relational Read-Model:** Postgres Projections transform JSONB events into queryable tables for the UI and analytics.
-- **AI Fusion (Optional):** Optional Ollama/LLM advisory layer for signal sentiment filtering.
+- **AI Advisory Subsystem:** Structured `crypto_trader/ai/` module with cloud/local adaptive routing
+  (cloud-first for swing, local for intraday), SHA-256 disk cache, Pydantic-validated output schema,
+  hard safety gates, and JSONL telemetry. Backed by Ollama's qwen3.5 family.
 
 ---
 
@@ -29,6 +41,9 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 | Directory / File     | Description                                              |
 | :------------------- | :------------------------------------------------------- |
 | `crypto_trader/`     | Core Python package (Engines, Exchanges, Risk, Storage). |
+| `crypto_trader/ai/`  | AI advisory subsystem: router, providers (cloud/local), cache, telemetry, validators, prompts. |
+| `crypto_trader/infra/` | Shared infrastructure: `event_routing.py` (wallet event sink factory). |
+| `crypto_trader/storage/` | Persistence adapters: Postgres event store, wallet store, projection. |
 | `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
 | `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `start`, `test_ui`). |
 | `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382).   |
@@ -111,11 +126,8 @@ Orders are blocked unless ALL hold: `LIVE_TRADING_ENABLED=true` **and** the exac
 | Clear kill-switch + loss streak (after review) | `./bin/clear_risk`                       |
 | Telegram (if configured)                       | `/kill` · `/resume` · `/status` · `/pnl` |
 
-> ⚠️ Known gaps before public/live deploy: Telegram `/kill` has **no sender allowlist**;
-> the dashboard API binds `0.0.0.0` with open CORS and no auth; do **not** set
-> `EXECUTION_BUS=redis` in `docker-compose` yet (the `bot` and `execution-worker`
-> services share one consumer group and would split entries across two wallets).
-> `./bin/bot` / `./bin/start` (multi_engine) use the in-process direct path and are unaffected.
+> **Dashboard Security:** Set `API_DASHBOARD_TOKEN=your_secret` in `.env` to enable
+> bearer-token authentication on all `/api/*` routes. Leave unset for local dev (auth skipped).
 
 ---
 
@@ -138,6 +150,37 @@ Antigravity is built for capital preservation through multiple layers of defense
 - **F3 Basis Guard:** Rejects entries if Binance/CoinDCX prices diverge beyond threshold.
 - **F4 Execution Degradation:** Realistic paper-trading model with spread penalties.
 - **F5 User Stream:** Real-time authoritative fill/balance reconciliation.
+
+---
+
+## 🔌 Adding New Strategies
+
+Strategies implement `BasePlaybook` (a structural Protocol in `crypto_trader/playbooks.py`):
+
+```python
+class MyPlaybook:
+    name = "playbook_my"  # registry key
+
+    def evaluate(self, df_1h, regime, structure=None):
+        # Return a setup dict or None
+        ...
+```
+
+Register it in `WebSocketTradingEngine.__init__`:
+
+```python
+self.playbook_my = MyPlaybook()
+# Add to _playbook_registry:
+self._playbook_registry["playbook_my"] = self.playbook_my
+```
+
+Wire it to regimes in `_REGIME_STRATEGY_MAP`:
+
+```python
+ExtendedRegime.TREND_EXPANSION: ["playbook_a", "playbook_b", "playbook_my"],
+```
+
+No engine code changes required beyond these three lines.
 
 ---
 
@@ -165,15 +208,21 @@ This will open positions in your paper wallet and you will see them appear insta
 
 ## ⚙️ Configuration (.env)
 
-| Variable           | Default   | Description                                 |
-| :----------------- | :-------- | :------------------------------------------ |
-| `MODE`             | `paper`   | `paper` (simulated) or `live` (CoinDCX).    |
-| `TRADE_SYMBOL`     | `SOLUSDT` | Active symbol for the single-engine runner. |
-| `MAX_LEVERAGE`     | `2`       | Hard leverage cap (Max 2x for safety).      |
-| `MAX_DAILY_TRADES` | `2`       | Daily safety limit for trades.              |
-| `MAX_MARGIN_RATIO` | `0.80`    | Exchange liquidation guard threshold.       |
-| `DATABASE_URL`     | `postgresql://trader:trader@localhost:5435/crypto_trader` | Postgres connection string. |
-| `REDIS_URL`        | `redis://localhost:6382/0`   | Redis connection string. |
+| Variable               | Default                                                   | Description                                                              |
+| :--------------------- | :-------------------------------------------------------- | :----------------------------------------------------------------------- |
+| `MODE`                 | `paper`                                                   | `paper` (simulated) or `live` (CoinDCX).                                 |
+| `TRADE_SYMBOL`         | `SOLUSDT`                                                 | Active symbol for the single-engine runner.                              |
+| `MAX_LEVERAGE`         | `2`                                                       | Hard leverage cap (Max 2x for safety).                                   |
+| `MAX_DAILY_TRADES`     | `2`                                                       | Daily safety limit for trades.                                           |
+| `MAX_MARGIN_RATIO`     | `0.80`                                                    | Exchange liquidation guard threshold.                                    |
+| `DATABASE_URL`         | `postgresql://trader:trader@localhost:5435/crypto_trader` | **Required.** Postgres for event store, wallet, and arb persistence.    |
+| `REDIS_URL`            | `redis://localhost:6382/0`                                | Redis connection string.                                                 |
+| `API_DASHBOARD_TOKEN`  | _(empty)_                                                 | Bearer token for dashboard API auth. Empty = no auth (dev).             |
+| `ALLOWED_ORIGINS`      | `*`                                                       | Comma-separated CORS origins for dashboard API.                          |
+| `OLLAMA_CLOUD_API_KEY` | _(empty)_                                                 | Ollama Cloud API key — enables cloud routing for swing-mode analysis.   |
+| `CLOUD_OLLAMA_MODEL`   | `qwen3.5:cloud`                                           | Cloud model for deep analysis.                                           |
+| `OLLAMA_MODEL`         | `qwen3.5:4b`                                              | Local Ollama model for intraday reasoning.                               |
+| `USE_CLOUD_LLM`        | `false`                                                   | Force all LLM calls to cloud (overrides adaptive routing).               |
 
 ---
 

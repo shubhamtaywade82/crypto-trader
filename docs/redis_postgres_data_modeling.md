@@ -33,7 +33,50 @@ snapshots(id BIGSERIAL PK, ts BIGINT, state JSONB)
 Current state is a projection of `events`; the wallet's `PortfolioReducer`
 replays them, and the reconciler injects correction events.
 
-### 1b. Relational projection (read-model) — new
+### 1b. Wallet persistence tables — new
+
+`crypto_trader/storage/wallet_store.py` (`WalletStore`) provides a dual-backend
+adapter (Postgres when `DATABASE_URL` is set; SQLite WAL otherwise) that persists
+domain events from `EnhancedFuturesWallet`. All tables live in the same `DATABASE_URL`
+database as the event store.
+
+**Postgres table names** (SQLite uses the same names without the `wallet_` prefix for
+backward compatibility):
+
+```sql
+-- Append-only audit log of all wallet domain events (ORDER_CREATED, POSITION_OPENED, etc.)
+wallet_events(id BIGSERIAL PK, ts BIGINT, event_type TEXT, symbol TEXT, namespace TEXT, payload_json TEXT)
+
+-- Order lifecycle: created → filled/cancelled/rejected/expired
+wallet_orders(order_id TEXT PK, symbol TEXT, side TEXT, order_type TEXT,
+              quantity TEXT, filled_quantity TEXT, avg_fill_price TEXT, status TEXT,
+              reduce_only BOOL, trigger_price TEXT, limit_price TEXT, expires_at BIGINT, updated_ts BIGINT)
+
+-- Fill records (one row per partial or full fill)
+wallet_fills(id BIGSERIAL PK, order_id TEXT, symbol TEXT, side TEXT,
+             quantity TEXT, fill_price TEXT, fee TEXT, ts BIGINT, sequence INT)
+
+-- Funding payments (periodic credits/debits)
+wallet_funding(id BIGSERIAL PK, symbol TEXT, rate TEXT, notional TEXT, amount TEXT, ts BIGINT)
+
+-- Fee charges (maker/taker, TDS, etc.)
+wallet_fees(id BIGSERIAL PK, symbol TEXT, reason TEXT, amount TEXT, ts BIGINT)
+
+-- Periodic wallet snapshots for fast bootstrap (latest 10 retained)
+wallet_snapshots(id BIGSERIAL PK, ts BIGINT, wallet_balance TEXT, realized_pnl_total TEXT, state_json TEXT)
+
+-- Arbitrage event journal
+arb_events(seq BIGSERIAL PK, ts BIGINT, arb_id TEXT, event_type TEXT, payload TEXT)
+
+-- Current state of each arb position (keyed by arb_id)
+arb_positions(arb_id TEXT PK, symbol TEXT, state TEXT, snapshot TEXT, updated_ts BIGINT)
+```
+
+All tables are created on first boot via `WalletStore.init_schema()` and are
+idempotent (`CREATE TABLE IF NOT EXISTS`). The wallet store is wired automatically
+when `DATABASE_URL` is set; no additional config flags required.
+
+### 1c. Relational projection (read-model) — new
 
 `crypto_trader/storage/projection.py` derives query-friendly tables from the
 event stream so a UI can run plain SQL instead of replaying JSONB. It is a
@@ -115,7 +158,7 @@ A projection failure is logged, never fatal — it's a derived view.
 | `SIGNAL_MAX_DELIVERIES` | `3` | Retries before a signal is DLQ'd |
 | `IDEMPOTENCY_TTL_SECONDS` | `300` | Duplicate-suppression window |
 | `PROJECTION_ENABLED` | `false` | Materialize the relational read-model (needs `DATABASE_URL`) |
-| `DATABASE_URL` | _(unset → SQLite dev)_ | Postgres DSN for the event store + projection |
+| `DATABASE_URL` | `postgresql://trader:trader@localhost:5435/crypto_trader` | **Required.** Postgres DSN for the event store, wallet tables, arb tables, and projection. Falls back to SQLite dev mode when unset. |
 
 `config.redis_enabled` is True only when `EXECUTION_BUS=redis` **and** `REDIS_URL` is set.
 
