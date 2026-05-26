@@ -24,6 +24,10 @@ echo "--- Starting Infrastructure (Postgres, Redis) ---"
 docker compose up -d postgres redis
 docker compose ps
 
+# Pre-emptive cleanup of any orphaned backend processes
+pkill -f "python3 -m crypto_trader.execution.run_consumer" || true
+pkill -f "python3 -m crypto_trader.api_service" || true
+
 # 2. Start Execution Consumer
 echo "--- Starting Execution Consumer (Background) ---"
 rm -f consumer.log

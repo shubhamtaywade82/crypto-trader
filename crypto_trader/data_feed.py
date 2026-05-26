@@ -94,7 +94,10 @@ class BinanceDataFeed:
             except requests.HTTPError as e:
                 if e.response.status_code in (418, 429):
                     continue  # Already handled above
-                logger.error(f"HTTP error: {e}")
+                if e.response.status_code in (401, 403):
+                    logger.debug(f"HTTP unauthorized/forbidden: {e}")
+                else:
+                    logger.error(f"HTTP error: {e}")
                 raise
 
             except Exception as e:

@@ -27,16 +27,29 @@ logger = logging.getLogger("multi_engine")
 def acquire_lock():
     """Acquire a file lock to prevent multiple instances."""
     lock_file = "/tmp/crypto_trader_multi_engine.lock"
-    lock_fd = open(lock_file, "w")
+    
+    # Try to open/create the file
+    mode = "r+" if os.path.exists(lock_file) else "w+"
+    lock_fd = open(lock_file, mode)
+
     try:
         fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        # Write PID to lock file
+        # Got the lock! Write current PID.
+        lock_fd.seek(0)
+        lock_fd.truncate()
         lock_fd.write(str(os.getpid()))
         lock_fd.flush()
         return lock_fd
     except IOError:
-        print(f"\nERROR: Another instance of multi_engine is already running (check {lock_file}).")
-        print("Please stop the existing instance before starting a new one.")
+        # Failed to get lock. Try to read PID from file.
+        lock_fd.seek(0)
+        existing_pid = lock_fd.read().strip()
+        print(f"\nERROR: Another instance of multi_engine is already running.")
+        if existing_pid:
+            print(f"Existing PID: {existing_pid} (check lock file {lock_file})")
+            print(f"Please stop it with: kill {existing_pid}")
+        else:
+            print(f"Check lock file {lock_file}")
         sys.exit(1)
 
 from pathlib import Path

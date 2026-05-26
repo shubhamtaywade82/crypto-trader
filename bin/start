@@ -26,6 +26,9 @@ echo "--- Infrastructure (Postgres, Redis) ---"
 docker compose up -d postgres redis
 docker compose ps
 
+# Pre-emptive cleanup of any orphaned engine processes to avoid lock-file errors
+pkill -f "python3 -m crypto_trader.multi_engine" || true
+
 echo "--- Dashboard API (background) on :8088 ---"
 rm -f api.log
 python3 -m crypto_trader.api_service --port 8088 > api.log 2>&1 &
