@@ -132,3 +132,31 @@ def test_bias_factor():
     assert E._bias_factor(PositionSide.SHORT, _Advice("long_only")) < 1.0
     assert E._bias_factor(PositionSide.LONG, _Advice("short_only")) < 1.0
     assert E._bias_factor(PositionSide.LONG, _Advice("none")) < 1.0
+
+
+# ── Part 4: maker-limit entry (paper simulation) ──
+
+def test_maker_limit_paper_fills_at_signal_price_with_maker_fee():
+    """A maker-limit entry in paper mode fills exactly at the signal price (no
+    spread/collar penalty) and pays the maker fee, unlike a market entry."""
+    import uuid
+    from decimal import Decimal
+    from crypto_trader.wallet import DATA_DIR, EnhancedFuturesWallet, Playbook, PositionSide
+
+    def fresh(sym):
+        ns = f"test_{uuid.uuid4().hex}"
+        return EnhancedFuturesWallet(symbol=sym, state_namespace=ns)
+
+    setup = {
+        "entry_price": "100", "side": PositionSide.LONG, "playbook": Playbook.INTRADAY,
+        "sl_price": "90", "tp_price": "110", "entry_order_style": "maker_limit",
+    }
+    w = fresh("BTCUSDT")
+    pos = w.open_position("BTCUSDT", setup, mark_price=100, custom_quantity=1.0)
+    assert pos is not None
+    # Maker-limit paper fill is exactly the signal price, no spread degradation.
+    assert Decimal(str(pos.entry_price)) == Decimal("100")
+    # Fee charged at the maker rate on notional.
+    fill = w.fills[-1]
+    expected = (Decimal("100") * Decimal("1")) * w.maker_fee_rate
+    assert abs(Decimal(str(fill.fee)) - expected) < Decimal("1e-9")

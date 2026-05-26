@@ -225,7 +225,32 @@ class WalletSignalAdapter:
                 tp = entry * (1 + self.default_tp_pct) if side == PositionSide.LONG else entry * (1 - self.default_tp_pct)
             setup["tp_price"] = float(tp)
 
-        pos = self.wallet.open_position(signal.symbol, setup, entry, custom_quantity=float(signal.quantity))
+        # Entry order style. For live maker-limit, acquire the passive fill
+        # lock-free, then book it; a skip-fallback miss aborts. Paper maker-limit
+        # is simulated inside open_position via the setup flag.
+        style = str(meta.get("entry_order_style", "market")).lower()
+        setup["entry_order_style"] = style
+        qty = float(signal.quantity)
+        external_fill = None
+        if style == "maker_limit" and getattr(self.wallet, "live_execution", False):
+            external_fill = self.wallet.acquire_live_entry_fill(
+                signal.symbol, side, qty, entry,
+                timeout_s=float(meta.get("maker_limit_timeout_s", 8.0)),
+                offset_bps=float(meta.get("maker_limit_offset_bps", 1.0)),
+                fallback=str(meta.get("maker_limit_fallback", "market")),
+            )
+            if external_fill is None:
+                return  # unfilled, fallback=skip
+            fq = external_fill.get("filled_quantity")
+            if fq is not None:
+                qty = float(fq)
+
+        if external_fill is not None:
+            pos = self.wallet.open_position(
+                signal.symbol, setup, entry, custom_quantity=qty, external_fill=external_fill,
+            )
+        else:
+            pos = self.wallet.open_position(signal.symbol, setup, entry, custom_quantity=qty)
 
         if pos and self.event_bus is not None:
             from ..events import TradeOpenedEvent

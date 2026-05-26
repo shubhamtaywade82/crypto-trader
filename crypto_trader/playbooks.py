@@ -624,6 +624,7 @@ class PlaybookVolExhaust:
             "tp_price": tp,
             "time_stop_hours": self.time_h,
             "score": round(score, 3),
+            "entry_order_style": "maker_limit",
             "reason": (
                 f"PlaybookVolExhaust: {self.bb_std:.0f}SD band + vol x{vol_ratio:.1f} "
                 f"+ RSI({rsi:.1f}) + reversal | target=mean | score={score:.2f}"
@@ -762,6 +763,7 @@ class PlaybookSweepMSS:
             ],
             "time_stop_hours": 36,
             "score": round(score, 3),
+            "entry_order_style": "maker_limit",
             "reason": (
                 f"PlaybookSweepMSS: {sweep['type']} sweep ({sweep.get('candles_ago')}c ago) "
                 f"+ MSS + {'OB' if ob_conf else ''}{'/FVG' if fvg_conf else ''} | score={score:.2f}"

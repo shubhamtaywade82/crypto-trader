@@ -96,6 +96,15 @@ class TradingConfig:
     paper_cdcx_spread_coeff: float = 0.0015  # per-side fill penalty in paper mode
     paper_collar_pct: float = 0.10           # reject paper market fills beyond this deviation
 
+    # ── Entry order style (maker-limit with market fallback) ──
+    # Global opt-in (default "market" = unchanged behaviour). When set to
+    # "maker_limit", entries from playbooks that request it (volx/sweep) post a
+    # passive LIMIT and fall back per maker_limit_fallback if unfilled.
+    entry_order_style: str = "market"        # "market" | "maker_limit"
+    maker_limit_timeout_s: float = 8.0       # how long to wait for a passive fill
+    maker_limit_offset_bps: float = 1.0      # post this far inside the spread (bps)
+    maker_limit_fallback: str = "market"     # "market" | "skip" when unfilled
+
     # ── CoinDCX private/user stream (F5, optional, default-off) ──
     coindcx_user_stream_enabled: bool = False
     coindcx_stream_url: str = "wss://stream.coindcx.com"
@@ -186,6 +195,10 @@ class TradingConfig:
             entry_basis_buffer=_get_float("ENTRY_BASIS_BUFFER", 0.0005),
             paper_cdcx_spread_coeff=_get_float("PAPER_CDCX_SPREAD_COEFF", 0.0015),
             paper_collar_pct=_get_float("PAPER_COLLAR_PCT", 0.10),
+            entry_order_style=os.getenv("ENTRY_ORDER_STYLE", "market").lower(),
+            maker_limit_timeout_s=_get_float("MAKER_LIMIT_TIMEOUT_S", 8.0),
+            maker_limit_offset_bps=_get_float("MAKER_LIMIT_OFFSET_BPS", 1.0),
+            maker_limit_fallback=os.getenv("MAKER_LIMIT_FALLBACK", "market").lower(),
             coindcx_user_stream_enabled=_get_bool("COINDCX_USER_STREAM_ENABLED", False),
             coindcx_stream_url=_get("COINDCX_STREAM_URL", "wss://stream.coindcx.com"),
             coindcx_stream_channel=_get("COINDCX_STREAM_CHANNEL", "coindcx"),

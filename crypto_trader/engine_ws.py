@@ -867,6 +867,15 @@ class WebSocketTradingEngine:
             logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
             return
 
+        # Entry order style: maker-limit only when globally enabled AND the
+        # winning playbook requested it (volx/sweep); otherwise market (default).
+        cfg_style = getattr(self.cfg, "entry_order_style", "market") if self.cfg else "market"
+        use_maker = (
+            str(cfg_style).lower() == "maker_limit"
+            and str(setup.get("entry_order_style", "market")).lower() == "maker_limit"
+        )
+        setup["entry_order_style"] = "maker_limit" if use_maker else "market"
+
         # Decoupled path: publish the entry as a signal. The in-process consumer
         # (shared wallet) executes it with idempotency/DLQ/PEL-recovery + a final
         # risk-gate veto, then emits TradeOpenedEvent. record_open is performed
@@ -882,7 +891,12 @@ class WebSocketTradingEngine:
                 "funding_rate": float(funding_rate),
                 "oi_delta": float(oi_delta),
                 "rvol": float(regime_ctx.rvol) if regime_ctx else 1.0,
+                "entry_order_style": setup["entry_order_style"],
             }
+            if use_maker and self.cfg:
+                meta["maker_limit_timeout_s"] = float(self.cfg.maker_limit_timeout_s)
+                meta["maker_limit_offset_bps"] = float(self.cfg.maker_limit_offset_bps)
+                meta["maker_limit_fallback"] = str(self.cfg.maker_limit_fallback)
             if "time_stop_hours" in setup:
                 meta["time_stop_hours"] = setup["time_stop_hours"]
             if "tp_price" in setup:
@@ -897,21 +911,43 @@ class WebSocketTradingEngine:
             self.signal_publisher.emit(Signal(
                 strategy_id=f"engine_ws:{self.symbol}",
                 symbol=self.symbol, side=setup["side"].value,
-                quantity=float(quantity), mode=mode, order_type="market",
+                quantity=float(quantity), mode=mode,
+                order_type="limit" if use_maker else "market",
                 price=float(entry_price), metadata=meta,
             ))
             self.adaptive_threshold.record_trade()
-            logger.info("[EXECUTED→BUS] %s %s qty=%.4f @ %.4f published to execution bus",
-                        self.symbol, setup["side"].value, float(quantity), float(entry_price))
+            logger.info("[EXECUTED→BUS] %s %s qty=%.4f @ %.4f style=%s published to execution bus",
+                        self.symbol, setup["side"].value, float(quantity), float(entry_price),
+                        setup["entry_order_style"])
             return
 
-        # Open position
+        # Direct path. For live maker-limit, acquire the passive fill lock-free
+        # (never under the shared wallet lock), then book it; on a skip-fallback
+        # miss, abort the entry. Paper maker-limit is simulated in open_position
+        # via the setup flag. Market entries are unchanged.
+        external_fill = None
+        book_qty = quantity
+        if use_maker and self.cfg and self.cfg.is_live:
+            external_fill = self.wallet.acquire_live_entry_fill(
+                self.symbol, setup["side"], quantity, Decimal(str(entry_price)),
+                timeout_s=self.cfg.maker_limit_timeout_s,
+                offset_bps=self.cfg.maker_limit_offset_bps,
+                fallback=self.cfg.maker_limit_fallback,
+            )
+            if external_fill is None:
+                logger.info("[MAKER-LIMIT] %s entry skipped (unfilled, fallback=skip)", self.symbol)
+                return
+            fq = external_fill.get("filled_quantity")
+            if fq is not None:
+                book_qty = Decimal(str(fq))
+
         pos = self.wallet.open_position(
             self.symbol,
             setup,
             entry_price,
             custom_margin=None,
-            custom_quantity=quantity,
+            custom_quantity=book_qty,
+            external_fill=external_fill,
         )
 
         if pos:

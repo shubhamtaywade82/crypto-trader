@@ -598,6 +598,102 @@ class EnhancedFuturesWallet:
         fee = self._calculate_fee(price * quantity, is_taker=True)
         return {"price": price, "fee": fee, "order_id": order.id, "client_order_id": coid}
 
+    def acquire_live_entry_fill(
+        self,
+        symbol: str,
+        side: "PositionSide",
+        quantity: Decimal,
+        limit_price: Decimal,
+        *,
+        timeout_s: float = 8.0,
+        offset_bps: float = 1.0,
+        fallback: str = "market",
+        poll_interval_s: float = 0.5,
+    ) -> Optional[dict]:
+        """Acquire a maker-limit entry fill on the live venue, LOCK-FREE.
+
+        Posts a passive LIMIT just inside the spread (a buy below / sell above
+        the signal price) so it rests as a maker order, then polls for the fill
+        up to ``timeout_s``. On timeout it cancels and, per ``fallback``, either
+        crosses with a MARKET order or skips the entry entirely.
+
+        Returns an ``external_fill`` dict for ``open_position`` (may carry a
+        reduced ``filled_quantity`` on a partial maker fill), or ``None`` to skip.
+
+        IMPORTANT: this MUST be called WITHOUT holding ``self.lock`` — it blocks
+        for up to ``timeout_s`` and the lock is shared across symbols.
+        """
+        import time as _t
+        from .execution.client_order_id import make_client_order_id
+
+        if not (self.live_execution and self.execution_engine is not None):
+            return None
+
+        qty = self._to_decimal(quantity)
+        limit_px = self._to_decimal(limit_price)
+        off = self._to_decimal(offset_bps) / Decimal("10000")
+        if side == PositionSide.LONG:
+            post_px = limit_px * (Decimal("1") - off)
+        else:
+            post_px = limit_px * (Decimal("1") + off)
+
+        coid = make_client_order_id(symbol, "entry", nonce=str(self._now_ms()))
+        try:
+            order = self.execution_engine.place_order(
+                symbol, side, qty, OrderType.LIMIT, limit_price=post_px, client_order_id=coid,
+            )
+        except Exception as e:
+            logger.warning("[MAKER-LIMIT] place failed for %s: %s", symbol, e)
+            return self._maker_limit_fallback(symbol, side, qty, fallback)
+
+        oid = str(order.id or "")
+        deadline = _t.time() + max(timeout_s, 0.0)
+        filled = Decimal("0")
+        while _t.time() < deadline:
+            _t.sleep(poll_interval_s)
+            try:
+                st = self.execution_engine.get_order_status(oid, symbol)
+            except Exception:
+                continue
+            filled = self._to_decimal(st.get("filled_quantity", 0) or 0)
+            status = str(st.get("status", "")).lower()
+            if status in ("filled",) or filled >= qty:
+                fee = self._calculate_fee(post_px * qty, is_taker=False)
+                return {"price": post_px, "fee": fee, "order_id": oid,
+                        "client_order_id": coid, "is_maker": True}
+            if status in ("cancelled", "canceled", "rejected"):
+                break
+
+        # Timed out (or terminal-without-fill): cancel the resting order, then
+        # re-read to settle any race, and decide based on what actually filled.
+        try:
+            self.execution_engine.cancel_order(oid)
+        except Exception:
+            pass
+        try:
+            st = self.execution_engine.get_order_status(oid, symbol)
+            filled = self._to_decimal(st.get("filled_quantity", 0) or 0)
+        except Exception:
+            pass
+
+        if filled >= qty:
+            fee = self._calculate_fee(post_px * qty, is_taker=False)
+            return {"price": post_px, "fee": fee, "order_id": oid,
+                    "client_order_id": coid, "is_maker": True}
+        if filled > Decimal("0"):
+            # Partial maker fill: book only what filled (engine reads filled_quantity).
+            fee = self._calculate_fee(post_px * filled, is_taker=False)
+            logger.info("[MAKER-LIMIT] %s partial maker fill %s/%s", symbol, filled, qty)
+            return {"price": post_px, "fee": fee, "order_id": oid,
+                    "client_order_id": coid, "is_maker": True, "filled_quantity": filled}
+        logger.info("[MAKER-LIMIT] %s unfilled within %.1fs — fallback=%s", symbol, timeout_s, fallback)
+        return self._maker_limit_fallback(symbol, side, qty, fallback)
+
+    def _maker_limit_fallback(self, symbol, side, qty, fallback) -> Optional[dict]:
+        if str(fallback).lower() == "market":
+            return self._venue_fill(symbol, side, qty, reduce_only=False, intent="entry")
+        return None
+
     def _place_protective_orders(self, pos: EnhancedPosition) -> dict:
         """Place resting SL (and optionally TP) on the venue (F1).
 
@@ -717,6 +813,8 @@ class EnhancedFuturesWallet:
             if not tp_levels and "tp_price" in setup:
                 tp_levels = [{"price": self._to_decimal(setup["tp_price"]), "pct": 1.0, "hit": False, "label": "TP"}]
 
+            entry_style = str(setup.get("entry_order_style", "market")).lower()
+
             if external_fill is None and self.live_execution and self.execution_engine is not None:
                 external_fill = self._venue_fill(symbol, side, qty, reduce_only=False, intent="entry")
 
@@ -724,6 +822,13 @@ class EnhancedFuturesWallet:
             if external_fill is not None:
                 execution_price = self._to_decimal(external_fill["price"])
                 fee_open = self._to_decimal(external_fill.get("fee", 0))
+                self._record_fill(order, qty, execution_price, fee_open, sequence=1)
+            elif entry_style == "maker_limit":
+                # Paper passive maker fill: filled at the intended (signal) price
+                # with the maker fee and no spread/collar penalty — models a
+                # resting LIMIT that gets hit rather than crossing the spread.
+                execution_price = entry
+                fee_open = self._calculate_fee(execution_price * qty, is_taker=False)
                 self._record_fill(order, qty, execution_price, fee_open, sequence=1)
             else:
                 execution_price = self._execution_price(mark_price, side, is_entry=True, setup=setup)
