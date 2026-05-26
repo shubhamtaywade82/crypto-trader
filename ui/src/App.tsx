@@ -1,5 +1,5 @@
 import { createSignal, For, onMount, onCleanup, createEffect, Show } from 'solid-js';
-import { createChart, CandlestickSeries, HistogramSeries } from 'lightweight-charts';
+import { createChart, CandlestickSeries, HistogramSeries, LineStyle, CrosshairMode, createSeriesMarkers } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi, UTCTimestamp, IPriceLine } from 'lightweight-charts';
 import './App.css';
 
@@ -122,6 +122,7 @@ function App() {
   let candleSeries: ISeriesApi<"Candlestick"> | undefined;
   let volumeSeries: ISeriesApi<"Histogram"> | undefined;
   let activePriceLine: IPriceLine | undefined;
+  let markersPlugin: any;
 
   // Order placement state
   const [orderSide, setOrderSide] = createSignal<"buy" | "sell">("buy");
@@ -791,7 +792,7 @@ function App() {
   onMount(() => {
     if (!chartContainerRef) return;
 
-    // Create the lightweight chart instance
+    // Create the lightweight chart instance with rich options
     chartInstance = createChart(chartContainerRef, {
       layout: {
         background: { color: '#0b0e14' },
@@ -800,21 +801,21 @@ function App() {
         fontFamily: "Inter, system-ui, sans-serif",
       },
       grid: {
-        vertLines: { color: '#161c28', style: 1 },
-        horzLines: { color: '#161c28', style: 1 },
+        vertLines: { color: '#161c28', style: LineStyle.Dotted },
+        horzLines: { color: '#161c28', style: LineStyle.Dotted },
       },
       crosshair: {
-        mode: 1, // Normal crosshair
+        mode: CrosshairMode.Normal,
         vertLine: {
           color: '#3b82f6',
           width: 1,
-          style: 3, // Dotted
+          style: LineStyle.LargeDashed,
           labelBackgroundColor: '#1e293b',
         },
         horzLine: {
           color: '#3b82f6',
           width: 1,
-          style: 3, // Dotted
+          style: LineStyle.LargeDashed,
           labelBackgroundColor: '#3b82f6',
         },
       },
@@ -841,6 +842,9 @@ function App() {
       wickUpColor: '#00e676',
       wickDownColor: '#ff3d00',
     });
+
+    // Attach markers primitive using lightweight-charts v5 createSeriesMarkers
+    markersPlugin = candleSeries.attachPrimitive(createSeriesMarkers(candleSeries));
 
     // Add Volume Series overlay using lightweight-charts v5 addSeries API
     volumeSeries = chartInstance.addSeries(HistogramSeries, {
@@ -900,6 +904,7 @@ function App() {
         chartInstance = undefined;
         candleSeries = undefined;
         volumeSeries = undefined;
+        markersPlugin = undefined;
       }
     });
   });
@@ -960,12 +965,58 @@ function App() {
         price: activePos.avg_price,
         color: isLong ? '#00e676' : '#ff3d00',
         lineWidth: 1.5 as any,
-        lineStyle: 2, // Dashed
+        lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
         title: `POSITION (${activePos.side.toUpperCase()}) - ${activePos.qty} qty`,
       };
       
       activePriceLine = candleSeries.createPriceLine(lineConfig);
+    }
+  });
+
+  // Sync trade fills onto the chart as dynamic Series Markers (Buy/Sell markers)
+  createEffect(() => {
+    const data = chartData();
+    const sym = selectedSymbol();
+    const fillList = fills();
+    
+    if (!candleSeries || data.length === 0) return;
+
+    // Filter fills matching active symbol and mode
+    const activeFills = fillList.filter(
+      f => f.symbol === sym && f.mode === (mode() as any)
+    );
+
+    const markers = activeFills.map((fill) => {
+      // Find the candle closest to the fill timestamp
+      const fillTimeSec = fill.ts / 1000;
+      let closestCandle = data[0];
+      let minDiff = Math.abs(data[0].time / 1000 - fillTimeSec);
+
+      for (let i = 1; i < data.length; i++) {
+        const diff = Math.abs(data[i].time / 1000 - fillTimeSec);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closestCandle = data[i];
+        }
+      }
+
+      const isBuy = fill.side.toLowerCase() === 'buy';
+      return {
+        time: (closestCandle.time / 1000) as UTCTimestamp,
+        position: isBuy ? 'belowBar' as const : 'aboveBar' as const,
+        shape: isBuy ? 'arrowUp' as const : 'arrowDown' as const,
+        color: isBuy ? '#00e676' : '#ff3d00',
+        text: `${fill.side.toUpperCase()} ${fill.qty}`,
+        size: 1.2,
+      };
+    });
+
+    // Sort markers chronologically
+    markers.sort((a, b) => (a.time as number) - (b.time as number));
+
+    if (markersPlugin) {
+      markersPlugin.setMarkers(markers);
     }
   });
 
