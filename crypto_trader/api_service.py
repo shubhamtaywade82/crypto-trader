@@ -40,6 +40,16 @@ def get_db_conn():
 def health():
     return {"status": "ok", "db": bool(DATABASE_URL), "redis": bool(REDIS_URL)}
 
+@app.get("/watchlist")
+def get_watchlist():
+    from crypto_trader.multi_engine import load_watchlist
+    try:
+        return {"watchlist": load_watchlist()}
+    except Exception as e:
+        logger.error("Failed to load watchlist: %s", e)
+        sym = os.environ.get("TRADE_SYMBOL", "SOLUSDT")
+        return {"watchlist": [sym]}
+
 @app.get("/positions")
 def get_positions(mode: str = Query("paper")):
     if mode == "live":

@@ -273,9 +273,13 @@ class WebSocketTradingEngine:
         if not isinstance(self.wallet.execution_engine, CoinDCXExecutionEngine):
             return
 
+        if not hasattr(self, "_consecutive_health_failures"):
+            self._consecutive_health_failures = 0
+
         try:
             details = self.wallet.execution_engine.get_cross_margin_details()
             if details:
+                self._consecutive_health_failures = 0
                 ratio = float(details.get("margin_ratio_cross", 0) or 0)
                 ok, reason = self.risk_manager.check_margin_ratio(ratio)
                 if not ok:
@@ -302,6 +306,15 @@ class WebSocketTradingEngine:
                         logger.error("margin-guard flatten failed for %s: %s", self.symbol, e)
         except Exception as e:
             logger.error("Authoritative health check failed: %s", e)
+            self._consecutive_health_failures += 1
+            if self._consecutive_health_failures >= 3 and self.wallet.get_open_position(self.symbol):
+                reason = f"Authoritative health check failed consecutively {self._consecutive_health_failures} times while holding an active position: {e}"
+                logger.critical(f"[AUTHORITATIVE GUARD] {reason} — triggering kill switch")
+                self.risk_manager.trigger_kill_switch(reason)
+                self._halted = True
+                if self.event_bus:
+                    from .events import SystemFailureEvent
+                    self.event_bus.publish(SystemFailureEvent(component="margin_guard", error=reason))
 
     # ── Main Loop ──
 

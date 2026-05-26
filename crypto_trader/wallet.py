@@ -718,6 +718,12 @@ class EnhancedFuturesWallet:
             if self.require_venue_sl:
                 from . import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
+                try:
+                    logger.critical("[PROTECTIVE SL] require_venue_sl=True: emergency flattening position for %s to protect capital", pos.symbol)
+                    self.close_position(pos.symbol, float(pos.entry_price), reason="REQUIRED_SL_FAILED")
+                except Exception as close_err:
+                    logger.error("[PROTECTIVE SL] emergency close failed for %s: %s", pos.symbol, close_err)
+                raise RuntimeError(f"Required venue Stop Loss placement failed: {e}") from e
         if self.venue_tp_enabled and pos.tp_levels:
             try:
                 tp_price = self._to_decimal(pos.tp_levels[-1]["price"])

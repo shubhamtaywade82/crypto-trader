@@ -12,6 +12,7 @@ if [ -f .env ]; then export $(grep -v '^#' .env | xargs); fi
 export DATABASE_URL=${DATABASE_URL:-"postgresql://trader:trader@localhost:5435/crypto_trader"}
 export REDIS_URL=${REDIS_URL:-"redis://localhost:6382/0"}
 export MODE=${MODE:-"paper"}
+export PROJECTION_ENABLED=${PROJECTION_ENABLED:-"true"}
 export MAX_MARGIN_RATIO=${MAX_MARGIN_RATIO:-"0.80"}
 
 # Live mode is real money — require an explicit confirmation before launching.
@@ -26,8 +27,9 @@ echo "--- Infrastructure (Postgres, Redis) ---"
 docker compose up -d postgres redis
 docker compose ps
 
-# Pre-emptive cleanup of any orphaned engine processes to avoid lock-file errors
+# Pre-emptive cleanup of any orphaned processes to avoid port and lock conflicts
 pkill -f "python3 -m crypto_trader.multi_engine" || true
+pkill -f "python3 -m crypto_trader.api_service" || true
 
 echo "--- Dashboard API (background) on :8088 ---"
 rm -f api.log

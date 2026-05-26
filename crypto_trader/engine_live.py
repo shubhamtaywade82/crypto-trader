@@ -326,6 +326,7 @@ class LiveTradingSystem:
             max_deliveries=self.cfg.signal_max_deliveries,
             idempotency_ttl_seconds=self.cfg.idempotency_ttl_seconds,
             risk_gate=build_risk_gate(self.risk),
+            record_open_fn=self.risk.record_open,
         )
         consumer.setup()
         consumer.recover_pending()  # handle orphaned in-flight signals on boot
@@ -345,12 +346,15 @@ class LiveTradingSystem:
         if self.cfg.is_live:
             self.wallet.attach_execution_engine(self.execution_engine, live=True)
             self._maybe_start_user_stream()
-        # Optional Postgres read-model (projection) derived from the event stream.
         if self.cfg.projection_enabled and self.cfg.database_url:
             try:
                 from .storage.projection import PostgresProjection
                 self.projection = PostgresProjection(self.cfg.database_url, mode=self.cfg.mode.value)
                 logger.info("Postgres projection (read-model) enabled")
+                try:
+                    self.projection.align_with_wallet(self.wallet)
+                except Exception as ex:
+                    logger.error("Failed to align projection with wallet on boot: %s", ex)
             except Exception as e:
                 logger.error("projection init failed (continuing without it): %s", e)
                 self.projection = None

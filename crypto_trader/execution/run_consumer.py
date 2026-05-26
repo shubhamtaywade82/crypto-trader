@@ -34,6 +34,10 @@ def build_consumer() -> SignalConsumer:
             from ..storage.projection import PostgresProjection
             system.projection = PostgresProjection(cfg.database_url, mode=cfg.mode.value)
             logger.info("Postgres projection (read-model) enabled in consumer")
+            try:
+                system.projection.align_with_wallet(system.wallet)
+            except Exception as ex:
+                logger.error("Failed to align projection with wallet on boot in consumer: %s", ex)
         except Exception as e:
             logger.error("projection init failed: %s", e)
             system.projection = None
@@ -74,6 +78,7 @@ def build_consumer() -> SignalConsumer:
         max_deliveries=cfg.signal_max_deliveries,
         idempotency_ttl_seconds=cfg.idempotency_ttl_seconds,
         risk_gate=build_risk_gate(system.risk),
+        record_open_fn=system.risk.record_open,
     )
 
 

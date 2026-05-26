@@ -54,6 +54,16 @@ def create_app(repo: Optional[ProjectionRepo] = None, event_source=None, cfg=Non
         except Exception as e:
             return JSONResponse({"status": "degraded", "error": str(e)}, status_code=200)
 
+    @app.get("/api/watchlist")
+    def watchlist():
+        from ...multi_engine import load_watchlist
+        try:
+            return {"watchlist": load_watchlist()}
+        except Exception as e:
+            logger.error("Failed to load watchlist in API app: %s", e)
+            sym = getattr(cfg, "symbol", "SOLUSDT")
+            return {"watchlist": [sym]}
+
     @app.get("/api/positions")
     def positions(mode: Optional[str] = Query(None, pattern="^(paper|live)$")):
         return _repo().positions(mode)

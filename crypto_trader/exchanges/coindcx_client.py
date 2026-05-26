@@ -195,7 +195,7 @@ class CoinDCXClient:
         url = f"{self.base_url}/exchange/ticker"
         try:
             t0 = time.time()
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self.session.get(url, timeout=3)
             t1 = time.time()
             date_hdr = resp.headers.get("Date")
             if not date_hdr:

@@ -265,6 +265,48 @@ class PostgresProjection:
              f.get("price"), f.get("qty"), f.get("fee"), f.get("ts")),
         )
 
+    def align_with_wallet(self, wallet) -> None:
+        """Synchronize the active_positions and open orders tables with the current wallet state on startup."""
+        import time
+        with self.conn.cursor() as cur:
+            # 1. Align active positions
+            cur.execute("DELETE FROM active_positions WHERE mode = %s", (self.mode,))
+            for symbol, pos in wallet.positions.items():
+                if getattr(pos, "status", "OPEN") == "OPEN" and float(getattr(pos, "remaining_quantity", 0)) > 0:
+                    db_pos = {
+                        "symbol": symbol,
+                        "mode": self.mode,
+                        "side": pos.side.value if hasattr(pos.side, "value") else str(pos.side),
+                        "qty": float(pos.remaining_quantity),
+                        "avg_price": float(pos.entry_price),
+                        "status": "OPEN",
+                        "last_event_ts": int(time.time() * 1000)
+                    }
+                    self._upsert_position(cur, db_pos)
+
+            # 2. Align open orders
+            cur.execute(
+                "DELETE FROM orders WHERE mode = %s AND status IN ('NEW', 'PENDING', 'PARTIALLY_FILLED')",
+                (self.mode,)
+            )
+            for oid, order in wallet.orders.items():
+                status_val = order.status.value if hasattr(order.status, "value") else str(order.status)
+                if status_val in ("NEW", "PENDING", "PARTIALLY_FILLED"):
+                    db_order = {
+                        "exchange_order_id": order.id,
+                        "mode": self.mode,
+                        "symbol": order.symbol,
+                        "side": order.side.value if hasattr(order.side, "value") else str(order.side),
+                        "order_type": order.order_type.value if hasattr(order.order_type, "value") else str(order.order_type),
+                        "qty": float(order.quantity),
+                        "filled_qty": float(order.filled_quantity),
+                        "avg_fill_price": float(order.avg_fill_price),
+                        "status": status_val,
+                        "created_at": getattr(order, "created_at", int(time.time() * 1000))
+                    }
+                    self._upsert_order(cur, db_order)
+        logger.info("Synchronized database active_positions and open orders tables with wallet state for mode %s", self.mode)
+
     # ── query helpers (for the UI / analytics) ───────────────────────────────
     def open_positions(self, mode: Optional[str] = None) -> List[dict]:
         """Active positions, optionally filtered by mode ('paper'/'live')."""

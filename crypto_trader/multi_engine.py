@@ -231,6 +231,10 @@ def main():
             from crypto_trader.storage.projection import PostgresProjection
             projection = PostgresProjection(cfg.database_url, mode=cfg.mode.value)
             logger.info("Postgres projection read-model enabled for multi-engine")
+            try:
+                projection.align_with_wallet(global_wallet)
+            except Exception as ex:
+                logger.error("Failed to align projection with wallet on boot: %s", ex)
         except Exception as e:
             logger.error("Failed to initialize Postgres projection: %s", e)
             

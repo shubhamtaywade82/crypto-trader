@@ -221,3 +221,139 @@ def test_strict_reconcile_cancels_all_on_unresolved(monkeypatch, tmp_path):
     assert any(m.kind == "ghost_position" for m in mismatches)
     assert eng.cancel_all_calls == 1          # strict mode flattened the book
     assert risk.kill_switch is True           # and halted
+
+
+# ── Production-readiness safety fixes ─────────────────────────────────────────
+
+def test_signal_consumer_retry_does_not_double_count_opens(monkeypatch):
+    from crypto_trader.execution.signal_bus import SignalConsumer, Signal
+    from decimal import Decimal
+
+    class MockBus:
+        def __init__(self):
+            self.acks = []
+            self.marks = []
+        def is_processed(self, k): return False
+        def delivery_count(self, s, g, m): return 1
+        def mark_processed(self, k, ttl): self.marks.append(k)
+        def ack(self, s, g, m): self.acks.append(m)
+
+    class FailingAdapter:
+        def __init__(self):
+            self.should_fail = True
+            self.calls = 0
+        def execute(self, sig):
+            self.calls += 1
+            if self.should_fail:
+                raise ValueError("temporary error")
+
+    bus = MockBus()
+    adapter = FailingAdapter()
+    recorded = 0
+    def record_fn():
+        nonlocal recorded
+        recorded += 1
+
+    consumer = SignalConsumer(
+        bus, {"paper": adapter},
+        record_open_fn=record_fn,
+        risk_gate=lambda s: True
+    )
+
+    sig = Signal(strategy_id="test", symbol="SOLUSDT", side="LONG", quantity=1.0, mode="paper")
+
+    # 1. First execution fails: should not increment recorded, should not mark/ack
+    consumer._handle("msg_1", sig.to_payload())
+    assert recorded == 0
+    assert len(bus.acks) == 0
+    assert adapter.calls == 1
+
+    # 2. Second execution succeeds: should increment recorded and ack
+    adapter.should_fail = False
+    consumer._handle("msg_1", sig.to_payload())
+    assert recorded == 1
+    assert len(bus.acks) == 1
+    assert adapter.calls == 2
+
+
+def test_ws_engine_health_consecutive_failures_trigger_kill_switch(monkeypatch, tmp_path):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    from crypto_trader.engine_ws import WebSocketTradingEngine
+    from crypto_trader.config import TradingConfig
+    from crypto_trader.wallet import EnhancedFuturesWallet, PositionSide, Playbook, EnhancedPosition
+    from crypto_trader.exchanges.coindcx_execution import CoinDCXExecutionEngine
+    from decimal import Decimal
+
+    cfg = TradingConfig(mode="live", symbol="SOLUSDT")
+    eng = WebSocketTradingEngine(symbol="SOLUSDT", use_llm=False, cfg=cfg)
+    eng.risk_manager = _clean_risk()
+    
+    class BadEngine(CoinDCXExecutionEngine):
+        def __init__(self):
+            pass
+        def get_cross_margin_details(self):
+            raise ValueError("API error")
+
+    eng.wallet.attach_execution_engine(BadEngine(), live=True)
+
+    pos = EnhancedPosition(
+        symbol="SOLUSDT", side=PositionSide.LONG, playbook=Playbook.INTRADAY,
+        entry_price=Decimal("100.0"), original_quantity=Decimal("1.0"),
+        remaining_quantity=Decimal("1.0"), notional=Decimal("100.0"),
+        margin_used=Decimal("10.0"), leverage=10, open_time=int(time.time()*1000),
+        sl_price=Decimal("90.0")
+    )
+    eng.wallet.positions["SOLUSDT"] = pos
+
+    # Call health check 2 times - should not trip kill switch
+    eng._check_authoritative_health()
+    eng._check_authoritative_health()
+    assert eng.risk_manager.kill_switch is False
+
+    # 3rd call - should trip kill switch
+    eng._check_authoritative_health()
+    assert eng.risk_manager.kill_switch is True
+    assert eng._halted is True
+
+
+def test_wallet_sl_placement_failure_flattens_when_sl_required(monkeypatch, tmp_path):
+    monkeypatch.setattr("crypto_trader.wallet.DATA_DIR", tmp_path)
+    from crypto_trader.wallet import EnhancedFuturesWallet, Order, OrderType, OrderStatus, PositionSide, Playbook
+    import pytest
+    from decimal import Decimal
+
+    w = EnhancedFuturesWallet(
+        symbol="SOLUSDT", initial_balance=1000, leverage=2,
+        state_namespace="slfailtest", require_venue_sl=True, venue_sl_enabled=True
+    )
+
+    class MockExec:
+        def __init__(self):
+            self.orders_placed = []
+        def place_order(self, symbol, side, qty, otype, *, trigger_price=None, limit_price=None,
+                        reduce_only=False, expires_at=None, client_order_id=None):
+            self.orders_placed.append((otype, side, qty))
+            if otype == OrderType.STOP_MARKET:
+                raise ValueError("Exchange SL placement failed")
+            return Order(id="ex-9", symbol=symbol, side=side, order_type=otype, quantity=qty,
+                         status=OrderStatus.FILLED, created_at=0, reduce_only=reduce_only,
+                         filled_quantity=qty, avg_fill_price=Decimal("120.00"))
+        def cancel_order(self, oid): return True
+        def sync_positions(self): return {}
+
+    mock_exec = MockExec()
+    w.attach_execution_engine(mock_exec, live=True)
+
+    setup = {
+        "entry_price": 120.0, "side": PositionSide.LONG, "playbook": Playbook.INTRADAY,
+        "sl_price": 118.0, "tp_price": 125.0,
+    }
+
+    with pytest.raises(RuntimeError, match="Stop Loss placement failed"):
+        w.open_position("SOLUSDT", setup, mark_price=120.0)
+
+    # Verify that the position was flattened on the exchange (a MARKET order was sent to exit)
+    assert any(otype == OrderType.MARKET and side == PositionSide.SHORT for otype, side, qty in mock_exec.orders_placed)
+    # Verify that the position is not active in the wallet
+    assert w.get_open_position("SOLUSDT") is None
+

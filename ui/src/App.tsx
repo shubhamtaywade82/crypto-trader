@@ -494,8 +494,29 @@ function App() {
     onCleanup(() => clearInterval(feedInterval));
   });
 
+  const fetchWatchlistSymbols = async () => {
+    try {
+      const res = await fetch(getUrl("/watchlist")).then(r => r.json());
+      if (res && Array.isArray(res.watchlist) && res.watchlist.length > 0) {
+        const items = res.watchlist.map((sym: string) => ({
+          symbol: sym,
+          price: 0,
+          prevPrice: 0,
+          change24h: 0,
+          sparkline: [],
+          bias: "NEUTRAL" as const
+        }));
+        setWatchlist(items);
+        setSelectedSymbol(items[0].symbol);
+      }
+    } catch (e) {
+      console.warn("Failed to load watchlist symbols from API, using default template:", e);
+    }
+  };
+
   // Initial load
-  onMount(() => {
+  onMount(async () => {
+    await fetchWatchlistSymbols();
     fetchLiveWatchlistData();
     fetchWatchlistSparklines();
     fetchKlines(selectedSymbol(), timeframe());
@@ -1268,7 +1289,7 @@ function App() {
                 class={`workspace-tab ${activeTab() === 'orders' ? 'active' : ''}`}
                 onClick={() => setActiveTab("orders")}
               >
-                Open Orders <span class="tab-badge">{orders().filter(o => o.status === 'NEW').length}</span>
+                Open Orders <span class="tab-badge">{orders().filter(o => ['new', 'pending', 'partially_filled'].includes(o.status.toLowerCase())).length}</span>
               </button>
               <button 
                 class={`workspace-tab ${activeTab() === 'fills' ? 'active' : ''}`}
@@ -1350,7 +1371,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      <For each={orders()} fallback={
+                      <For each={orders().filter(o => ['new', 'pending', 'partially_filled'].includes(o.status.toLowerCase()))} fallback={
                         <tr>
                           <td colspan="8" class="empty-row-state">No open orders.</td>
                         </tr>

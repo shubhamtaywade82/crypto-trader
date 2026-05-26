@@ -82,6 +82,7 @@ class SignalConsumer:
         max_deliveries: int = 3,
         idempotency_ttl_seconds: int = 300,
         risk_gate: Optional[Callable[[Signal], bool]] = None,
+        record_open_fn: Optional[Callable[[], None]] = None,
     ):
         self.bus = bus
         self.adapters = adapters
@@ -92,6 +93,7 @@ class SignalConsumer:
         self.max_deliveries = max_deliveries
         self.idempotency_ttl = idempotency_ttl_seconds
         self.risk_gate = risk_gate
+        self.record_open_fn = record_open_fn
         self._running = False
 
     def setup(self) -> None:
@@ -199,6 +201,14 @@ class SignalConsumer:
         except Exception as e:
             logger.error("adapter failed for signal %s (will retry): %s", signal.signal_id, e)
             return
+        
+        # Success! Record the open
+        if self.record_open_fn is not None:
+            try:
+                self.record_open_fn()
+            except Exception as e:
+                logger.error("failed to record open for signal %s: %s", signal.signal_id, e)
+
         idem_key = f"idem:{signal.strategy_id}:{signal.timestamp}"
         self.bus.mark_processed(idem_key, self.idempotency_ttl)
         self.bus.ack(self.stream, self.group, msg_id)
@@ -309,12 +319,11 @@ class WalletSignalAdapter:
 
 def build_risk_gate(risk_manager) -> Callable[["Signal"], bool]:
     """A signal-level risk gate: enforces the kill switch + daily/velocity caps
-    before execution. Records the open so the velocity window advances."""
+    before execution. Does NOT record the open (that is done after execution)."""
     def gate(signal: "Signal") -> bool:
         ok, reason = risk_manager.can_trade()
         if not ok:
             logger.warning("risk gate blocked %s: %s", signal.symbol, reason)
             return False
-        risk_manager.record_open()
         return True
     return gate
