@@ -409,7 +409,44 @@ class LiveTradingSystem:
         from .exchanges.resilient_data_feed import ResilientDataFeed
         engine.data_feed = ResilientDataFeed.from_config(self.cfg)
         logger.info("Signal-tick data feed: resilient (%s primary)", self.cfg.data_source.value)
+
+        # Optional delta-neutral funding-rate arbitrage (Strategy C, default-off).
+        engine.funding_arb = self._build_funding_arb(engine)
+
         engine.run_loop(signal_interval_seconds=signal_interval_seconds, max_iterations=max_iterations)
+
+    def _build_funding_arb(self, engine):
+        """Construct the funding-arb manager when enabled. Spot leg uses the
+        paper spot engine in paper mode and the live CoinDCX spot engine in live
+        mode; the perp leg reuses the engine's execution adapter."""
+        if not getattr(self.cfg, "funding_arb_enabled", False):
+            return None
+        from .arb_book import ArbBook
+        from .funding_arb_manager import FundingArbManager
+        from .exchanges.coindcx_spot_execution import (
+            CoinDCXSpotExecutionEngine, PaperSpotExecutionEngine,
+        )
+
+        mark_fn = engine.data_feed.get_mark_price
+        funding_fn = engine.data_feed.get_funding_rate
+        if self.cfg.mode == TradingMode.PAPER:
+            spot_engine = PaperSpotExecutionEngine(mark_fn)
+            perp_engine = PaperSpotExecutionEngine(mark_fn)  # paper perp leg: filled at mark
+        else:
+            spot_engine = CoinDCXSpotExecutionEngine(
+                api_key=self.cfg.coindcx_api_key,
+                api_secret=self.cfg.coindcx_api_secret,
+                i_understand_real_money=True,
+            )
+            perp_engine = self.execution_engine  # live CoinDCX futures adapter
+
+        book = ArbBook(namespace=self.cfg.symbol)
+        logger.warning("[ARB] funding arbitrage ENABLED for %s (notional=%.2f USDT)",
+                       self.cfg.symbol, self.cfg.funding_arb_notional_usdt)
+        return FundingArbManager(
+            self.cfg.symbol, spot_engine, perp_engine, book, self.cfg,
+            mark_fn=mark_fn, funding_fn=funding_fn,
+        )
 
 
 def main():

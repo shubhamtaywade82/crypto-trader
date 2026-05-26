@@ -105,6 +105,19 @@ class TradingConfig:
     maker_limit_offset_bps: float = 1.0      # post this far inside the spread (bps)
     maker_limit_fallback: str = "market"     # "market" | "skip" when unfilled
 
+    # ── Delta-neutral funding-rate arbitrage (Strategy C, default-off) ──
+    # Non-directional spot+perp carry. Phased rollout: paper -> live observe-only
+    # -> tiny live. Requires the spot execution engine to be wired.
+    funding_arb_enabled: bool = False
+    funding_arb_notional_usdt: float = 0.0   # per-arb notional (0 = no entries)
+    funding_arb_qty_step: float = 0.0001     # common qty step across spot/perp legs
+    min_funding_to_enter: float = 0.0001     # enter when funding rate >= this (per interval)
+    funding_exit_floor: float = 0.0          # unwind when funding <= this (flips against carry)
+    min_funding_to_hold: float = 0.00003     # unwind when carry no longer beats round-trip cost
+    max_entry_basis: float = 0.005           # skip entry if |perp-spot|/spot exceeds this
+    max_basis_drift: float = 0.006           # unwind if basis drifts this far from entry
+    funding_interval_ms: int = 28_800_000    # CoinDCX funding settles every 8h
+
     # ── CoinDCX private/user stream (F5, optional, default-off) ──
     coindcx_user_stream_enabled: bool = False
     coindcx_stream_url: str = "wss://stream.coindcx.com"
@@ -199,6 +212,15 @@ class TradingConfig:
             maker_limit_timeout_s=_get_float("MAKER_LIMIT_TIMEOUT_S", 8.0),
             maker_limit_offset_bps=_get_float("MAKER_LIMIT_OFFSET_BPS", 1.0),
             maker_limit_fallback=os.getenv("MAKER_LIMIT_FALLBACK", "market").lower(),
+            funding_arb_enabled=_get_bool("FUNDING_ARB_ENABLED", False),
+            funding_arb_notional_usdt=_get_float("FUNDING_ARB_NOTIONAL_USDT", 0.0),
+            funding_arb_qty_step=_get_float("FUNDING_ARB_QTY_STEP", 0.0001),
+            min_funding_to_enter=_get_float("MIN_FUNDING_TO_ENTER", 0.0001),
+            funding_exit_floor=_get_float("FUNDING_EXIT_FLOOR", 0.0),
+            min_funding_to_hold=_get_float("MIN_FUNDING_TO_HOLD", 0.00003),
+            max_entry_basis=_get_float("MAX_ENTRY_BASIS", 0.005),
+            max_basis_drift=_get_float("MAX_BASIS_DRIFT", 0.006),
+            funding_interval_ms=_get_int("FUNDING_INTERVAL_MS", 28_800_000),
             coindcx_user_stream_enabled=_get_bool("COINDCX_USER_STREAM_ENABLED", False),
             coindcx_stream_url=_get("COINDCX_STREAM_URL", "wss://stream.coindcx.com"),
             coindcx_stream_channel=_get("COINDCX_STREAM_CHANNEL", "coindcx"),

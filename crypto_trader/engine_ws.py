@@ -71,11 +71,15 @@ class WebSocketTradingEngine:
         cfg = None,
         signal_publisher = None,
         risk_budget_fraction: float = 1.0,
+        funding_arb = None,
     ):
         self.symbol = symbol.upper()
         self.use_llm = use_llm
         self.event_bus = event_bus
         self.cfg = cfg
+        # Optional delta-neutral funding-arb manager (Strategy C). Runs alongside
+        # the directional signal tick; None unless wired by the launcher.
+        self.funding_arb = funding_arb
         # When set (live + Redis execution bus), entries are PUBLISHED as signals
         # and executed by the in-process consumer (shared wallet) — giving the
         # idempotency lock / DLQ / PEL-recovery / risk-gate safety on the live
@@ -320,6 +324,13 @@ class WebSocketTradingEngine:
 
                 # Signal generation tick (REST-based)
                 self._signal_tick()
+
+                # Delta-neutral funding-arb tick (non-directional, orthogonal).
+                if self.funding_arb is not None:
+                    try:
+                        self.funding_arb.on_signal_tick()
+                    except Exception as e:
+                        logger.error("[ARB] funding-arb tick error: %s", e)
 
                 iteration += 1
                 if max_iterations and iteration >= max_iterations:
