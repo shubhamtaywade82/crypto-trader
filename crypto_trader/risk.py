@@ -41,6 +41,11 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 class RiskManager:
     """Enforces daily trade limits and consecutive loss stops."""
 
+    _CORRELATED_GROUPS = [
+        ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT"],
+    ]
+
     def __init__(
         self,
         max_daily_trades: int = 2,
@@ -94,11 +99,8 @@ class RiskManager:
         self._save_state()
         logger.info("[KILL SWITCH] Cleared")
 
-    def _to_float(self, val: any) -> float:
-        return float(val) if isinstance(val, Decimal) else float(val)
-
-    def _is_kill_switch_active(self) -> bool:
-        return self.kill_switch
+    def _to_float(self, val) -> float:
+        return float(val)
 
     def _reset_daily_stats_if_new_day(self) -> None:
         today = self._today()
@@ -143,7 +145,7 @@ class RiskManager:
         return dd >= self.max_drawdown_pct
 
     def can_trade(self, current_balance: Optional[float] = None, initial_daily_balance: Optional[float] = None) -> Tuple[bool, str]:
-        if self._is_kill_switch_active():
+        if self.kill_switch:
             return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
 
         self._reset_daily_stats_if_new_day()
@@ -323,8 +325,8 @@ class AdaptiveThresholdManager:
     def _save_state(self):
         try:
             _atomic_write_json(self.state_file, {"last_trade_time": self.last_trade_time})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("AdaptiveThresholdManager state save failed: %s", e)
 
     def _load_state(self):
         if not self.state_file.exists():
@@ -333,8 +335,8 @@ class AdaptiveThresholdManager:
             with open(self.state_file, "r") as f:
                 data = json.load(f)
             self.last_trade_time = data.get("last_trade_time", time.time())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("AdaptiveThresholdManager state load failed: %s", e)
 
 
 class LLMCircuitBreaker:

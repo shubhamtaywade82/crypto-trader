@@ -43,10 +43,15 @@ class SQLiteEventStore:
         self.conn.commit()
 
     def load_events(self, limit: Optional[int] = None) -> List[dict]:
-        q = "SELECT ts, type, payload FROM events ORDER BY id ASC"
         if limit:
-            q += f" LIMIT {int(limit)}"
-        rows = self.conn.execute(q).fetchall()
+            rows = self.conn.execute(
+                "SELECT ts, type, payload FROM events ORDER BY id ASC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT ts, type, payload FROM events ORDER BY id ASC"
+            ).fetchall()
         return [{"ts": r[0], "event_type": r[1], "payload": json.loads(r[2])} for r in rows]
 
     def snapshot(self, state: dict) -> None:

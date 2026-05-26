@@ -12,17 +12,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..config import load_config
 from .repo import ProjectionRepo, PostgresRepo
 
 logger = logging.getLogger("crypto_trader.api")
+
+API_TOKEN = os.getenv("API_DASHBOARD_TOKEN", "")
 
 # Built SolidJS bundle (Phase 2). Served at "/" when present.
 UI_DIST = Path(__file__).resolve().parents[2] / "ui" / "dist"
@@ -32,9 +36,16 @@ def create_app(repo: Optional[ProjectionRepo] = None, event_source=None, cfg=Non
     """App factory. ``repo`` / ``event_source`` are injectable for tests."""
     cfg = cfg or load_config()
     app = FastAPI(title="crypto-trader dashboard", version="1.0")
+    _allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
     app.add_middleware(
-        CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"],
+        CORSMiddleware, allow_origins=_allowed_origins, allow_methods=["GET"], allow_headers=["*"],
     )
+
+    _bearer = HTTPBearer(auto_error=False)
+
+    def _require_auth(creds: Optional[HTTPAuthorizationCredentials] = Security(_bearer)):
+        if API_TOKEN and (creds is None or creds.credentials != API_TOKEN):
+            raise HTTPException(status_code=401, detail="unauthorized")
 
     if repo is None and cfg.database_url:
         repo = PostgresRepo(cfg.database_url)
@@ -47,14 +58,15 @@ def create_app(repo: Optional[ProjectionRepo] = None, event_source=None, cfg=Non
             raise HTTPException(status_code=503, detail="no projection repo configured (set DATABASE_URL)")
         return app.state.repo
 
-    @app.get("/api/health")
+    @app.get("/api/health", dependencies=[Depends(_require_auth)])
     def health():
         try:
             return {"status": "ok", **_repo().health(), "mode": cfg.mode.value}
         except Exception as e:
-            return JSONResponse({"status": "degraded", "error": str(e)}, status_code=200)
+            logger.error("Health check error: %s", e)
+            return JSONResponse({"status": "degraded", "error": "database unavailable"}, status_code=200)
 
-    @app.get("/api/watchlist")
+    @app.get("/api/watchlist", dependencies=[Depends(_require_auth)])
     def watchlist():
         from ...multi_engine import load_watchlist
         try:
@@ -64,23 +76,23 @@ def create_app(repo: Optional[ProjectionRepo] = None, event_source=None, cfg=Non
             sym = getattr(cfg, "symbol", "SOLUSDT")
             return {"watchlist": [sym]}
 
-    @app.get("/api/positions")
+    @app.get("/api/positions", dependencies=[Depends(_require_auth)])
     def positions(mode: Optional[str] = Query(None, pattern="^(paper|live)$")):
         return _repo().positions(mode)
 
-    @app.get("/api/orders")
-    def orders(mode: Optional[str] = Query(None, pattern="^(paper|live)$"), limit: int = 50):
+    @app.get("/api/orders", dependencies=[Depends(_require_auth)])
+    def orders(mode: Optional[str] = Query(None, pattern="^(paper|live)$"), limit: int = Query(default=50, ge=1, le=500)):
         return _repo().orders(mode, limit)
 
-    @app.get("/api/fills")
-    def fills(mode: Optional[str] = Query(None, pattern="^(paper|live)$"), limit: int = 50):
+    @app.get("/api/fills", dependencies=[Depends(_require_auth)])
+    def fills(mode: Optional[str] = Query(None, pattern="^(paper|live)$"), limit: int = Query(default=50, ge=1, le=500)):
         return _repo().fills(mode, limit)
 
-    @app.get("/api/pnl")
+    @app.get("/api/pnl", dependencies=[Depends(_require_auth)])
     def pnl(mode: Optional[str] = Query(None, pattern="^(paper|live)$")):
         return _repo().pnl(mode)
 
-    @app.get("/api/stream")
+    @app.get("/api/stream", dependencies=[Depends(_require_auth)])
     async def stream():
         """SSE: realtime bot events relayed from Redis pub/sub."""
         source_factory = app.state.event_source

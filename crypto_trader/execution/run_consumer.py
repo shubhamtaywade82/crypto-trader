@@ -42,27 +42,30 @@ def build_consumer() -> SignalConsumer:
             logger.error("projection init failed: %s", e)
             system.projection = None
 
-    if getattr(system, "event_store", None) is not None or getattr(system, "projection", None) is not None or cfg.redis_enabled:
-        prev = system.wallet.event_hook
-        bus = RedisStreamBus.from_url(cfg.redis_url) if cfg.redis_enabled else None
-        
+    from ..infra.event_routing import build_event_sink
+
+    # Build the base sink for event_store + projection
+    _base_sink = build_event_sink(
+        event_store=getattr(system, "event_store", None),
+        projection=getattr(system, "projection", None),
+        mode=cfg.mode.value,
+        prev_hook=system.wallet.event_hook,
+    )
+
+    # Wrap with Redis bus publish
+    _event_bus = RedisStreamBus.from_url(cfg.redis_url) if cfg.redis_enabled else None
+    if _event_bus is not None:
+        _prev = _base_sink
         def _sink(ev):
-            # Ensure mode is included for the UI/Projection to filter correctly
-            if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
-                if "mode" not in ev["payload"]:
-                    ev["payload"]["mode"] = cfg.mode.value
-                    
-            if getattr(system, "event_store", None) is not None:
-                try: system.event_store.append(ev)
-                except Exception as e: logger.error("event store append failed: %s", e)
-            if getattr(system, "projection", None) is not None:
-                try: system.projection.apply(ev)
-                except Exception as e: logger.error("projection apply failed: %s", e)
-            if bus:
-                try: bus.publish("events:broadcast", ev)
-                except Exception as e: logger.error("redis event broadcast failed: %s", e)
-            if prev: prev(ev)
+            if _prev:
+                _prev(ev)
+            try:
+                _event_bus.publish("events:broadcast", ev)
+            except Exception as e:
+                logger.error("redis event broadcast failed: %s", e)
         system.wallet.event_hook = _sink
+    elif _base_sink is not None:
+        system.wallet.event_hook = _base_sink
 
     adapter = WalletSignalAdapter(system.wallet)
     adapters = {"paper": adapter, "live": adapter}  # wallet decides paper vs live

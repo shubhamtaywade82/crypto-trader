@@ -246,22 +246,15 @@ def main():
         except Exception as e:
             logger.error("Failed to initialize UI event relay: %s", e)
             
-    if event_store is not None or projection is not None or ui_publisher is not None:
-        prev_hook = global_wallet.event_hook
-        def _sink(ev):
-            if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
-                ev["payload"]["mode"] = cfg.mode.value
-                
-            if event_store is not None:
-                try: event_store.append(ev)
-                except Exception as e: logger.error("event store append failed: %s", e)
-            if projection is not None:
-                try: projection.apply(ev)
-                except Exception as e: logger.error("projection apply failed: %s", e)
-            if ui_publisher is not None:
-                ui_publisher(ev)
-            if prev_hook:
-                prev_hook(ev)
+    from crypto_trader.infra.event_routing import build_event_sink
+    _sink = build_event_sink(
+        event_store=event_store,
+        projection=projection,
+        ui_publisher=ui_publisher,
+        mode=cfg.mode.value,
+        prev_hook=global_wallet.event_hook,
+    )
+    if _sink is not None:
         global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)

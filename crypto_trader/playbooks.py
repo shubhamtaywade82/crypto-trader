@@ -7,6 +7,7 @@ Playbook B: Swing (24-48h, scaled exits, 1.2% SL, trail)
 
 import logging
 from typing import Optional, Dict
+from typing import Protocol, runtime_checkable
 from enum import Enum
 
 import pandas as pd
@@ -18,6 +19,92 @@ from .wallet import PositionSide, Playbook
 logger = logging.getLogger("crypto_trader.playbooks")
 
 
+@runtime_checkable
+class BasePlaybook(Protocol):
+    """Structural Protocol all playbooks must satisfy for registry-based dispatch."""
+    name: str
+
+    def evaluate(self, *args, **kwargs) -> Optional[Dict]:
+        ...
+
+
+def _compute_smc_bonus(
+    direction: "PositionSide",
+    structure: Optional[Dict],
+    current_price: float,
+    breakout_level: float = 0.0,
+    include_sweep: bool = True,
+    include_pa_signals: bool = False,
+) -> float:
+    """Compute SMC confluence bonus from market structure signals.
+
+    Args:
+        direction: Trade direction (PositionSide.LONG or SHORT).
+        structure: MarketStructureAnalyzer output dict.
+        current_price: Current close price.
+        breakout_level: If >0, OB proximity is checked against this level instead of current_price.
+        include_sweep: Whether to award a bonus for a recent liquidity sweep.
+        include_pa_signals: Whether to award a bonus for engulfing PA signals.
+    """
+    if not structure:
+        return 0.0
+
+    bonus = 0.0
+    dir_str = "BULLISH" if direction == PositionSide.LONG else "BEARISH"
+    recent_bos = structure.get("recent_bos")
+    recent_sweep = structure.get("recent_sweep")
+    unmitigated_obs = structure.get("unmitigated_order_blocks", [])
+    unmitigated_fvgs = structure.get("unmitigated_fvgs", [])
+    pa_signals = structure.get("price_action_signals", [])
+
+    # BOS bonus (PlaybookA gives 0.15, PlaybookB gives 0.20)
+    bos_weight = 0.20 if include_pa_signals else 0.15
+    if recent_bos and recent_bos["type"] == dir_str and recent_bos.get("candles_ago", 999) <= 10:
+        bonus += bos_weight
+
+    # Sweep bonus (PlaybookA style only)
+    if include_sweep and recent_sweep and recent_sweep["type"] == dir_str and recent_sweep.get("candles_ago", 999) <= 5:
+        bonus += 0.15
+
+    # OB bonus
+    if breakout_level > 0:
+        # PlaybookB style: OB near the breakout level
+        ob_key = "high" if direction == PositionSide.LONG else "low"
+        for ob in unmitigated_obs:
+            if ob["type"] == dir_str and abs(float(ob[ob_key]) - breakout_level) / breakout_level < 0.005:
+                bonus += 0.15
+                break
+    else:
+        # PlaybookA style: price inside OB zone
+        for ob in unmitigated_obs:
+            if ob["type"] == dir_str and float(ob["low"]) <= current_price <= float(ob["high"]):
+                bonus += 0.15
+                break
+
+    # FVG bonus (PlaybookA style only)
+    if not include_pa_signals:
+        if direction == PositionSide.LONG:
+            for fvg in unmitigated_fvgs:
+                if fvg["type"] == "BULLISH" and float(fvg["bottom"]) > current_price:
+                    bonus += 0.10
+                    break
+        else:
+            for fvg in unmitigated_fvgs:
+                if fvg["type"] == "BEARISH" and float(fvg["top"]) < current_price:
+                    bonus += 0.10
+                    break
+
+    # PA signals bonus (PlaybookB style only)
+    if include_pa_signals:
+        pattern = "BULLISH_ENGULFING" if direction == PositionSide.LONG else "BEARISH_ENGULFING"
+        for sig in pa_signals:
+            if sig["candle"] == "completed" and sig["pattern"] == pattern:
+                bonus += 0.10
+                break
+
+    return bonus
+
+
 # ── Playbook A: Intraday Snap ──
 
 class PlaybookA:
@@ -25,6 +112,8 @@ class PlaybookA:
     6-16 hour hold.
     Entry: 1H pullback to EMA21 within 4H trend + volume + RSI + rejection candle.
     """
+
+    name = "playbook_a"
 
     def __init__(
         self,
@@ -135,40 +224,13 @@ class PlaybookA:
             checks_passed += 1
 
         # SMC confirmation gates (from MarketStructureAnalyzer output)
-        smc_bonus = 0.0
-        if structure:
-            current_price = float(price)
-            recent_bos = structure.get("recent_bos")
-            recent_sweep = structure.get("recent_sweep")
-            unmitigated_obs = structure.get("unmitigated_order_blocks", [])
-            unmitigated_fvgs = structure.get("unmitigated_fvgs", [])
-
-            if direction == PositionSide.LONG:
-                if recent_bos and recent_bos["type"] == "BULLISH" and recent_bos.get("candles_ago", 999) <= 10:
-                    smc_bonus += 0.15
-                if recent_sweep and recent_sweep["type"] == "BULLISH" and recent_sweep.get("candles_ago", 999) <= 5:
-                    smc_bonus += 0.15
-                for ob in unmitigated_obs:
-                    if ob["type"] == "BULLISH" and float(ob["low"]) <= current_price <= float(ob["high"]):
-                        smc_bonus += 0.15
-                        break
-                for fvg in unmitigated_fvgs:
-                    if fvg["type"] == "BULLISH" and float(fvg["bottom"]) > current_price:
-                        smc_bonus += 0.10
-                        break
-            else:
-                if recent_bos and recent_bos["type"] == "BEARISH" and recent_bos.get("candles_ago", 999) <= 10:
-                    smc_bonus += 0.15
-                if recent_sweep and recent_sweep["type"] == "BEARISH" and recent_sweep.get("candles_ago", 999) <= 5:
-                    smc_bonus += 0.15
-                for ob in unmitigated_obs:
-                    if ob["type"] == "BEARISH" and float(ob["low"]) <= current_price <= float(ob["high"]):
-                        smc_bonus += 0.15
-                        break
-                for fvg in unmitigated_fvgs:
-                    if fvg["type"] == "BEARISH" and float(fvg["top"]) < current_price:
-                        smc_bonus += 0.10
-                        break
+        smc_bonus = _compute_smc_bonus(
+            direction=direction,
+            structure=structure,
+            current_price=float(price),
+            include_sweep=True,
+            include_pa_signals=False,
+        )
 
         score += smc_bonus
 
@@ -204,6 +266,8 @@ class PlaybookB:
     Entry: 4H breakout + 1H retest.
     Scaled exits: 50% at +1%, 25% at +2%, 25% runner trails EMA9.
     """
+
+    name = "playbook_b"
 
     def __init__(
         self,
@@ -320,39 +384,14 @@ class PlaybookB:
         checks_passed += 1
 
         # SMC confirmation gates (from MarketStructureAnalyzer output)
-        smc_bonus = 0.0
-        if structure:
-            current_price = float(price)
-            recent_bos = structure.get("recent_bos")
-            unmitigated_obs = structure.get("unmitigated_order_blocks", [])
-            pa_signals = structure.get("price_action_signals", [])
-
-            if direction == PositionSide.LONG:
-                if recent_bos and recent_bos["type"] == "BULLISH" and recent_bos.get("candles_ago", 999) <= 10:
-                    smc_bonus += 0.20
-                for ob in unmitigated_obs:
-                    if (ob["type"] == "BULLISH"
-                            and breakout_level > 0
-                            and abs(float(ob["high"]) - breakout_level) / breakout_level < 0.005):
-                        smc_bonus += 0.15
-                        break
-                for sig in pa_signals:
-                    if sig["candle"] == "completed" and sig["pattern"] == "BULLISH_ENGULFING":
-                        smc_bonus += 0.10
-                        break
-            else:
-                if recent_bos and recent_bos["type"] == "BEARISH" and recent_bos.get("candles_ago", 999) <= 10:
-                    smc_bonus += 0.20
-                for ob in unmitigated_obs:
-                    if (ob["type"] == "BEARISH"
-                            and breakout_level > 0
-                            and abs(float(ob["low"]) - breakout_level) / breakout_level < 0.005):
-                        smc_bonus += 0.15
-                        break
-                for sig in pa_signals:
-                    if sig["candle"] == "completed" and sig["pattern"] == "BEARISH_ENGULFING":
-                        smc_bonus += 0.10
-                        break
+        smc_bonus = _compute_smc_bonus(
+            direction=direction,
+            structure=structure,
+            current_price=float(price),
+            breakout_level=breakout_level,
+            include_sweep=False,
+            include_pa_signals=True,
+        )
 
         score += smc_bonus
 
@@ -384,6 +423,8 @@ class PlaybookAres:
     Entry: Price touches/crosses band + RSI exhaustion.
     R:R: 1:2.3.
     """
+
+    name = "playbook_ares"
 
     def __init__(
         self,
@@ -521,6 +562,8 @@ class PlaybookVolExhaust:
     Exit: target the band mean (20-SMA); SL = 1.5*ATR beyond the extreme wick.
     """
 
+    name = "playbook_volx"
+
     def __init__(
         self,
         bb_period: int = 20,
@@ -643,6 +686,8 @@ class PlaybookSweepMSS:
     Entry on pullback into an unmitigated order block / FVG.
     SL beyond the sweeping wick; TP = opposing liquidity pool (active swing).
     """
+
+    name = "playbook_sweep"
 
     def __init__(
         self,

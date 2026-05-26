@@ -34,7 +34,7 @@ from .regime import (
     RegimeClassifier, RegimeContext, calculate_rvol, compute_ema,
 )
 from .session import get_session_context, TradingSession
-from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD
+from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD, build_advisor
 from .journal import TradeJournal
 from .structure import MarketStructureAnalyzer
 
@@ -43,6 +43,9 @@ logger = logging.getLogger("crypto_trader.engine_ws")
 DEFAULT_SYMBOL = "SOLUSDT"
 LEVERAGE = 5
 FUNDING_EXTREME = 0.0005
+DEFAULT_SL_PCT = 0.007
+DEFAULT_TP1_PCT = 0.010
+DEFAULT_TP2_PCT = 0.020
 
 
 class WebSocketTradingEngine:
@@ -141,6 +144,12 @@ class WebSocketTradingEngine:
         self.playbook_ares = PlaybookAres()
         self.playbook_volx = PlaybookVolExhaust()
         self.playbook_sweep = PlaybookSweepMSS()
+        self._playbook_registry: dict = {
+            pb.name: pb for pb in [
+                self.playbook_a, self.playbook_b, self.playbook_ares,
+                self.playbook_volx, self.playbook_sweep,
+            ]
+        }
 
         # Regime / Session engine
         _rc_kwargs = {}
@@ -160,33 +169,7 @@ class WebSocketTradingEngine:
         # LLM
         self.advisor = None
         self._llm_thread = None
-        if use_llm:
-            use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
-
-            if use_cloud:
-                resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
-                resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
-                resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
-                logger.info(f"[LLM] Mode: CLOUD (Target: {resolved_host})")
-            else:
-                resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-                resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
-                resolved_key = os.getenv("OLLAMA_API_KEY", "")
-                logger.info("[LLM] Mode: LOCAL")
-
-            use_openai = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
-
-            self.advisor = OllamaAdvisor(
-                host=resolved_host,
-                model=resolved_model,
-                api_key=resolved_key,
-                use_openai=use_openai,
-                log_llm=llm_logged
-            )
-            if self.advisor.is_ready():
-                logger.info(f"[LLM] Connected to {resolved_model}")
-            else:
-                logger.warning("[LLM] Ollama unavailable. Technical-only mode.")
+        self.advisor = build_advisor(use_llm, llm_host=llm_host, llm_model=llm_model, llm_logged=llm_logged)
 
         # WebSocket position manager (high-frequency exits)
         self.ws_pm = WebSocketPositionManager(
@@ -221,7 +204,7 @@ class WebSocketTradingEngine:
         """Handle incoming commands from EventBus (e.g., Telegram)."""
         if event.command == "KILL_ALL" or (event.command == "KILL" and event.params.get("symbol") == self.symbol):
             self._halted = True
-            logger.warning(f"🛑 [HALTED] {self.symbol} received KILL command.")
+            logger.warning("[KILL] [HALTED] %s received KILL command.", self.symbol)
             # A remote KILL must flatten the live position, not just block new
             # entries — otherwise an open position rides on unattended.
             try:
@@ -231,17 +214,17 @@ class WebSocketTradingEngine:
                     if not mark or mark <= 0:
                         mark = float(pos.entry_price)
                     self.wallet.close_position(self.symbol, float(mark), reason="REMOTE_KILL")
-                    logger.warning(f"🛑 [KILL] flattened {self.symbol} on remote command")
+                    logger.warning("[KILL] flattened %s on remote command", self.symbol)
             except Exception as e:
                 logger.error("remote KILL flatten failed for %s: %s", self.symbol, e)
         
         elif event.command == "RESUME_ALL" or (event.command == "RESUME" and event.params.get("symbol") == self.symbol):
             self._halted = False
-            logger.info(f"✅ [RESUMED] {self.symbol} received RESUME command.")
+            logger.info("[RESUMED] %s received RESUME command.", self.symbol)
 
         elif event.command == "STATUS":
             # Engine will respond via logs or potentially publish a StatusEvent
-            logger.info(f"📊 [STATUS] {self.symbol} | Halted: {self._halted} | Pos: {self.wallet.get_open_position(self.symbol) is not None}")
+            logger.info("[STATUS] %s | Halted: %s | Pos: %s", self.symbol, self._halted, self.wallet.get_open_position(self.symbol) is not None)
 
     # ── Lifecycle ──
 
@@ -376,8 +359,8 @@ class WebSocketTradingEngine:
         try:
             from . import safe_mode
             safe_mode.trip_halt(reason)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.critical("[SUPERVISOR] Failed to trip HALT file: %s", e)
         if getattr(self, "risk_manager", None) is not None:
             self.risk_manager.trigger_kill_switch(reason)
         if self.event_bus:
@@ -455,8 +438,8 @@ class WebSocketTradingEngine:
                 liq_vol = float(liq_df["quoteQty"].sum())
                 # Normalise against a rough baseline of 1M USDT liquidations
                 liquidation_intensity = min(liq_vol / 1_000_000, 1.0)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[SIGNAL-TICK] liquidation fetch skipped: %s", e)
 
         # Spread estimate for chaos detection (use WS spread if available)
         ws_spread_pct = 0.0
@@ -465,8 +448,8 @@ class WebSocketTradingEngine:
             _mid = self.ws_feed.get_mid_price()
             if _mid > 0:
                 ws_spread_pct = (_spread / _mid) * 100
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[SIGNAL-TICK] spread fetch skipped: %s", e)
 
         # Extended regime classification
         adx_val = float(df_4h["adx"].iloc[-1]) if "adx" in df_4h.columns else 0.0
@@ -840,7 +823,7 @@ class WebSocketTradingEngine:
         # proportional stop distance rather than discarding it for a flat default.
         is_long = setup["side"] == PositionSide.LONG
         pb_entry = float(setup.get("entry_price") or 0)
-        default_sl_pct, default_tp_pct = 0.007, 0.010
+        default_sl_pct, default_tp_pct = DEFAULT_SL_PCT, DEFAULT_TP1_PCT
 
         def _reanchor(level_price, fallback_pct, is_stop):
             """Map a playbook level to the actual entry, keeping its ratio."""

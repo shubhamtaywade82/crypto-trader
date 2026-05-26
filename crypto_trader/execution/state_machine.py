@@ -72,9 +72,12 @@ class InvalidTransition(Exception):
 class OrderLifecycle:
     """Mutable holder enforcing legal transitions for a single order."""
 
-    def __init__(self, client_order_id: str, state: OrderState = OrderState.CREATED):
+    def __init__(self, client_order_id: str, state: OrderState = OrderState.CREATED,
+                 symbol: str = "", intent: str = ""):
         self.client_order_id = client_order_id
         self.state = state
+        self.symbol = symbol
+        self.intent = intent
 
     def transition(self, target: OrderState) -> OrderState:
         if self._is_repeated_partial_fill(target):

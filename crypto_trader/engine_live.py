@@ -369,25 +369,15 @@ class LiveTradingSystem:
             except Exception as e:
                 logger.error("UI event relay init failed (continuing without it): %s", e)
 
-        if self.event_store is not None or self.projection is not None or ui_publisher is not None:
-            prev = self.wallet.event_hook
-            def _sink(ev):
-                if isinstance(ev, dict) and "payload" in ev and isinstance(ev["payload"], dict):
-                    ev["payload"]["mode"] = self.cfg.mode.value
-                if self.event_store is not None:
-                    try:
-                        self.event_store.append(ev)
-                    except Exception as e:  # never let journaling kill trading
-                        logger.error("event store append failed: %s", e)
-                if self.projection is not None:
-                    try:
-                        self.projection.apply(ev)
-                    except Exception as e:  # projection is derived; never fatal
-                        logger.error("projection apply failed: %s", e)
-                if ui_publisher is not None:
-                    ui_publisher(ev)  # already swallows its own errors
-                if prev:
-                    prev(ev)
+        from .infra.event_routing import build_event_sink
+        _sink = build_event_sink(
+            event_store=self.event_store,
+            projection=self.projection,
+            ui_publisher=ui_publisher,
+            mode=self.cfg.mode.value,
+            prev_hook=self.wallet.event_hook,
+        )
+        if _sink is not None:
             self.wallet.event_hook = _sink
 
         # Decoupled execution bus (opt-in via EXECUTION_BUS=redis + REDIS_URL):

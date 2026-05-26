@@ -18,13 +18,17 @@ def main():
     time.sleep(5)
     
     print("Checking Postgres rows...")
-    output = subprocess.check_output(f'psql "{db_url}" -c "SELECT * FROM active_positions; SELECT * FROM orders; SELECT * FROM fills;"', shell=True)
+    output = subprocess.check_output(
+        ["psql", db_url, "-c", "SELECT * FROM active_positions; SELECT * FROM orders; SELECT * FROM fills;"]
+    )
     print(output.decode('utf-8'))
-    
+
     print("Publishing DUPLICATE signal...")
     publisher.emit(signal)
     time.sleep(2)
-    output2 = subprocess.check_output(f'psql "{db_url}" -c "SELECT count(*) FROM orders;"', shell=True)
+    output2 = subprocess.check_output(
+        ["psql", db_url, "-c", "SELECT count(*) FROM orders;"]
+    )
     print("Orders count after duplicate:")
     print(output2.decode('utf-8'))
     
@@ -45,7 +49,7 @@ def main():
     # DLQ is execution:signals:dlq
     # redis-cli -p 6382 XRANGE execution:signals:dlq - +
     try:
-        dlq = subprocess.check_output("redis-cli -p 6382 XRANGE execution:signals:dlq - +", shell=True)
+        dlq = subprocess.check_output(["redis-cli", "-p", "6382", "XRANGE", "execution:signals:dlq", "-", "+"])
         print(dlq.decode('utf-8'))
     except Exception as e:
         print(f"Error checking DLQ: {e}")

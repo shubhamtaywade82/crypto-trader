@@ -655,3 +655,40 @@ class OllamaAdvisor:
 
         final_score = tech_component + llm_component
         return round(final_score, 3), llm_weight, explanation
+
+
+def build_advisor(
+    use_llm: bool,
+    llm_host: str = None,
+    llm_model: str = None,
+    llm_logged: bool = False,
+) -> "OllamaAdvisor | None":
+    """Factory: build OllamaAdvisor from config/env. Returns None if use_llm=False or unavailable."""
+    if not use_llm:
+        return None
+    import os
+    use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
+    if use_cloud:
+        resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
+        resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
+        resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
+        import logging; logging.getLogger("crypto_trader.llm_advisor").info("[LLM] Mode: CLOUD (Target: %s)", resolved_host)
+    else:
+        resolved_host = llm_host or os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+        resolved_model = llm_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
+        resolved_key = os.getenv("OLLAMA_API_KEY", "")
+        import logging; logging.getLogger("crypto_trader.llm_advisor").info("[LLM] Mode: LOCAL")
+    use_openai = os.getenv("USE_OPENAI_FORMAT", "false").lower() in ("true", "1", "yes")
+    advisor = OllamaAdvisor(
+        host=resolved_host,
+        model=resolved_model,
+        api_key=resolved_key,
+        use_openai=use_openai,
+        log_llm=llm_logged,
+    )
+    import logging; _log = logging.getLogger("crypto_trader.llm_advisor")
+    if advisor.is_ready():
+        _log.info("[LLM] Connected to %s", resolved_model)
+    else:
+        _log.warning("[LLM] Ollama unavailable. Technical-only mode.")
+    return advisor

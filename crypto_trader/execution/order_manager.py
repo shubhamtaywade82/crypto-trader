@@ -15,6 +15,7 @@ It deliberately does NOT decide *what* to trade; the strategy/orchestrator does.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from decimal import Decimal
 from typing import Dict, Optional
@@ -48,6 +49,7 @@ class OrderManager:
         self.backoff_base = backoff_base
         # client_order_id -> lifecycle
         self.lifecycles: Dict[str, OrderLifecycle] = {}
+        self._lock = threading.Lock()
 
     def submit(
         self,
@@ -64,8 +66,11 @@ class OrderManager:
         expires_at: Optional[int] = None,
     ) -> Order:
         coid = make_client_order_id(symbol, intent, nonce=nonce)
-        self._guard_duplicate_submission(coid, symbol, reduce_only)
-        lifecycle = self.lifecycles.setdefault(coid, OrderLifecycle(coid))
+        with self._lock:
+            self._guard_duplicate_submission(coid, symbol, reduce_only)
+            lifecycle = self.lifecycles.setdefault(
+                coid, OrderLifecycle(coid, symbol=symbol, intent=intent)
+            )
 
         return self._execute_with_retry(
             lifecycle, coid, symbol, side, quantity, order_type,
@@ -129,10 +134,10 @@ class OrderManager:
 
     # ── internals ────────────────────────────────────────────────────────────
     def _has_working_entry(self, symbol: str) -> bool:
-        for coid, lc in self.lifecycles.items():
+        for lc in self.lifecycles.values():
             if lc.terminal:
                 continue
-            if symbol.upper() in coid.upper() and "exit" not in coid.lower():
+            if lc.symbol.upper() == symbol.upper() and lc.intent != "exit":
                 return True
         return False
 
