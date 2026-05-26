@@ -226,6 +226,10 @@ def build_prompt(
     oi_delta: float,
     taker_ratio: float,
     open_positions: List[dict],
+    market_regime: str = "",
+    session: str = "",
+    is_kill_zone: bool = False,
+    rvol: float = 1.0,
 ) -> str:
     """Build rich, structured prompt with pre-calculated SMC & Price Action market structure context."""
 
@@ -248,11 +252,21 @@ def build_prompt(
 
     structure_text = "\n\n".join(blocks)
 
+    # Extended regime / session context line (empty string if not provided)
+    regime_ctx_line = ""
+    if market_regime or session:
+        kill_zone_label = f" kill_zone={is_kill_zone}" if session else ""
+        rvol_label = f" | RVOL: {rvol:.2f}" if rvol != 1.0 else ""
+        regime_ctx_line = (
+            f"    Extended Regime: {market_regime or 'N/A'} | "
+            f"Session: {session or 'N/A'}{kill_zone_label}{rvol_label}\n"
+        )
+
     return f"""Analyze {symbol} and return ONLY JSON.
 
     Price: {mark_price:.2f} | 24h: {change_24h:+.2f}% | Regime: {regime} (score={regime_score:.2f})
     Funding: {funding_rate:+.4f}% | OI Delta 24h: {oi_delta:+.1f}% | Taker Buy Ratio: {taker_ratio:.2f}
-
+{regime_ctx_line}
     {structure_text}
 
     Positions: {pos_ctx}
@@ -527,13 +541,21 @@ class OllamaAdvisor:
         taker_ratio: float,
         open_positions: List[dict],
         force_refresh: bool = False,
+        market_regime: str = "",
+        session: str = "",
+        is_kill_zone: bool = False,
+        rvol: float = 1.0,
     ) -> Optional[LLMAdvice]:
         if not self.circuit_breaker.can_use():
             logger.warning("[LLM] Circuit breaker active. LLM disabled.")
             return None
 
-        prompt = build_prompt(symbol, df_5m, df_15m, df_1h, df_4h, regime, regime_score, mark_price,
-                              funding_rate, oi_delta, taker_ratio, open_positions)
+        prompt = build_prompt(
+            symbol, df_5m, df_15m, df_1h, df_4h, regime, regime_score, mark_price,
+            funding_rate, oi_delta, taker_ratio, open_positions,
+            market_regime=market_regime, session=session,
+            is_kill_zone=is_kill_zone, rvol=rvol,
+        )
 
         if not force_refresh:
             cached = self.cache.get(symbol, prompt)

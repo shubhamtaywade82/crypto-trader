@@ -19,6 +19,7 @@ import logging
 import argparse
 from decimal import Decimal
 from datetime import datetime, timezone
+from typing import Optional
 
 import pandas as pd
 
@@ -28,7 +29,11 @@ from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB, PlaybookAres
-from .regime import MarketRegimeAnalyzer, compute_ema
+from .regime import (
+    MarketRegimeAnalyzer, MarketRegime, ExtendedRegime,
+    RegimeClassifier, RegimeContext, calculate_rvol, compute_ema,
+)
+from .session import get_session_context, TradingSession
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD
 from .journal import TradeJournal
 from .structure import MarketStructureAnalyzer
@@ -130,6 +135,18 @@ class WebSocketTradingEngine:
         self.playbook_a = PlaybookA()
         self.playbook_b = PlaybookB()
         self.playbook_ares = PlaybookAres()
+
+        # Regime / Session engine
+        _rc_kwargs = {}
+        if cfg:
+            _rc_kwargs = dict(
+                rvol_dead=cfg.rvol_dead_threshold,
+                rvol_weak=cfg.rvol_weak_threshold,
+                rvol_strong=cfg.rvol_strong_threshold,
+                size_high=cfg.regime_size_multiplier_high,
+                size_low=cfg.regime_size_multiplier_low,
+            )
+        self.regime_classifier = RegimeClassifier(**_rc_kwargs)
 
         # Journal
         self.journal = TradeJournal()
@@ -380,11 +397,70 @@ class WebSocketTradingEngine:
             logger.error(f"Data fetch failed — skipping signal tick: {e}")
             return
 
-        # 1. Regime analysis
-        regime, regime_score, df_4h = self.regime_analyzer.analyze(df_4h)
-        logger.info(f"Regime: {regime.value} (score={regime_score:.2f})")
+        # 1. Session context
+        session_ctx = get_session_context()
+        logger.info(
+            f"[SESSION] {session_ctx.session.value} | "
+            f"kill_zone={session_ctx.is_kill_zone} ({session_ctx.kill_zone_name or 'none'}) | "
+            f"UTC={session_ctx.utc_hour:02d}h"
+        )
 
-        # 2. Market structure analysis (SMC signals for playbook gating)
+        # Kill zone gate: if enabled, skip signal evaluation outside kill zones
+        require_kz = getattr(self.cfg, "require_kill_zone", False) if self.cfg else False
+        if require_kz and not session_ctx.is_kill_zone:
+            logger.info("[SIGNAL-TICK] Outside kill zone — skipping (REQUIRE_KILL_ZONE=True)")
+            return
+
+        # 2. Regime analysis
+        regime, regime_score, df_4h = self.regime_analyzer.analyze(df_4h)
+
+        # RVOL on the 1H frame (most relevant for intraday entries)
+        rvol = calculate_rvol(df_1h, window=20)
+
+        # OI delta: would require storing historical OI to compute a proper delta.
+        # Using 0.0 for now — the raw oi value is still passed to the LLM prompt.
+        oi_delta = 0.0
+
+        # Liquidation intensity: normalise recent liquidation volume to 0–1
+        liquidation_intensity = 0.0
+        try:
+            liq_df = self.data_feed.get_liquidation_orders(self.symbol)
+            if liq_df is not None and not liq_df.empty and "quoteQty" in liq_df.columns:
+                liq_vol = float(liq_df["quoteQty"].sum())
+                # Normalise against a rough baseline of 1M USDT liquidations
+                liquidation_intensity = min(liq_vol / 1_000_000, 1.0)
+        except Exception:
+            pass
+
+        # Spread estimate for chaos detection (use WS spread if available)
+        ws_spread_pct = 0.0
+        try:
+            _spread = self.ws_feed.get_spread()
+            _mid = self.ws_feed.get_mid_price()
+            if _mid > 0:
+                ws_spread_pct = (_spread / _mid) * 100
+        except Exception:
+            pass
+
+        # Extended regime classification
+        adx_val = float(df_4h["adx"].iloc[-1]) if "adx" in df_4h.columns else 0.0
+        regime_ctx: RegimeContext = self.regime_classifier.build_context(
+            base_regime=regime,
+            adx=adx_val,
+            rvol=rvol,
+            oi_delta=oi_delta,
+            liquidation_intensity=liquidation_intensity,
+            session_name=session_ctx.session.value,
+            is_kill_zone=session_ctx.is_kill_zone,
+            spread_pct=ws_spread_pct,
+        )
+        logger.info(
+            f"[REGIME] {regime.value} (score={regime_score:.2f}) | "
+            f"extended={regime_ctx.extended.value} | "
+            f"rvol={rvol:.2f} | adx={adx_val:.1f} | size_x={regime_ctx.size_multiplier:.2f}"
+        )
+
+        # 3. Market structure analysis (SMC signals for playbook gating)
         structure = None
         try:
             msa = MarketStructureAnalyzer(df_1h, swing_window=3)
@@ -399,11 +475,7 @@ class WebSocketTradingEngine:
             logger.warning(f"[STRUCTURE] MarketStructureAnalyzer failed: {e}")
             structure = None
 
-        # OI delta: would require storing historical OI to compute a proper delta.
-        # Using 0.0 for now — the raw oi value is still passed to the LLM prompt.
-        oi_delta = 0.0
-
-        # 3. Start LLM async
+        # 4. Start LLM async (pass extended regime for richer context)
         if self.use_llm and self.advisor:
             pos = self.wallet.get_open_position(self.symbol)
             open_positions = [pos.to_dict()] if pos else []
@@ -421,9 +493,13 @@ class WebSocketTradingEngine:
                     oi_delta=oi_delta,
                     taker_ratio=taker_ratio,
                     open_positions=open_positions,
+                    market_regime=regime_ctx.extended.value,
+                    session=session_ctx.session.value,
+                    is_kill_zone=session_ctx.is_kill_zone,
+                    rvol=rvol,
                 )
 
-        # 4. Risk check
+        # 5. Risk check
         self.risk_manager.update_peak_balance(self.wallet.margin_balance)
         # Assuming initial balance for daily drawdown is the wallet balance minus daily PnL
         initial_daily_balance = float(self.wallet.wallet_balance) - self.risk_manager.daily_pnl
@@ -445,7 +521,7 @@ class WebSocketTradingEngine:
             return
         self._halt_published = False
 
-        # 4.5 Update position if open (to check AI and regime reversal exits)
+        # 5.5 Update position if open (to check AI and regime reversal exits)
         pos = self.wallet.get_open_position(self.symbol)
         if pos:
             df_1h["ema9"] = compute_ema(df_1h["close"], 9)
@@ -465,13 +541,22 @@ class WebSocketTradingEngine:
                 current_regime=regime.value if regime else None,
             )
 
-        # 5. Evaluate entry if no open position
+        # 6. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:
+            # Block entry when regime forbids it (DEAD_MARKET, HIGH_RISK_CHAOS, LIQUIDATION_EVENT)
+            if not regime_ctx.allows_new_entries():
+                logger.info(
+                    f"[REGIME-BLOCK] No entry — extended regime is {regime_ctx.extended.value}"
+                )
+                return
+
             # Get latest ADX for Ares playbook filter
             latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
             try:
                 self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                                    funding_rate, oi_delta, taker_ratio, structure=structure, adx_1h=latest_adx)
+                                    funding_rate, oi_delta, taker_ratio, structure=structure,
+                                    adx_1h=latest_adx, regime_ctx=regime_ctx,
+                                    session_ctx=session_ctx)
             except Exception as e:
                 # An exception mid-entry (e.g. order placed but booking/SL failed)
                 # could leave an unmanaged live position. Fail safe: HALT, trip
@@ -494,27 +579,59 @@ class WebSocketTradingEngine:
         # 6. Print summary
         self.wallet.print_summary()
 
+    # Regime → allowed strategy order. Empty list means no entries.
+    _REGIME_STRATEGY_MAP: dict = {
+        ExtendedRegime.TREND_EXPANSION:      ["playbook_a", "playbook_b"],
+        ExtendedRegime.BREAKOUT_ENVIRONMENT: ["playbook_b", "playbook_a"],
+        ExtendedRegime.ACCUMULATION:         ["playbook_a"],
+        ExtendedRegime.MEAN_REVERSION:       ["playbook_ares"],
+        ExtendedRegime.LOW_VOL_CHOP:         ["playbook_ares"],
+        ExtendedRegime.LIQUIDATION_EVENT:    [],
+        ExtendedRegime.DEAD_MARKET:          [],
+        ExtendedRegime.HIGH_RISK_CHAOS:      [],
+    }
+
     def _evaluate_entry(self, df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                        funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None):
+                        funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None,
+                        regime_ctx: Optional[RegimeContext] = None,
+                        session_ctx=None):
         """Evaluate entry signals and execute via WebSocket LTP."""
         setup = None
 
-        # 1. Try Playbook Ares (Mean Reversion)
-        setup = self.playbook_ares.evaluate(df_15m, adx_1h=adx_1h)
-        if setup:
-            logger.info(f"[PLAYBOOK ARES] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+        # Determine allowed playbook order from extended regime (fallback: legacy order)
+        if regime_ctx is not None:
+            allowed = self._REGIME_STRATEGY_MAP.get(
+                regime_ctx.extended,
+                ["playbook_ares", "playbook_a", "playbook_b"],
+            )
+        else:
+            allowed = ["playbook_ares", "playbook_a", "playbook_b"]
 
-        # 2. Try Playbook A
-        if not setup:
-            setup = self.playbook_a.evaluate(df_1h, regime, structure=structure)
-            if setup:
-                logger.info(f"[PLAYBOOK A] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+        if not allowed:
+            logger.info(f"[ROUTER] No strategies allowed for {regime_ctx.extended.value if regime_ctx else 'unknown'}")
+            return
 
-        # 3. Try Playbook B
-        if not setup:
-            setup = self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure)
+        logger.info(f"[ROUTER] allowed_strategies={allowed}")
+
+        playbook_map = {
+            "playbook_ares": lambda: self.playbook_ares.evaluate(df_15m, adx_1h=adx_1h),
+            "playbook_a":    lambda: self.playbook_a.evaluate(df_1h, regime, structure=structure),
+            "playbook_b":    lambda: self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure),
+        }
+        playbook_labels = {
+            "playbook_ares": "PLAYBOOK ARES",
+            "playbook_a":    "PLAYBOOK A",
+            "playbook_b":    "PLAYBOOK B",
+        }
+
+        for pb_key in allowed:
+            evaluator = playbook_map.get(pb_key)
+            if evaluator is None:
+                continue
+            setup = evaluator()
             if setup:
-                logger.info(f"[PLAYBOOK B] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+                logger.info(f"[{playbook_labels[pb_key]}] Signal: {setup['side'].value} | score={setup['score']:.2f}")
+                break
 
         if not setup:
             return
@@ -560,7 +677,8 @@ class WebSocketTradingEngine:
         # Execute entry using WebSocket LTP for precise price
         self._execute_entry(setup, final_score, llm_weight, explanation,
                            mark_price, funding_rate, oi_delta, taker_ratio,
-                           tech_score, regime, regime_score, advice, dynamic_threshold)
+                           tech_score, regime, regime_score, advice, dynamic_threshold,
+                           regime_ctx=regime_ctx)
 
     def _coindcx_market_data(self):
         if self._coindcx_md is None:
@@ -603,7 +721,8 @@ class WebSocketTradingEngine:
 
     def _execute_entry(self, setup, final_score, llm_weight, explanation,
                       mark_price, funding_rate, oi_delta, taker_ratio,
-                      tech_score, regime, regime_score, advice, dynamic_threshold):
+                      tech_score, regime, regime_score, advice, dynamic_threshold,
+                      regime_ctx: Optional[RegimeContext] = None):
         """Execute entry using real-time WebSocket prices."""
         # A1: never enter on stale data. If the WS feed has no fresh price within
         # the staleness budget, veto the entry rather than fall back to a possibly
@@ -681,6 +800,13 @@ class WebSocketTradingEngine:
         stop_distance = abs(entry_price - setup["sl_price"])
         risk_budget = self.wallet.margin_balance * Decimal("0.02") * Decimal(str(self.risk_budget_fraction))
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
+        # Apply regime-based size scalar (e.g. 1.25× for TREND_EXPANSION, 0.5× for LOW_VOL_CHOP)
+        if regime_ctx is not None and regime_ctx.size_multiplier != 1.0:
+            size_multiplier *= regime_ctx.size_multiplier
+            logger.debug(
+                f"[SIZING] regime={regime_ctx.extended.value} size_x={regime_ctx.size_multiplier:.2f} "
+                f"→ combined_multiplier={size_multiplier:.3f}"
+            )
         risk_budget *= Decimal(str(size_multiplier))
         stop_distance_dec = Decimal(str(stop_distance))
         quantity = (risk_budget / stop_distance_dec) if stop_distance_dec > 0 else Decimal("0")
@@ -700,10 +826,12 @@ class WebSocketTradingEngine:
             meta = {
                 "sl_price": float(setup["sl_price"]),
                 "regime": regime.value if regime else "",
+                "extended_regime": regime_ctx.extended.value if regime_ctx else "",
                 "tech_score": float(tech_score),
                 "llm_decision": "ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
                 "funding_rate": float(funding_rate),
                 "oi_delta": float(oi_delta),
+                "rvol": float(regime_ctx.rvol) if regime_ctx else 1.0,
             }
             if "time_stop_hours" in setup:
                 meta["time_stop_hours"] = setup["time_stop_hours"]
