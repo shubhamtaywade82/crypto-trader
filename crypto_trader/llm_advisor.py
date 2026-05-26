@@ -682,7 +682,9 @@ class OllamaAdvisor:
                 system_prompt = _load_system_prompt()
 
                 start = time.perf_counter()
-                decision = self._router.route(state, system_prompt, prompt, timeout_s=int(self.client.timeout))
+                # Cap router timeout below staleness cutoff so advice never arrives too old to use.
+                router_timeout = min(int(self.client.timeout), MAX_LLM_AGE_SECONDS - 20)
+                decision = self._router.route(state, system_prompt, prompt, timeout_s=max(15, router_timeout))
                 latency_ms = (time.perf_counter() - start) * 1000
 
                 advice = _decision_to_advice(decision, symbol, latency_ms)

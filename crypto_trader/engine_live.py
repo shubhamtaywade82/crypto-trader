@@ -396,7 +396,10 @@ class LiveTradingSystem:
             leverage=self.cfg.max_leverage,
             wallet=self.wallet,
             event_bus=self.bus,
-            use_llm=False if self.cfg.mode == TradingMode.PAPER else True,
+            use_llm=(
+                False if self.cfg.mode == TradingMode.PAPER
+                else os.getenv("USE_LLM", "true").lower() not in ("false", "0", "no")
+            ),
             cfg=self.cfg,
             signal_publisher=signal_publisher,
         )

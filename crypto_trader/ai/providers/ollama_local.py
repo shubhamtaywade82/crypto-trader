@@ -27,11 +27,13 @@ class OllamaLocalProvider:
             ],
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0.2},
+            "think": False,  # disable thinking tokens — 3-5x faster for qwen3.x models
+            "options": {"temperature": 0.2, "num_predict": 256},
         }
         try:
             resp = self.session.post(f"{self.host}/api/chat", json=payload, timeout=timeout_s)
             resp.raise_for_status()
-            return resp.json()["message"]["content"]
+            data = resp.json()
+            return data["message"]["content"]
         except Exception:
             return None
