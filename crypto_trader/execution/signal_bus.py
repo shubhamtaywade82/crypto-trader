@@ -268,7 +268,10 @@ class WalletSignalAdapter:
                 llm_decision=str(meta.get("llm_decision", "")),
                 funding=float(meta.get("funding_rate", 0) or 0),
                 oi_delta=float(meta.get("oi_delta", 0) or 0),
-                liquidation_price=float(getattr(pos, "liquidation_price", 0) or 0),
+                liquidation_price=float(
+                    self.wallet.liquidation_price(pos)
+                    if hasattr(self.wallet, "liquidation_price") else 0
+                ),
             ))
 
 

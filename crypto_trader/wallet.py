@@ -2627,6 +2627,26 @@ class EnhancedFuturesWallet:
         equity = (pos.margin_used + pos.unrealized_pnl)
         maintenance = pos.notional * self.maintenance_margin_ratio
         return equity < maintenance
+
+    def liquidation_price(self, pos: EnhancedPosition) -> Decimal:
+        """Estimated liquidation price, consistent with ``_is_liquidation_required``
+        (dynamic margin = notional/leverage at mark, plus PnL, vs notional*mmr).
+
+        LONG  liquidates as price falls to  entry / (1 + 1/lev - mmr)
+        SHORT liquidates as price rises to  entry / (1 - 1/lev + mmr)
+        Returns 0 when undefined (e.g. zero leverage/entry).
+        """
+        entry = self._to_decimal(pos.entry_price)
+        lev = self._to_decimal(pos.leverage)
+        mmr = self.maintenance_margin_ratio
+        if entry <= 0 or lev <= 0:
+            return Decimal("0")
+        inv_lev = Decimal("1") / lev
+        denom = (Decimal("1") + inv_lev - mmr) if pos.side == PositionSide.LONG \
+            else (Decimal("1") - inv_lev + mmr)
+        if denom <= 0:
+            return Decimal("0")
+        return entry / denom
     def reset(self):
         with self.lock:
             self.positions.clear()

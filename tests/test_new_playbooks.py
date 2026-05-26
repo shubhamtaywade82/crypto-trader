@@ -160,3 +160,34 @@ def test_maker_limit_paper_fills_at_signal_price_with_maker_fee():
     fill = w.fills[-1]
     expected = (Decimal("100") * Decimal("1")) * w.maker_fee_rate
     assert abs(Decimal(str(fill.fee)) - expected) < Decimal("1e-9")
+
+
+# ── Regression: EnhancedPosition liquidation price (CRITICAL bug fix) ──
+
+def test_liquidation_price_computed_and_no_attribute_error():
+    """Regression for: 'EnhancedPosition' object has no attribute 'liquidation_price'.
+    The wallet exposes a liquidation_price(pos) helper; long liq < entry, short > entry."""
+    import uuid
+    from decimal import Decimal
+    from crypto_trader.wallet import EnhancedFuturesWallet, Playbook, PositionSide
+
+    def fresh(sym):
+        return EnhancedFuturesWallet(symbol=sym, state_namespace=f"test_{uuid.uuid4().hex}")
+
+    w = fresh("BTCUSDT")
+    lp = w.open_position("BTCUSDT", {
+        "entry_price": "100", "side": PositionSide.LONG, "playbook": Playbook.INTRADAY,
+        "sl_price": "90", "tp_price": "110",
+    }, mark_price=100, custom_quantity=1.0)
+    assert lp is not None
+    liq_long = w.liquidation_price(lp)
+    assert liq_long > 0 and liq_long < Decimal("100")
+
+    w2 = fresh("ETHUSDT")
+    sp = w2.open_position("ETHUSDT", {
+        "entry_price": "100", "side": PositionSide.SHORT, "playbook": Playbook.INTRADAY,
+        "sl_price": "110", "tp_price": "90",
+    }, mark_price=100, custom_quantity=1.0)
+    assert sp is not None
+    liq_short = w2.liquidation_price(sp)
+    assert liq_short > Decimal("100")

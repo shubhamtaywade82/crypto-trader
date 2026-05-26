@@ -1000,7 +1000,7 @@ class WebSocketTradingEngine:
                     llm_decision="ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
                     funding=funding_rate,
                     oi_delta=oi_delta,
-                    liquidation_price=pos.liquidation_price
+                    liquidation_price=float(self.wallet.liquidation_price(pos)),
                 ))
 
     # ── WebSocket Callbacks ──
