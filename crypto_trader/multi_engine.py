@@ -232,6 +232,7 @@ def main():
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if telegram_token and telegram_chat_id:
         tg_service = TelegramService(telegram_token, telegram_chat_id, bus)
+        tg_service.attach_wallet(global_wallet)
         tg_service.start()
         logger.info("Telegram notification service started")
     else:
