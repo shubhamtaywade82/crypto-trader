@@ -73,6 +73,7 @@ class LiveTradingSystem:
             venue_tp_enabled=self.cfg.venue_tp_enabled,
             require_venue_sl=self.cfg.require_venue_sl,
             software_sl_backup_bps=self.cfg.software_sl_backup_bps,
+            database_url=self.cfg.database_url,
         )
 
     # ── construction ──────────────────────────────────────────────────────
@@ -97,8 +98,10 @@ class LiveTradingSystem:
         return MarketDataRouter.from_config(self.cfg, bus=self.bus)
 
     def _build_event_store(self):
+        from pathlib import Path
         from .storage import get_event_store
-        return get_event_store(self.cfg.database_url)
+        sqlite_fallback = str(Path.home() / ".crypto_trader" / "event_journal.db")
+        return get_event_store(self.cfg.database_url, sqlite_path=sqlite_fallback)
 
     # ── self-test gate ────────────────────────────────────────────────────
     def preflight(self) -> List[Check]:
@@ -434,7 +437,7 @@ class LiveTradingSystem:
             )
             perp_engine = self.execution_engine  # live CoinDCX futures adapter
 
-        book = ArbBook(namespace=self.cfg.symbol)
+        book = ArbBook(namespace=self.cfg.symbol, database_url=self.cfg.database_url)
         logger.warning("[ARB] funding arbitrage ENABLED for %s (notional=%.2f USDT)",
                        self.cfg.symbol, self.cfg.funding_arb_notional_usdt)
         return FundingArbManager(

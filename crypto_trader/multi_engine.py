@@ -203,28 +203,31 @@ def main():
         )
         logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
         
-    # Create one shared wallet for all engines
-    global_wallet = EnhancedFuturesWallet(
-        symbol="GLOBAL", 
-        initial_balance=total_balance, 
-        leverage=args.leverage,
-    )
-
     # ── Database Projections & Event Journal for Dashboard UI ──
     from crypto_trader.config import load_config
     cfg = load_config()
+
+    # Create one shared wallet for all engines
+    global_wallet = EnhancedFuturesWallet(
+        symbol="GLOBAL",
+        initial_balance=total_balance,
+        leverage=args.leverage,
+        database_url=cfg.database_url,
+    )
     
     event_store = None
     projection = None
     ui_publisher = None
     
-    if cfg.database_url:
-        try:
-            from crypto_trader.storage import get_event_store
-            event_store = get_event_store(cfg.database_url)
-            logger.info("Postgres event store initialized for multi-engine")
-        except Exception as e:
-            logger.error("Failed to initialize Postgres event store: %s", e)
+    try:
+        from pathlib import Path as _Path
+        from crypto_trader.storage import get_event_store
+        _sqlite_fallback = str(_Path.home() / ".crypto_trader" / "event_journal.db")
+        event_store = get_event_store(cfg.database_url, sqlite_path=_sqlite_fallback)
+        logger.info("Event store initialized for multi-engine (%s)",
+                    "Postgres" if cfg.database_url else "SQLite fallback")
+    except Exception as e:
+        logger.error("Failed to initialize event store: %s", e)
             
     if cfg.projection_enabled and cfg.database_url:
         try:
