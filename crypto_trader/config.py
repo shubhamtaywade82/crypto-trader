@@ -272,13 +272,19 @@ class TradingConfig:
     st2_atr_period: int = 10             # base ATR length (scaled by timeframe when adaptive)
     st2_factor: float = 3.0             # Supertrend multiplier
     st2_use_adaptive_atr: bool = True   # auto-scale ATR length to the chart timeframe
-    st2_timeframe: str = "1h"           # primary signal timeframe label (for ATR scaling)
+    # Timeframes
+    # ST2_TIMEFRAME controls the primary signal candles (e.g. "15m", "1h", "4h").
+    # ST2_HTF_TIMEFRAME controls the higher-timeframe alignment filter
+    # (e.g. "4h" when primary is "1h", "1d" when primary is "4h").
+    # Any Binance kline interval is valid: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M
+    st2_timeframe: str = "1h"           # primary signal timeframe
+    st2_htf_timeframe: str = "4h"       # higher-timeframe filter (must be > st2_timeframe)
     # Entry mode
     st2_entry_mode: str = "flip"        # "flip" | "retracement"
     st2_retracement_pct: float = 1.0    # retracement mode: max % distance from flip close
     st2_flip_lookback: int = 5          # retracement mode: bars to look back for a flip
     # Optional filters
-    st2_use_htf_filter: bool = True     # require 4H Supertrend to align with signal
+    st2_use_htf_filter: bool = True     # require HTF Supertrend to align with signal
     st2_use_vol_filter: bool = False    # require RVOL >= st2_vol_multiplier
     st2_vol_multiplier: float = 1.2
     st2_use_adx_filter: bool = False    # require ADX >= st2_adx_threshold
@@ -388,6 +394,7 @@ class TradingConfig:
             st2_factor=_get_float("ST2_FACTOR", 3.0),
             st2_use_adaptive_atr=_get_bool("ST2_USE_ADAPTIVE_ATR", True),
             st2_timeframe=_get("ST2_TIMEFRAME", "1h"),
+            st2_htf_timeframe=_get("ST2_HTF_TIMEFRAME", "4h"),
             st2_entry_mode=_get("ST2_ENTRY_MODE", "flip").lower(),
             st2_retracement_pct=_get_float("ST2_RETRACEMENT_PCT", 1.0),
             st2_flip_lookback=_get_int("ST2_FLIP_LOOKBACK", 5),

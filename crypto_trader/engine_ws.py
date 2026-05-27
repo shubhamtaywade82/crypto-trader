@@ -184,6 +184,7 @@ class WebSocketTradingEngine:
                 factor=getattr(cfg, "st2_factor", 3.0),
                 use_adaptive_atr=getattr(cfg, "st2_use_adaptive_atr", True),
                 timeframe=getattr(cfg, "st2_timeframe", "1h"),
+                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
                 entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
                 retracement_pct=getattr(cfg, "st2_retracement_pct", 1.0),
                 flip_lookback=getattr(cfg, "st2_flip_lookback", 5),
@@ -201,10 +202,12 @@ class WebSocketTradingEngine:
             )
             logger.info(
                 "[ST2] Supertrend2 mode active: factor=%.1f atr=%d adaptive=%s "
-                "entry_mode=%s htf_filter=%s",
+                "primary_tf=%s htf_tf=%s entry_mode=%s htf_filter=%s",
                 self.playbook_st2.factor,
                 self.playbook_st2.atr_period,
                 self.playbook_st2.use_adaptive_atr,
+                self.playbook_st2.timeframe,
+                self.playbook_st2.htf_timeframe,
                 self.playbook_st2.entry_mode,
                 self.playbook_st2.use_htf_filter,
             )
@@ -449,10 +452,37 @@ class WebSocketTradingEngine:
         self._evaluate_and_enter(data, regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx, structure, structure_ltf)
         self.wallet.print_summary()
 
+    @staticmethod
+    def _kline_limit(timeframe: str) -> int:
+        """Return a sensible kline limit for a given timeframe string."""
+        tf = timeframe.lower().strip()
+        # Minutes: more bars needed for short TFs to build up ATR/indicators
+        if tf.endswith("m"):
+            try:
+                mins = int(tf[:-1])
+            except ValueError:
+                return 200
+            if mins <= 1:
+                return 500
+            if mins <= 5:
+                return 400
+            if mins <= 15:
+                return 300
+            return 200
+        # Hours
+        if tf.endswith("h"):
+            try:
+                h = int(tf[:-1])
+            except ValueError:
+                return 200
+            return 200 if h <= 4 else 150
+        # Daily / weekly / monthly
+        return 200
+
     def _fetch_market_data(self):
         """Fetch all REST and WebSocket market data. Returns dict or None to skip tick."""
         try:
-            # Fetch historical data via REST
+            # ── Fixed baseline TFs (used by regime, structure, LLM, legacy playbooks) ──
             df_4h = self.data_feed.get_klines(self.symbol, "4h", limit=200)
             df_1h = self.data_feed.get_klines(self.symbol, "1h", limit=150)
             df_15m = self.data_feed.get_klines(self.symbol, "15m", limit=150)
@@ -480,11 +510,46 @@ class WebSocketTradingEngine:
             logger.error(f"Data fetch failed — skipping signal tick: {e}")
             return None
 
-        return {
+        data = {
             "df_4h": df_4h, "df_1h": df_1h, "df_15m": df_15m, "df_5m": df_5m,
             "mark_price": mark_price, "funding_rate": funding_rate,
             "oi_data": oi_data, "taker_ratio": taker_ratio,
         }
+
+        # ── ST2 configurable timeframes ──────────────────────────────────────
+        # Resolve primary and HTF data for the Supertrend2 mode.  When the
+        # configured TF matches a baseline already fetched above, reuse it
+        # (no extra API call).  Otherwise fetch a fresh series.
+        if self.playbook_st2 is not None:
+            _baseline_map = {"1h": df_1h, "4h": df_4h, "15m": df_15m, "5m": df_5m}
+            st2_tf = self.playbook_st2.timeframe
+            st2_htf = self.playbook_st2.htf_timeframe
+
+            if st2_tf in _baseline_map:
+                data["df_st2"] = _baseline_map[st2_tf]
+            else:
+                try:
+                    data["df_st2"] = self.data_feed.get_klines(
+                        self.symbol, st2_tf, limit=self._kline_limit(st2_tf)
+                    )
+                    logger.debug("[ST2] Fetched primary TF %s (%d bars)", st2_tf, len(data["df_st2"]))
+                except Exception as e:
+                    logger.warning("[ST2] Failed to fetch primary TF %s: %s — falling back to 1h", st2_tf, e)
+                    data["df_st2"] = df_1h
+
+            if st2_htf in _baseline_map:
+                data["df_st2_htf"] = _baseline_map[st2_htf]
+            else:
+                try:
+                    data["df_st2_htf"] = self.data_feed.get_klines(
+                        self.symbol, st2_htf, limit=self._kline_limit(st2_htf)
+                    )
+                    logger.debug("[ST2] Fetched HTF %s (%d bars)", st2_htf, len(data["df_st2_htf"]))
+                except Exception as e:
+                    logger.warning("[ST2] Failed to fetch HTF %s: %s — HTF filter will be skipped", st2_htf, e)
+                    data["df_st2_htf"] = None
+
+        return data
 
     def _compute_regime_context(self, data: dict):
         """Build session context, check kill zone gate, and compute extended regime.
@@ -638,13 +703,13 @@ class WebSocketTradingEngine:
         if self.playbook_st2 is None:
             return False
         try:
-            df_1h = data["df_1h"]
-            if len(df_1h) < self.playbook_st2._min_bars():
+            df_st2 = data.get("df_st2", data["df_1h"])
+            if df_st2 is None or len(df_st2) < self.playbook_st2._min_bars():
                 return False
 
-            from .strategies.supertrend2 import compute_supertrend2, adaptive_atr_length
+            from .strategies.supertrend2 import compute_supertrend2
             atr_len = self.playbook_st2._effective_atr_len()
-            _, direction = compute_supertrend2(df_1h, self.playbook_st2.factor, atr_len)
+            _, direction = compute_supertrend2(df_st2, self.playbook_st2.factor, atr_len)
 
             curr_dir = int(direction.iloc[-1])
             prev_dir = int(direction.iloc[-2])
@@ -695,10 +760,10 @@ class WebSocketTradingEngine:
         if self.playbook_st2 is None:
             return
 
-        df_1h = data["df_1h"]
-        df_4h = data["df_4h"]
+        df_st2 = data.get("df_st2", data["df_1h"])
+        df_st2_htf = data.get("df_st2_htf", data["df_4h"]) if self.playbook_st2.use_htf_filter else None
 
-        setup = self.playbook_st2.evaluate(df_1h, df_4h if self.playbook_st2.use_htf_filter else None)
+        setup = self.playbook_st2.evaluate(df_st2, df_st2_htf)
         if not setup:
             logger.debug("[ST2 ENTRY] No signal this tick")
             return

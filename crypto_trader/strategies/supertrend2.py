@@ -233,6 +233,7 @@ class PlaybookSupertrend2:
         factor: float = 3.0,
         use_adaptive_atr: bool = True,
         timeframe: str = "1h",
+        htf_timeframe: str = "4h",
         entry_mode: str = "flip",
         retracement_pct: float = 1.0,
         flip_lookback: int = 5,
@@ -252,6 +253,7 @@ class PlaybookSupertrend2:
         self.factor = max(0.1, factor)
         self.use_adaptive_atr = use_adaptive_atr
         self.timeframe = timeframe
+        self.htf_timeframe = htf_timeframe
         self.entry_mode = entry_mode
         self.retracement_pct = max(0.0, retracement_pct)
         self.flip_lookback = max(1, flip_lookback)
@@ -317,7 +319,7 @@ class PlaybookSupertrend2:
         # ── HTF filter ──────────────────────────────────────────────────────
         if self.use_htf_filter and df_htf is not None and len(df_htf) >= min_bars + 2:
             htf_atr_len = (
-                adaptive_atr_length(self.atr_period, "4h")
+                adaptive_atr_length(self.atr_period, self.htf_timeframe)
                 if self.use_adaptive_atr
                 else self.atr_period
             )
