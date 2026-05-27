@@ -150,11 +150,13 @@ class WebSocketTradingEngine:
             )
         else:
             self.risk_manager = RiskManager()
+        _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
+        _min_threshold = cfg.adaptive_min_threshold if cfg else 0.50
         self.adaptive_threshold = AdaptiveThresholdManager(
-            base_threshold=FINAL_SCORE_THRESHOLD,
-            min_threshold=0.50,
+            base_threshold=_base_threshold,
+            min_threshold=_min_threshold,
             decay_per_hour=0.01,
-            target_trades_per_day=1.0
+            target_trades_per_day=1.0,
         )
 
         # Strategy
@@ -643,6 +645,15 @@ class WebSocketTradingEngine:
                 )
                 return
 
+            # Profile-based regime filter
+            if self.cfg and self.cfg.allowed_regimes:
+                if regime_ctx.extended.value not in self.cfg.allowed_regimes:
+                    logger.info(
+                        "[PROFILE-BLOCK] %s regime not allowed by '%s' profile",
+                        regime_ctx.extended.value, self.cfg.trading_profile,
+                    )
+                    return
+
             # Get latest ADX for Ares playbook filter
             latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
             try:
@@ -797,13 +808,14 @@ class WebSocketTradingEngine:
         if final_score < dynamic_threshold:
             logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
             return
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
         if (
-            (setup["side"] == PositionSide.LONG and funding_rate > FUNDING_EXTREME)
-            or (setup["side"] == PositionSide.SHORT and funding_rate < -FUNDING_EXTREME)
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
         ):
             logger.info(
                 f"[BLOCKED] Funding extreme for {setup['side'].value}: {funding_rate:+.4%} "
-                f"(threshold={FUNDING_EXTREME:.2%})"
+                f"(threshold={_funding_extreme:.2%})"
             )
             return
 
@@ -983,7 +995,8 @@ class WebSocketTradingEngine:
         # Risk-based sizing from stop distance (2% risk per trade, scaled by this
         # engine's share of a shared wallet to avoid multi-symbol over-allocation).
         stop_distance = abs(entry_price - setup["sl_price"])
-        risk_budget = self.wallet.margin_balance * Decimal("0.02") * Decimal(str(self.risk_budget_fraction))
+        _risk_pct = Decimal(str(self.cfg.risk_per_trade_pct)) if self.cfg else Decimal("0.02")
+        risk_budget = self.wallet.margin_balance * _risk_pct * Decimal(str(self.risk_budget_fraction))
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
         # Apply regime-based size scalar (e.g. 1.25× for TREND_EXPANSION, 0.5× for LOW_VOL_CHOP)
         if regime_ctx is not None and regime_ctx.size_multiplier != 1.0:

@@ -10,7 +10,7 @@ Loaded from environment variables (the package's ``__init__`` already populates
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
@@ -24,6 +24,66 @@ class DataSource(str, Enum):
     BINANCE = "binance"
     COINDCX = "coindcx"
     AUTO = "auto"            # Binance primary, CoinDCX fallback
+
+
+class TradingProfile(str, Enum):
+    CONSERVATIVE = "conservative"
+    MODERATE = "moderate"
+    AGGRESSIVE = "aggressive"
+
+
+@dataclass
+class _ProfileDefaults:
+    final_score_threshold: float
+    adaptive_min_threshold: float
+    max_daily_trades: int
+    max_consecutive_losses: int
+    max_drawdown_pct: float
+    max_leverage: int
+    risk_per_trade_pct: float
+    funding_extreme_threshold: float
+    require_kill_zone: bool
+    allowed_regimes: list  # ExtendedRegime value strings that allow entries
+
+
+_TRADING_PROFILES: dict = {
+    "conservative": _ProfileDefaults(
+        final_score_threshold=0.82,
+        adaptive_min_threshold=0.75,
+        max_daily_trades=2,
+        max_consecutive_losses=1,
+        max_drawdown_pct=0.08,
+        max_leverage=2,
+        risk_per_trade_pct=0.01,
+        funding_extreme_threshold=0.0003,
+        require_kill_zone=True,
+        allowed_regimes=["TREND_EXPANSION", "BREAKOUT_ENVIRONMENT"],
+    ),
+    "moderate": _ProfileDefaults(
+        final_score_threshold=0.72,
+        adaptive_min_threshold=0.60,
+        max_daily_trades=5,
+        max_consecutive_losses=2,
+        max_drawdown_pct=0.15,
+        max_leverage=3,
+        risk_per_trade_pct=0.02,
+        funding_extreme_threshold=0.0005,
+        require_kill_zone=False,
+        allowed_regimes=["TREND_EXPANSION", "BREAKOUT_ENVIRONMENT", "ACCUMULATION", "MEAN_REVERSION"],
+    ),
+    "aggressive": _ProfileDefaults(
+        final_score_threshold=0.62,
+        adaptive_min_threshold=0.50,
+        max_daily_trades=10,
+        max_consecutive_losses=3,
+        max_drawdown_pct=0.25,
+        max_leverage=5,
+        risk_per_trade_pct=0.04,
+        funding_extreme_threshold=0.001,
+        require_kill_zone=False,
+        allowed_regimes=["TREND_EXPANSION", "BREAKOUT_ENVIRONMENT", "ACCUMULATION", "MEAN_REVERSION", "LOW_VOL_CHOP"],
+    ),
+}
 
 
 def _get(name: str, default: str = "") -> str:
@@ -169,6 +229,17 @@ class TradingConfig:
     regime_size_multiplier_high: float = 1.25  # TREND_EXPANSION
     regime_size_multiplier_low: float = 0.5    # LOW_VOL_CHOP / MEAN_REVERSION
 
+    # ── Trading Profile ──
+    # Controls entry quality bar, risk sizing, regime filtering, and daily limits.
+    trading_profile: str = "moderate"
+    final_score_threshold: float = 0.72
+    adaptive_min_threshold: float = 0.60
+    risk_per_trade_pct: float = 0.02
+    funding_extreme_threshold: float = 0.0005
+    max_consecutive_losses: int = 2
+    max_drawdown_pct: float = 0.20
+    allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -185,11 +256,15 @@ class TradingConfig:
 
         margin_currency = _get("COINDCX_MARGIN_CURRENCY", "USDT").upper()
 
+        # Resolve trading profile and apply its defaults (env vars can still override)
+        profile_name = _get("TRADING_PROFILE", "moderate").lower()
+        profile = _TRADING_PROFILES.get(profile_name, _TRADING_PROFILES["moderate"])
+
         return cls(
             mode=mode_enum,
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
-            max_leverage=_get_int("MAX_LEVERAGE", 2),
+            max_leverage=_get_int("MAX_LEVERAGE", profile.max_leverage),
             initial_balance=_get_float("INITIAL_BALANCE", 1000.0),
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),
@@ -237,16 +312,24 @@ class TradingConfig:
             ui_events_channel=_get("UI_EVENTS_CHANNEL", "events:ui"),
             clock_skew_max_ms=_get_int("CLOCK_SKEW_MAX_MS", 2000),
             max_orders_per_minute=_get_int("MAX_ORDERS_PER_MINUTE", 6),
-            max_daily_trades=_get_int("MAX_DAILY_TRADES", 2),
+            max_daily_trades=_get_int("MAX_DAILY_TRADES", profile.max_daily_trades),
             max_margin_ratio=_get_float("MAX_MARGIN_RATIO", 0.80),
             thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
             reconcile_strict_cancel=_get_bool("RECONCILE_STRICT_CANCEL", False),
-            require_kill_zone=_get_bool("REQUIRE_KILL_ZONE", False),
+            require_kill_zone=_get_bool("REQUIRE_KILL_ZONE", profile.require_kill_zone),
             rvol_dead_threshold=_get_float("RVOL_DEAD_THRESHOLD", 0.6),
             rvol_weak_threshold=_get_float("RVOL_WEAK_THRESHOLD", 0.9),
             rvol_strong_threshold=_get_float("RVOL_STRONG_THRESHOLD", 1.5),
             regime_size_multiplier_high=_get_float("REGIME_SIZE_MULTIPLIER_HIGH", 1.25),
             regime_size_multiplier_low=_get_float("REGIME_SIZE_MULTIPLIER_LOW", 0.5),
+            trading_profile=profile_name,
+            final_score_threshold=_get_float("FINAL_SCORE_THRESHOLD", profile.final_score_threshold),
+            adaptive_min_threshold=_get_float("ADAPTIVE_MIN_THRESHOLD", profile.adaptive_min_threshold),
+            risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", profile.risk_per_trade_pct),
+            funding_extreme_threshold=_get_float("FUNDING_EXTREME_THRESHOLD", profile.funding_extreme_threshold),
+            max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", profile.max_consecutive_losses),
+            max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", profile.max_drawdown_pct),
+            allowed_regimes=profile.allowed_regimes,
         )
 
     @property
@@ -266,9 +349,10 @@ class TradingConfig:
         errs: List[str] = []
         if self.max_leverage < 1:
             errs.append("MAX_LEVERAGE must be >= 1")
-        if self.max_leverage > 2:
+        profile = _TRADING_PROFILES.get(self.trading_profile, _TRADING_PROFILES["moderate"])
+        if self.max_leverage > profile.max_leverage:
             errs.append(
-                f"MAX_LEVERAGE={self.max_leverage} exceeds the launch cap of 2x"
+                f"MAX_LEVERAGE={self.max_leverage} exceeds {self.trading_profile} profile cap of {profile.max_leverage}x"
             )
         if not self.symbol:
             errs.append("TRADE_SYMBOL is required")
