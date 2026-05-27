@@ -681,11 +681,24 @@ class OllamaAdvisor:
 
                 system_prompt = _load_system_prompt()
 
+                if self.log_llm:
+                    logger.info(
+                        "[LLM Prompt] %s | mode=%s | state=%s\n%s\n%s",
+                        symbol, mode, state.model_dump_json(), prompt, "=" * 60,
+                    )
+
                 start = time.perf_counter()
                 # Cap router timeout below staleness cutoff so advice never arrives too old to use.
                 router_timeout = min(int(self.client.timeout), MAX_LLM_AGE_SECONDS - 20)
                 decision = self._router.route(state, system_prompt, prompt, timeout_s=max(15, router_timeout))
                 latency_ms = (time.perf_counter() - start) * 1000
+
+                if self.log_llm:
+                    logger.info(
+                        "[LLM Response] %s | action=%s | conf=%.2f | rr=%.2f | warnings=%s | lat=%.0fms",
+                        symbol, decision.action, decision.confidence,
+                        decision.risk_reward, decision.warnings, latency_ms,
+                    )
 
                 advice = _decision_to_advice(decision, symbol, latency_ms)
                 self.circuit_breaker.record_success()

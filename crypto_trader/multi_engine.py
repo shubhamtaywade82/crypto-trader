@@ -140,8 +140,23 @@ def main():
     threads = []
     
     total_balance = 1000.0
-    global_risk = RiskManager()
-    
+
+    # Load config early so profile-driven risk parameters apply to the global risk manager
+    from crypto_trader.config import load_config as _load_cfg_early
+    _early_cfg = _load_cfg_early()
+    global_risk = RiskManager(
+        max_daily_trades=_early_cfg.max_daily_trades,
+        max_consecutive_losses=_early_cfg.max_consecutive_losses,
+        max_drawdown_pct=_early_cfg.max_drawdown_pct,
+        max_orders_per_minute=_early_cfg.max_orders_per_minute,
+        max_margin_ratio=_early_cfg.max_margin_ratio,
+    )
+    logger.info(
+        "Trading profile: %s (threshold=%.2f, max_trades=%d, regimes=%s)",
+        _early_cfg.trading_profile, _early_cfg.final_score_threshold,
+        _early_cfg.max_daily_trades, _early_cfg.allowed_regimes,
+    )
+
     # Initialize CoinDCX live execution engine if live trading is enabled
     live_enabled = os.getenv("LIVE_TRADING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
     live_ack = os.getenv("LIVE_TRADING_ACK", "") == "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"

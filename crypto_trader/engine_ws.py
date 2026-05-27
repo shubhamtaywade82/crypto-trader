@@ -150,11 +150,15 @@ class WebSocketTradingEngine:
             )
         else:
             self.risk_manager = RiskManager()
+        _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
+        _min_threshold = cfg.adaptive_min_threshold if cfg else 0.45
+        _decay_rate = cfg.adaptive_decay_per_hour if cfg else 0.01
+        _target_trades = cfg.adaptive_target_trades_per_day if cfg else 2.0
         self.adaptive_threshold = AdaptiveThresholdManager(
-            base_threshold=FINAL_SCORE_THRESHOLD,
-            min_threshold=0.50,
-            decay_per_hour=0.01,
-            target_trades_per_day=1.0
+            base_threshold=_base_threshold,
+            min_threshold=_min_threshold,
+            decay_per_hour=_decay_rate,
+            target_trades_per_day=_target_trades,
         )
 
         # Strategy
@@ -554,28 +558,37 @@ class WebSocketTradingEngine:
 
     def _start_llm_async(self, data: dict, regime, regime_score, regime_ctx, session_ctx, rvol):
         """Start the LLM advice thread asynchronously (step 4)."""
-        if self.use_llm and self.advisor:
-            pos = self.wallet.get_open_position(self.symbol)
-            open_positions = [pos.to_dict()] if pos else []
-            if self._llm_thread is None or not self._llm_thread.is_alive():
-                self._llm_thread = self.advisor.get_advice_async(
-                    symbol=self.symbol,
-                    df_5m=data["df_5m"],
-                    df_15m=data["df_15m"],
-                    df_1h=data["df_1h"],
-                    df_4h=data["df_4h"],
-                    regime=regime.value,
-                    regime_score=regime_score,
-                    mark_price=data["mark_price"],
-                    funding_rate=data["funding_rate"],
-                    oi_delta=0.0,
-                    taker_ratio=data["taker_ratio"],
-                    open_positions=open_positions,
-                    market_regime=regime_ctx.extended.value,
-                    session=session_ctx.session.value,
-                    is_kill_zone=session_ctx.is_kill_zone,
-                    rvol=rvol,
-                )
+        if not (self.use_llm and self.advisor):
+            return
+        # Skip LLM when regime hard-blocks entries — saves GPU for useful calls.
+        _dead_regimes = {"DEAD_MARKET", "HIGH_RISK_CHAOS", "LIQUIDATION_EVENT"}
+        if regime_ctx is not None and regime_ctx.extended.value in _dead_regimes:
+            logger.debug("[LLM] Skipping — regime=%s blocked", regime_ctx.extended.value)
+            return
+        # Skip if position already open — no entry evaluation will run.
+        pos = self.wallet.get_open_position(self.symbol)
+        if pos:
+            logger.debug("[LLM] Skipping — position already open for %s", self.symbol)
+            return
+        if self._llm_thread is None or not self._llm_thread.is_alive():
+            self._llm_thread = self.advisor.get_advice_async(
+                symbol=self.symbol,
+                df_5m=data["df_5m"],
+                df_15m=data["df_15m"],
+                df_1h=data["df_1h"],
+                df_4h=data["df_4h"],
+                regime=regime.value,
+                regime_score=regime_score,
+                mark_price=data["mark_price"],
+                funding_rate=data["funding_rate"],
+                oi_delta=0.0,
+                taker_ratio=data["taker_ratio"],
+                open_positions=[],
+                market_regime=regime_ctx.extended.value,
+                session=session_ctx.session.value,
+                is_kill_zone=session_ctx.is_kill_zone,
+                rvol=rvol,
+            )
 
     def _update_open_position(self, data: dict, regime, session_ctx):
         """Update an open position if one exists (step 5.5 — AI/regime reversal exits)."""
@@ -642,6 +655,15 @@ class WebSocketTradingEngine:
                     f"[REGIME-BLOCK] No entry — extended regime is {regime_ctx.extended.value}"
                 )
                 return
+
+            # Profile-based regime filter
+            if self.cfg and self.cfg.allowed_regimes:
+                if regime_ctx.extended.value not in self.cfg.allowed_regimes:
+                    logger.info(
+                        "[PROFILE-BLOCK] %s regime not allowed by '%s' profile",
+                        regime_ctx.extended.value, self.cfg.trading_profile,
+                    )
+                    return
 
             # Get latest ADX for Ares playbook filter
             latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
@@ -797,13 +819,14 @@ class WebSocketTradingEngine:
         if final_score < dynamic_threshold:
             logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
             return
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
         if (
-            (setup["side"] == PositionSide.LONG and funding_rate > FUNDING_EXTREME)
-            or (setup["side"] == PositionSide.SHORT and funding_rate < -FUNDING_EXTREME)
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
         ):
             logger.info(
                 f"[BLOCKED] Funding extreme for {setup['side'].value}: {funding_rate:+.4%} "
-                f"(threshold={FUNDING_EXTREME:.2%})"
+                f"(threshold={_funding_extreme:.2%})"
             )
             return
 
@@ -983,7 +1006,8 @@ class WebSocketTradingEngine:
         # Risk-based sizing from stop distance (2% risk per trade, scaled by this
         # engine's share of a shared wallet to avoid multi-symbol over-allocation).
         stop_distance = abs(entry_price - setup["sl_price"])
-        risk_budget = self.wallet.margin_balance * Decimal("0.02") * Decimal(str(self.risk_budget_fraction))
+        _risk_pct = Decimal(str(self.cfg.risk_per_trade_pct)) if self.cfg else Decimal("0.02")
+        risk_budget = self.wallet.margin_balance * _risk_pct * Decimal(str(self.risk_budget_fraction))
         size_multiplier = min(final_score / dynamic_threshold, 1.0)
         # Apply regime-based size scalar (e.g. 1.25× for TREND_EXPANSION, 0.5× for LOW_VOL_CHOP)
         if regime_ctx is not None and regime_ctx.size_multiplier != 1.0:
