@@ -30,6 +30,7 @@ from .ws_client import BinanceWebSocketFeed, WebSocketPositionManager
 from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager
 from .playbooks import PlaybookA, PlaybookB, PlaybookAres, PlaybookVolExhaust, PlaybookSweepMSS
+from .strategies.supertrend2 import PlaybookSupertrend2
 from .regime import (
     MarketRegimeAnalyzer, MarketRegime, ExtendedRegime,
     RegimeClassifier, RegimeContext, calculate_rvol, compute_ema,
@@ -174,6 +175,39 @@ class WebSocketTradingEngine:
                 self.playbook_volx, self.playbook_sweep,
             ]
         }
+
+        # Supertrend2 playbook (instantiated from cfg when strategy_mode=supertrend2)
+        self.playbook_st2: Optional[PlaybookSupertrend2] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "supertrend2":
+            self.playbook_st2 = PlaybookSupertrend2(
+                atr_period=getattr(cfg, "st2_atr_period", 10),
+                factor=getattr(cfg, "st2_factor", 3.0),
+                use_adaptive_atr=getattr(cfg, "st2_use_adaptive_atr", True),
+                timeframe=getattr(cfg, "st2_timeframe", "1h"),
+                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
+                retracement_pct=getattr(cfg, "st2_retracement_pct", 1.0),
+                flip_lookback=getattr(cfg, "st2_flip_lookback", 5),
+                use_htf_filter=getattr(cfg, "st2_use_htf_filter", True),
+                use_vol_filter=getattr(cfg, "st2_use_vol_filter", False),
+                vol_multiplier=getattr(cfg, "st2_vol_multiplier", 1.2),
+                use_adx_filter=getattr(cfg, "st2_use_adx_filter", False),
+                adx_threshold=getattr(cfg, "st2_adx_threshold", 20),
+                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
+                use_tp=getattr(cfg, "st2_use_tp", True),
+                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
+                sl_pct=getattr(cfg, "st2_sl_pct", 1.5),
+                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 2.5),
+                max_hold_hours=getattr(cfg, "st2_max_hold_hours", 168),
+            )
+            logger.info(
+                "[ST2] Supertrend2 mode active: factor=%.1f atr=%d adaptive=%s "
+                "entry_mode=%s htf_filter=%s",
+                self.playbook_st2.factor,
+                self.playbook_st2.atr_period,
+                self.playbook_st2.use_adaptive_atr,
+                self.playbook_st2.entry_mode,
+                self.playbook_st2.use_htf_filter,
+            )
 
         # Regime / Session engine
         _rc_kwargs = {}
@@ -590,10 +624,129 @@ class WebSocketTradingEngine:
                 rvol=rvol,
             )
 
+    # ── Supertrend2 helpers ───────────────────────────────────────────────────
+
+    def _st2_check_flip_exit(self, data: dict, pos) -> bool:
+        """
+        Check whether the Supertrend2 direction has just flipped against the
+        open position. If so, close it and return True.
+
+        Called every signal tick (5 min) when strategy_mode == "supertrend2".
+        The 1H Supertrend can flip at most once per hour so this granularity
+        is more than sufficient.
+        """
+        if self.playbook_st2 is None:
+            return False
+        try:
+            df_1h = data["df_1h"]
+            if len(df_1h) < self.playbook_st2._min_bars():
+                return False
+
+            from .strategies.supertrend2 import compute_supertrend2, adaptive_atr_length
+            atr_len = self.playbook_st2._effective_atr_len()
+            _, direction = compute_supertrend2(df_1h, self.playbook_st2.factor, atr_len)
+
+            curr_dir = int(direction.iloc[-1])
+            prev_dir = int(direction.iloc[-2])
+
+            if curr_dir == prev_dir:
+                return False  # no flip this bar
+
+            mark = data["mark_price"]
+            from .wallet import PositionSide
+
+            if pos.side == PositionSide.LONG and curr_dir == 1 and prev_dir == -1:
+                self.wallet.close_position(self.symbol, float(mark), reason="ST2_FLIP_EXIT")
+                logger.info(
+                    "[ST2 EXIT] Long closed — Supertrend flipped to downtrend @ %.4f", mark
+                )
+                if self.event_bus:
+                    from .events import SystemFailureEvent  # noqa: reuse log channel
+                return True
+
+            if pos.side == PositionSide.SHORT and curr_dir == -1 and prev_dir == 1:
+                self.wallet.close_position(self.symbol, float(mark), reason="ST2_FLIP_EXIT")
+                logger.info(
+                    "[ST2 EXIT] Short closed — Supertrend flipped to uptrend @ %.4f", mark
+                )
+                return True
+
+        except Exception as exc:
+            logger.warning("[ST2 EXIT] flip-exit check failed: %s", exc)
+
+        return False
+
+    def _evaluate_entry_st2(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """
+        Entry evaluation path for strategy_mode == "supertrend2".
+
+        Bypasses legacy playbooks, LLM fusion, and regime routing.
+        Only the Supertrend2 flip/retracement signal and the funding-rate
+        guard (safety net) control entry.  All risk-manager checks (daily
+        limits, drawdown) and the execution path (_execute_entry) are reused.
+        """
+        if self.playbook_st2 is None:
+            return
+
+        df_1h = data["df_1h"]
+        df_4h = data["df_4h"]
+
+        setup = self.playbook_st2.evaluate(df_1h, df_4h if self.playbook_st2.use_htf_filter else None)
+        if not setup:
+            logger.debug("[ST2 ENTRY] No signal this tick")
+            return
+
+        logger.info("[ST2 SIGNAL] %s | %s", setup["side"].value, setup["reason"])
+
+        # Funding-rate extreme guard (keep for safety)
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"].value in ("LONG", "BUY") and funding_rate > _funding_extreme)
+            or (setup["side"].value in ("SHORT", "SELL") and funding_rate < -_funding_extreme)
+        ):
+            logger.info(
+                "[ST2 BLOCKED] Funding extreme %+.4%% (threshold %.4%%)",
+                funding_rate, _funding_extreme,
+            )
+            return
+
+        dynamic_threshold = self.adaptive_threshold.get_threshold()
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=1.0,          # ST2 signal is binary; always passes threshold
+            llm_weight=0.0,
+            explanation="Supertrend2 signal",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=1.0,
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=dynamic_threshold,
+            regime_ctx=regime_ctx,
+        ))
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _update_open_position(self, data: dict, regime, session_ctx):
         """Update an open position if one exists (step 5.5 — AI/regime reversal exits)."""
         pos = self.wallet.get_open_position(self.symbol)
         if pos:
+            # ST2 mode: check for Supertrend flip exit before normal SL/TP logic
+            _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
+            if _st2_mode and self._st2_check_flip_exit(data, pos):
+                return  # position closed by flip; skip further position management
+
             df_1h = data["df_1h"]
             mark_price = data["mark_price"]
             df_1h["ema9"] = compute_ema(df_1h["close"], 9)
@@ -649,34 +802,46 @@ class WebSocketTradingEngine:
 
         # 6. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:
-            # Block entry when regime forbids it (DEAD_MARKET, HIGH_RISK_CHAOS, LIQUIDATION_EVENT)
-            if not regime_ctx.allows_new_entries():
-                logger.info(
-                    f"[REGIME-BLOCK] No entry — extended regime is {regime_ctx.extended.value}"
-                )
-                return
+            _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
 
-            # Profile-based regime filter
-            if self.cfg and self.cfg.allowed_regimes:
-                if regime_ctx.extended.value not in self.cfg.allowed_regimes:
-                    logger.info(
-                        "[PROFILE-BLOCK] %s regime not allowed by '%s' profile",
-                        regime_ctx.extended.value, self.cfg.trading_profile,
-                    )
-                    return
-
-            # Get latest ADX for Ares playbook filter
-            latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
             try:
-                self._evaluate_entry(df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                                    funding_rate, 0.0, taker_ratio, structure=structure,
-                                    adx_1h=latest_adx, regime_ctx=regime_ctx,
-                                    session_ctx=session_ctx, structure_ltf=structure_ltf)
+                if _st2_mode:
+                    # ── Supertrend2 path ──────────────────────────────────────
+                    # Bypass legacy regime routing, profile regime filter, and LLM.
+                    # The Supertrend direction flip is the sole entry gate.
+                    self._evaluate_entry_st2(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                else:
+                    # ── Legacy multi-playbook path ────────────────────────────
+                    # Block entry when regime forbids it
+                    if not regime_ctx.allows_new_entries():
+                        logger.info(
+                            "[REGIME-BLOCK] No entry — extended regime is %s",
+                            regime_ctx.extended.value,
+                        )
+                        return
+
+                    # Profile-based regime filter
+                    if self.cfg and self.cfg.allowed_regimes:
+                        if regime_ctx.extended.value not in self.cfg.allowed_regimes:
+                            logger.info(
+                                "[PROFILE-BLOCK] %s regime not allowed by '%s' profile",
+                                regime_ctx.extended.value, self.cfg.trading_profile,
+                            )
+                            return
+
+                    latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
+                    self._evaluate_entry(
+                        df_1h, df_4h, df_15m, regime, regime_score, mark_price,
+                        funding_rate, 0.0, taker_ratio, structure=structure,
+                        adx_1h=latest_adx, regime_ctx=regime_ctx,
+                        session_ctx=session_ctx, structure_ltf=structure_ltf,
+                    )
+
             except Exception as e:
-                # An exception mid-entry (e.g. order placed but booking/SL failed)
-                # could leave an unmanaged live position. Fail safe: HALT, trip
-                # the kill switch, and reconcile against the venue rather than
-                # letting the loop crash and abandon a naked position.
+                # An exception mid-entry could leave an unmanaged live position.
+                # Fail safe: HALT and trip the kill switch.
                 logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e, exc_info=True)
                 self._halted = True
                 if getattr(self, "risk_manager", None) is not None:

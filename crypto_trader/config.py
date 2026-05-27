@@ -32,6 +32,19 @@ class TradingProfile(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
+class StrategyMode(str, Enum):
+    """
+    Controls which entry/exit logic the engine uses.
+
+    LEGACY       — the original multi-playbook system (A, B, Ares, VolX, Sweep).
+    SUPERTREND2  — only the Supertrend2 adaptive-ATR strategy for both entries
+                   and exits.  All legacy playbooks and regime filters are
+                   bypassed; the Supertrend flip IS the signal.
+    """
+    LEGACY = "legacy"
+    SUPERTREND2 = "supertrend2"
+
+
 @dataclass
 class _ProfileDefaults:
     final_score_threshold: float
@@ -250,6 +263,34 @@ class TradingConfig:
     max_drawdown_pct: float = 0.20
     allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
 
+    # ── Strategy mode ──
+    # "legacy" = original multi-playbook system
+    # "supertrend2" = Supertrend2 adaptive-ATR only
+    strategy_mode: str = "legacy"
+
+    # ── Supertrend2 settings (active only when strategy_mode = "supertrend2") ──
+    st2_atr_period: int = 10             # base ATR length (scaled by timeframe when adaptive)
+    st2_factor: float = 3.0             # Supertrend multiplier
+    st2_use_adaptive_atr: bool = True   # auto-scale ATR length to the chart timeframe
+    st2_timeframe: str = "1h"           # primary signal timeframe label (for ATR scaling)
+    # Entry mode
+    st2_entry_mode: str = "flip"        # "flip" | "retracement"
+    st2_retracement_pct: float = 1.0    # retracement mode: max % distance from flip close
+    st2_flip_lookback: int = 5          # retracement mode: bars to look back for a flip
+    # Optional filters
+    st2_use_htf_filter: bool = True     # require 4H Supertrend to align with signal
+    st2_use_vol_filter: bool = False    # require RVOL >= st2_vol_multiplier
+    st2_vol_multiplier: float = 1.2
+    st2_use_adx_filter: bool = False    # require ADX >= st2_adx_threshold
+    st2_adx_threshold: int = 20
+    # Exit / risk
+    st2_tp1_pct: float = 1.0           # TP1 distance from entry (%)
+    st2_use_tp: bool = True            # False = exit only via Supertrend flip
+    st2_sl_mode: str = "supertrend"    # "supertrend" | "fixed_pct" | "atr"
+    st2_sl_pct: float = 1.5            # SL % for fixed_pct mode
+    st2_sl_atr_mult: float = 2.5       # ATR multiplier for atr mode
+    st2_max_hold_hours: int = 168      # safety time-stop (7 days default)
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -342,6 +383,25 @@ class TradingConfig:
             max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", profile.max_consecutive_losses),
             max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", profile.max_drawdown_pct),
             allowed_regimes=profile.allowed_regimes,
+            strategy_mode=_get("STRATEGY_MODE", "legacy").lower(),
+            st2_atr_period=_get_int("ST2_ATR_PERIOD", 10),
+            st2_factor=_get_float("ST2_FACTOR", 3.0),
+            st2_use_adaptive_atr=_get_bool("ST2_USE_ADAPTIVE_ATR", True),
+            st2_timeframe=_get("ST2_TIMEFRAME", "1h"),
+            st2_entry_mode=_get("ST2_ENTRY_MODE", "flip").lower(),
+            st2_retracement_pct=_get_float("ST2_RETRACEMENT_PCT", 1.0),
+            st2_flip_lookback=_get_int("ST2_FLIP_LOOKBACK", 5),
+            st2_use_htf_filter=_get_bool("ST2_USE_HTF_FILTER", True),
+            st2_use_vol_filter=_get_bool("ST2_USE_VOL_FILTER", False),
+            st2_vol_multiplier=_get_float("ST2_VOL_MULTIPLIER", 1.2),
+            st2_use_adx_filter=_get_bool("ST2_USE_ADX_FILTER", False),
+            st2_adx_threshold=_get_int("ST2_ADX_THRESHOLD", 20),
+            st2_tp1_pct=_get_float("ST2_TP1_PCT", 1.0),
+            st2_use_tp=_get_bool("ST2_USE_TP", True),
+            st2_sl_mode=_get("ST2_SL_MODE", "supertrend").lower(),
+            st2_sl_pct=_get_float("ST2_SL_PCT", 1.5),
+            st2_sl_atr_mult=_get_float("ST2_SL_ATR_MULT", 2.5),
+            st2_max_hold_hours=_get_int("ST2_MAX_HOLD_HOURS", 168),
         )
 
     @property
