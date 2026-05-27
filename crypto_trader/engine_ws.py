@@ -558,28 +558,37 @@ class WebSocketTradingEngine:
 
     def _start_llm_async(self, data: dict, regime, regime_score, regime_ctx, session_ctx, rvol):
         """Start the LLM advice thread asynchronously (step 4)."""
-        if self.use_llm and self.advisor:
-            pos = self.wallet.get_open_position(self.symbol)
-            open_positions = [pos.to_dict()] if pos else []
-            if self._llm_thread is None or not self._llm_thread.is_alive():
-                self._llm_thread = self.advisor.get_advice_async(
-                    symbol=self.symbol,
-                    df_5m=data["df_5m"],
-                    df_15m=data["df_15m"],
-                    df_1h=data["df_1h"],
-                    df_4h=data["df_4h"],
-                    regime=regime.value,
-                    regime_score=regime_score,
-                    mark_price=data["mark_price"],
-                    funding_rate=data["funding_rate"],
-                    oi_delta=0.0,
-                    taker_ratio=data["taker_ratio"],
-                    open_positions=open_positions,
-                    market_regime=regime_ctx.extended.value,
-                    session=session_ctx.session.value,
-                    is_kill_zone=session_ctx.is_kill_zone,
-                    rvol=rvol,
-                )
+        if not (self.use_llm and self.advisor):
+            return
+        # Skip LLM when regime hard-blocks entries — saves GPU for useful calls.
+        _dead_regimes = {"DEAD_MARKET", "HIGH_RISK_CHAOS", "LIQUIDATION_EVENT"}
+        if regime_ctx is not None and regime_ctx.extended.value in _dead_regimes:
+            logger.debug("[LLM] Skipping — regime=%s blocked", regime_ctx.extended.value)
+            return
+        # Skip if position already open — no entry evaluation will run.
+        pos = self.wallet.get_open_position(self.symbol)
+        if pos:
+            logger.debug("[LLM] Skipping — position already open for %s", self.symbol)
+            return
+        if self._llm_thread is None or not self._llm_thread.is_alive():
+            self._llm_thread = self.advisor.get_advice_async(
+                symbol=self.symbol,
+                df_5m=data["df_5m"],
+                df_15m=data["df_15m"],
+                df_1h=data["df_1h"],
+                df_4h=data["df_4h"],
+                regime=regime.value,
+                regime_score=regime_score,
+                mark_price=data["mark_price"],
+                funding_rate=data["funding_rate"],
+                oi_delta=0.0,
+                taker_ratio=data["taker_ratio"],
+                open_positions=[],
+                market_regime=regime_ctx.extended.value,
+                session=session_ctx.session.value,
+                is_kill_zone=session_ctx.is_kill_zone,
+                rvol=rvol,
+            )
 
     def _update_open_position(self, data: dict, regime, session_ctx):
         """Update an open position if one exists (step 5.5 — AI/regime reversal exits)."""
