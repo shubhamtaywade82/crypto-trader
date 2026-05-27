@@ -36,6 +36,8 @@ class TradingProfile(str, Enum):
 class _ProfileDefaults:
     final_score_threshold: float
     adaptive_min_threshold: float
+    adaptive_target_trades_per_day: float   # decay starts after (24/target) hours of no trades
+    adaptive_decay_per_hour: float          # how fast threshold drops per idle hour
     max_daily_trades: int
     max_consecutive_losses: int
     max_drawdown_pct: float
@@ -50,6 +52,8 @@ _TRADING_PROFILES: dict = {
     "conservative": _ProfileDefaults(
         final_score_threshold=0.82,
         adaptive_min_threshold=0.75,
+        adaptive_target_trades_per_day=1.0,   # decay starts at 24h idle
+        adaptive_decay_per_hour=0.005,
         max_daily_trades=2,
         max_consecutive_losses=1,
         max_drawdown_pct=0.08,
@@ -62,6 +66,8 @@ _TRADING_PROFILES: dict = {
     "moderate": _ProfileDefaults(
         final_score_threshold=0.72,
         adaptive_min_threshold=0.60,
+        adaptive_target_trades_per_day=2.0,   # decay starts at 12h idle
+        adaptive_decay_per_hour=0.01,
         max_daily_trades=5,
         max_consecutive_losses=2,
         max_drawdown_pct=0.15,
@@ -73,7 +79,9 @@ _TRADING_PROFILES: dict = {
     ),
     "aggressive": _ProfileDefaults(
         final_score_threshold=0.62,
-        adaptive_min_threshold=0.50,
+        adaptive_min_threshold=0.45,          # floor lower so decay goes further
+        adaptive_target_trades_per_day=3.0,   # decay starts at 8h idle
+        adaptive_decay_per_hour=0.02,         # drops 0.02/h → after 9h: 0.60 → scores pass
         max_daily_trades=10,
         max_consecutive_losses=3,
         max_drawdown_pct=0.25,
@@ -234,6 +242,8 @@ class TradingConfig:
     trading_profile: str = "moderate"
     final_score_threshold: float = 0.72
     adaptive_min_threshold: float = 0.60
+    adaptive_target_trades_per_day: float = 2.0   # decay starts after 24/target idle hours
+    adaptive_decay_per_hour: float = 0.01         # threshold drop rate per idle hour
     risk_per_trade_pct: float = 0.02
     funding_extreme_threshold: float = 0.0005
     max_consecutive_losses: int = 2
@@ -325,6 +335,8 @@ class TradingConfig:
             trading_profile=profile_name,
             final_score_threshold=_get_float("FINAL_SCORE_THRESHOLD", profile.final_score_threshold),
             adaptive_min_threshold=_get_float("ADAPTIVE_MIN_THRESHOLD", profile.adaptive_min_threshold),
+            adaptive_target_trades_per_day=_get_float("ADAPTIVE_TARGET_TRADES_PER_DAY", profile.adaptive_target_trades_per_day),
+            adaptive_decay_per_hour=_get_float("ADAPTIVE_DECAY_PER_HOUR", profile.adaptive_decay_per_hour),
             risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", profile.risk_per_trade_pct),
             funding_extreme_threshold=_get_float("FUNDING_EXTREME_THRESHOLD", profile.funding_extreme_threshold),
             max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", profile.max_consecutive_losses),

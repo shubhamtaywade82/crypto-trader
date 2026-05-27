@@ -151,12 +151,14 @@ class WebSocketTradingEngine:
         else:
             self.risk_manager = RiskManager()
         _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
-        _min_threshold = cfg.adaptive_min_threshold if cfg else 0.50
+        _min_threshold = cfg.adaptive_min_threshold if cfg else 0.45
+        _decay_rate = cfg.adaptive_decay_per_hour if cfg else 0.01
+        _target_trades = cfg.adaptive_target_trades_per_day if cfg else 2.0
         self.adaptive_threshold = AdaptiveThresholdManager(
             base_threshold=_base_threshold,
             min_threshold=_min_threshold,
-            decay_per_hour=0.01,
-            target_trades_per_day=1.0,
+            decay_per_hour=_decay_rate,
+            target_trades_per_day=_target_trades,
         )
 
         # Strategy
