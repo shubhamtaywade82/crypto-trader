@@ -36,13 +36,18 @@ class StrategyMode(str, Enum):
     """
     Controls which entry/exit logic the engine uses.
 
-    LEGACY       — the original multi-playbook system (A, B, Ares, VolX, Sweep).
-    SUPERTREND2  — only the Supertrend2 adaptive-ATR strategy for both entries
-                   and exits.  All legacy playbooks and regime filters are
-                   bypassed; the Supertrend flip IS the signal.
+    LEGACY          — the original multi-playbook system (A, B, Ares, VolX, Sweep).
+    SUPERTREND2     — only the Supertrend2 adaptive-ATR strategy for both entries
+                      and exits.  All legacy playbooks and regime filters are
+                      bypassed; the Supertrend flip IS the signal.
+    MEAN_REVERSION  — SMA-band mean-reversion: enter when price deviates from
+                      SMA by ``mr_entry_band``, exit when it reverts to SMA.
+                      Works on any symbol in the WATCHLIST.  Funding-rate guard
+                      and all risk/daily limits still apply.
     """
     LEGACY = "legacy"
     SUPERTREND2 = "supertrend2"
+    MEAN_REVERSION = "mean_reversion"
 
 
 @dataclass
@@ -264,8 +269,9 @@ class TradingConfig:
     allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
 
     # ── Strategy mode ──
-    # "legacy" = original multi-playbook system
-    # "supertrend2" = Supertrend2 adaptive-ATR only
+    # "legacy"         = original multi-playbook system
+    # "supertrend2"    = Supertrend2 adaptive-ATR only
+    # "mean_reversion" = SMA-band mean-reversion for all WATCHLIST symbols
     strategy_mode: str = "legacy"
 
     # ── Supertrend2 settings (active only when strategy_mode = "supertrend2") ──
@@ -296,6 +302,13 @@ class TradingConfig:
     st2_sl_pct: float = 1.5            # SL % for fixed_pct mode
     st2_sl_atr_mult: float = 2.5       # ATR multiplier for atr mode
     st2_max_hold_hours: int = 168      # safety time-stop (7 days default)
+
+    # ── Mean Reversion settings (active only when strategy_mode = "mean_reversion") ──
+    # SRD §5: 20-period SMA on last CLOSED candle, 15m timeframe (configurable).
+    mr_timeframe: str = "15m"         # kline interval for mean-reversion signals
+    mr_sma_period: int = 20           # SMA period (PRD default: 20)
+    mr_entry_band: float = 0.015      # 1.5% deviation from SMA to trigger entry
+    mr_stop_loss_pct: float = 0.008   # 0.8% hard stop from fill price
 
     @classmethod
     def from_env(cls) -> "TradingConfig":
@@ -409,6 +422,10 @@ class TradingConfig:
             st2_sl_pct=_get_float("ST2_SL_PCT", 1.5),
             st2_sl_atr_mult=_get_float("ST2_SL_ATR_MULT", 2.5),
             st2_max_hold_hours=_get_int("ST2_MAX_HOLD_HOURS", 168),
+            mr_timeframe=_get("MR_TIMEFRAME", "15m"),
+            mr_sma_period=_get_int("MR_SMA_PERIOD", 20),
+            mr_entry_band=_get_float("MR_ENTRY_BAND", 0.015),
+            mr_stop_loss_pct=_get_float("MR_STOP_LOSS_PCT", 0.008),
         )
 
     @property

@@ -688,9 +688,10 @@ class OllamaAdvisor:
                     )
 
                 start = time.perf_counter()
-                # Cap router timeout below staleness cutoff so advice never arrives too old to use.
-                router_timeout = min(int(self.client.timeout), MAX_LLM_AGE_SECONDS - 20)
-                decision = self._router.route(state, system_prompt, prompt, timeout_s=max(15, router_timeout))
+                # Allow up to timeout-5s so response can arrive before staleness cutoff.
+                # Never shorter than 20s or longer than MAX_LLM_AGE_SECONDS-10s.
+                router_timeout = max(20, min(int(self.client.timeout), MAX_LLM_AGE_SECONDS - 10))
+                decision = self._router.route(state, system_prompt, prompt, timeout_s=router_timeout)
                 latency_ms = (time.perf_counter() - start) * 1000
 
                 if self.log_llm:
@@ -699,6 +700,27 @@ class OllamaAdvisor:
                         symbol, decision.action, decision.confidence,
                         decision.risk_reward, decision.warnings, latency_ms,
                     )
+
+                # Detect system-level fallback (timeout / all-providers-failed).
+                # In that case do NOT veto the trade — return None so the engine
+                # falls back to technical signals only.
+                is_system_fallback = (
+                    decision.action == "NO_TRADE"
+                    and "GATED_BY_SYSTEM" in (decision.reason_codes or [])
+                )
+                if is_system_fallback:
+                    logger.warning(
+                        "[LLM] %s | System fallback (timeout/failure) — skipping LLM veto, "
+                        "technical signals will decide. lat=%.0fms",
+                        symbol, latency_ms,
+                    )
+                    self.circuit_breaker.record_failure()
+                    # Return last cached advice if available (non-stale), else None
+                    with self._lock:
+                        last = self._last_advice
+                    if last and last.symbol == symbol and (time.time() - last.timestamp) < MAX_LLM_AGE_SECONDS:
+                        return last
+                    return None
 
                 advice = _decision_to_advice(decision, symbol, latency_ms)
                 self.circuit_breaker.record_success()

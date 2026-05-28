@@ -48,6 +48,36 @@ class OrderStatus(Enum):
     EXPIRED = "EXPIRED"
 
 
+class OrderStateMachine:
+    """Deterministic Order State Machine enforcing PRD §11.4 lifecycle rules."""
+    
+    VALID_TRANSITIONS = {
+        OrderStatus.NEW.value: {OrderStatus.PENDING.value, OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, OrderStatus.EXPIRED.value},
+        OrderStatus.PENDING.value: {OrderStatus.PARTIALLY_FILLED.value, OrderStatus.FILLED.value, OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, OrderStatus.EXPIRED.value},
+        OrderStatus.PARTIALLY_FILLED.value: {OrderStatus.PARTIALLY_FILLED.value, OrderStatus.FILLED.value, OrderStatus.CANCELLED.value, OrderStatus.EXPIRED.value},
+        OrderStatus.FILLED.value: set(),
+        OrderStatus.CANCELLED.value: set(),
+        OrderStatus.REJECTED.value: set(),
+        OrderStatus.EXPIRED.value: set(),
+    }
+
+    @classmethod
+    def can_transition(cls, current: str, target: str) -> bool:
+        if current == target:
+            return True
+        allowed = cls.VALID_TRANSITIONS.get(current, set())
+        return target in allowed
+
+    @classmethod
+    def transition(cls, order_dict: dict, target_status: str) -> bool:
+        current = order_dict.get("status")
+        if cls.can_transition(current, target_status):
+            order_dict["status"] = target_status
+            return True
+        logger.error(f"[STATE MACHINE] Invalid transition rejected: {current} -> {target_status}")
+        return False
+
+
 class OrderType(Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
@@ -141,7 +171,8 @@ class PortfolioReducer:
                     order_ref["quantity"] - order_ref["filled_quantity"],
                 )
                 order_ref["avg_fill_price"] = Decimal(str(payload.get("fill_price", "0")))
-                order_ref["status"] = payload.get("status", OrderStatus.FILLED.value)
+                target_status = payload.get("status", OrderStatus.FILLED.value)
+                OrderStateMachine.transition(order_ref, target_status)
             state.fills.append(payload)
             state.wallet_balance -= fee
             state.realized_pnl_total -= fee
@@ -150,19 +181,19 @@ class PortfolioReducer:
         if et == "ORDER_CANCELLED":
             oid = payload.get("order_id")
             if oid and oid in state.orders:
-                state.orders[oid]["status"] = OrderStatus.CANCELLED.value
+                OrderStateMachine.transition(state.orders[oid], OrderStatus.CANCELLED.value)
             return
 
         if et == "ORDER_REJECTED":
             oid = payload.get("order_id")
             if oid and oid in state.orders:
-                state.orders[oid]["status"] = OrderStatus.REJECTED.value
+                OrderStateMachine.transition(state.orders[oid], OrderStatus.REJECTED.value)
             return
         
         if et == "ORDER_EXPIRED":
             oid = payload.get("order_id")
             if oid and oid in state.orders:
-                state.orders[oid]["status"] = OrderStatus.EXPIRED.value
+                OrderStateMachine.transition(state.orders[oid], OrderStatus.EXPIRED.value)
             return
 
         if et == "POSITION_OPENED":

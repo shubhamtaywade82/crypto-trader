@@ -373,3 +373,77 @@ class LLMCircuitBreaker:
             self.failure_count = 0
             return True
         return False
+
+class MarginEngine:
+    """
+    Enforces futures margin safety rules.
+    PRD §9: Margin utilization, liquidation distance.
+    """
+    def __init__(
+        self,
+        max_margin_utilization: float = 0.25,
+        min_liquidation_distance_pct: float = 0.03,
+        require_isolated_margin: bool = True
+    ):
+        self.max_margin_utilization = max_margin_utilization
+        self.min_liquidation_distance_pct = min_liquidation_distance_pct
+        self.require_isolated_margin = require_isolated_margin
+        
+    def validate_margin_mode(self, is_isolated: bool) -> Tuple[bool, str]:
+        if self.require_isolated_margin and not is_isolated:
+            return False, "Cross margin is prohibited. Isolated margin required."
+        return True, "OK"
+        
+    def check_margin_utilization(self, total_maintenance_margin: float, wallet_balance: float) -> Tuple[bool, str]:
+        if wallet_balance <= 0:
+            return False, "Wallet balance is zero or negative."
+        
+        utilization = total_maintenance_margin / wallet_balance
+        if utilization > self.max_margin_utilization:
+            return False, f"Margin utilization too high: {utilization:.2%} > {self.max_margin_utilization:.2%}"
+        return True, "OK"
+        
+    def check_liquidation_distance(self, entry_price: float, stop_loss_price: float, liquidation_price: float, side: str) -> Tuple[bool, str]:
+        if side.lower() == "long":
+            if stop_loss_price <= liquidation_price:
+                return False, f"Stop loss {stop_loss_price} is at or below liquidation {liquidation_price}"
+            dist = (entry_price - liquidation_price) / entry_price
+        else:
+            if stop_loss_price >= liquidation_price:
+                return False, f"Stop loss {stop_loss_price} is at or above liquidation {liquidation_price}"
+            dist = (liquidation_price - entry_price) / entry_price
+            
+        if dist < self.min_liquidation_distance_pct:
+            return False, f"Liquidation distance too small: {dist:.2%} < {self.min_liquidation_distance_pct:.2%}"
+        
+        return True, "OK"
+
+class LeverageEngine:
+    """
+    Enforces dynamic leverage rules.
+    PRD §9: Leverage tracking, tier validation, ADL monitoring.
+    """
+    def __init__(self, default_leverage: int = 2, hard_max_leverage: int = 5):
+        self.default_leverage = default_leverage
+        self.hard_max_leverage = hard_max_leverage
+        
+    def validate_leverage_tier(self, requested_leverage: int, position_notional: float, max_notional_for_tier: float) -> Tuple[bool, str]:
+        if requested_leverage > self.hard_max_leverage:
+            return False, f"Requested leverage {requested_leverage}x exceeds hard max {self.hard_max_leverage}x"
+            
+        if position_notional > max_notional_for_tier:
+            return False, f"Position notional {position_notional} exceeds tier max {max_notional_for_tier} for {requested_leverage}x"
+            
+        return True, "OK"
+        
+    def calculate_effective_leverage(self, total_position_notional: float, account_equity: float) -> float:
+        if account_equity <= 0:
+            return float('inf')
+        return total_position_notional / account_equity
+        
+    def adjust_leverage_for_volatility(self, base_leverage: int, atr_pct: float, high_vol_threshold: float = 0.05, extreme_vol_threshold: float = 0.10) -> int:
+        if atr_pct >= extreme_vol_threshold:
+            return 0 # No trading
+        elif atr_pct >= high_vol_threshold:
+            return max(1, base_leverage // 2)
+        return base_leverage
