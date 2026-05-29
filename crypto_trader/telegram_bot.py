@@ -88,7 +88,7 @@ class TelegramService:
             if not symbols:
                 symbols = "BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT (Default)"
             msg = (
-                f"{emoji} *Antigravity Bot Started* ({mode_str} Mode)\n\n"
+                f"{emoji} *Crypto-Trader-Bot Started* ({mode_str} Mode)\n\n"
                 f"Balance: `{bal:.2f} USDT`\n"
                 f"Watchlist: `{symbols}`\n\n"
                 f"Use /status or /pnl to query state."
@@ -194,7 +194,7 @@ class TelegramService:
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             return
-        await update.message.reply_text("Antigravity trading bot active. Use /status /pnl /kill /resume.")
+        await update.message.reply_text("Crypto-Trader-Bot active. Use /status /pnl /kill /resume.")
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
