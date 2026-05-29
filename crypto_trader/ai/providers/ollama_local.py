@@ -28,7 +28,7 @@ class OllamaLocalProvider:
             "stream": False,
             "format": "json",
             "think": False,  # disable thinking tokens — 3-5x faster for qwen3.x models
-            "options": {"temperature": 0.2, "num_predict": 256},
+            "options": {"temperature": 0.2, "num_predict": 768},
         }
         try:
             resp = self.session.post(f"{self.host}/api/chat", json=payload, timeout=timeout_s)

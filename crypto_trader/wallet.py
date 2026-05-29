@@ -1077,6 +1077,9 @@ class EnhancedFuturesWallet:
                 pos.tds_paid += tds_close
                 self._emit_event("TDS_CHARGED", {"amount": tds_close, "reason": "CLOSE_TDS", "symbol": symbol})
 
+            # Credit the still-open leg into realized PnL before flattening so
+            # total_realized_pnl reflects the full trade once unrealized is zeroed.
+            pos.partial_realized_pnl += remaining_pnl
             pos.unrealized_pnl = Decimal("0")
             pos.status = "CLOSED"
             pos.close_time = self._now_ms()
@@ -1087,7 +1090,7 @@ class EnhancedFuturesWallet:
             logger.info(
                 f"[POSITION CLOSED] {symbol} {pos.side.value} | "
                 f"Close={execution_price:.2f} | Remaining PnL={remaining_pnl:.2f} | "
-                f"Total Trade PnL={pos.partial_realized_pnl + remaining_pnl:.2f} | Reason={reason}"
+                f"Total Trade PnL={pos.partial_realized_pnl:.2f} | Reason={reason}"
             )
             self._save_state()
             return pos

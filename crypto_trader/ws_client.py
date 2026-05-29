@@ -681,13 +681,13 @@ class WebSocketPositionManager:
         if closed_pos and self.event_bus:
             from .events import TradeClosedEvent
             # Calculate metrics
-            pnl_pct = (float(closed_pos.realized_pnl) / float(closed_pos.margin_used) * 100) if float(closed_pos.margin_used) > 0 else 0
+            pnl_pct = (float(closed_pos.total_realized_pnl) / float(closed_pos.margin_used) * 100) if float(closed_pos.margin_used) > 0 else 0
             duration = (time.time() - closed_pos.open_time / 1000) / 60 if hasattr(closed_pos, 'open_time') else 0
             
             self.event_bus.publish(TradeClosedEvent(
                 symbol=self.symbol,
                 side=closed_pos.side.value,
-                realized_pnl=float(closed_pos.realized_pnl),
+                realized_pnl=float(closed_pos.total_realized_pnl),
                 pnl_percent=pnl_pct,
                 exit_price=f_price,
                 reason=reason,
