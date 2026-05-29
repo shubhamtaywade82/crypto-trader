@@ -70,10 +70,37 @@ class TelegramService:
                 self.event_bus.subscribe(ev_type, self._handle_event)
 
             logger.info("Telegram Bot initialized and subscribed to EventBus")
+            self.loop.create_task(self._send_startup_message())
             self.app.run_polling(close_loop=False, stop_signals=False)
         except Exception as e:
             logger.error("[Telegram] Failed to start: %s", e)
             self.enabled = False
+
+    async def _send_startup_message(self):
+        if not self.enabled or not self.app:
+            return
+        await asyncio.sleep(2)
+        try:
+            mode_str = "LIVE" if (self._wallet_ref and getattr(self._wallet_ref, "live_execution", False)) else "PAPER"
+            emoji = "⚠️" if mode_str == "LIVE" else "🟢"
+            bal = float(self._wallet_ref.wallet_balance) if self._wallet_ref else 0.0
+            symbols = os.getenv("WATCHLIST", "") or os.getenv("TRADE_SYMBOL", "")
+            if not symbols:
+                symbols = "BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT (Default)"
+            msg = (
+                f"{emoji} *Antigravity Bot Started* ({mode_str} Mode)\n\n"
+                f"Balance: `{bal:.2f} USDT`\n"
+                f"Watchlist: `{symbols}`\n\n"
+                f"Use /status or /pnl to query state."
+            )
+            await self.app.bot.send_message(
+                chat_id=self.chat_id,
+                text=msg,
+                parse_mode="Markdown",
+            )
+            logger.info("[Telegram] Startup message sent successfully.")
+        except Exception as e:
+            logger.error("[Telegram] Failed to send startup message: %s", e)
 
     def _handle_event(self, event: Event):
         if self.enabled and self.loop and self.loop.is_running():
@@ -107,12 +134,13 @@ class TelegramService:
         if isinstance(event, TradeOpenedEvent):
             side_label = "LONG" if "LONG" in event.side.upper() else "SHORT"
             emoji = "🟢"
+            bal_str = f"  |  Bal: `{event.wallet_balance:.2f} USDT`" if getattr(event, "wallet_balance", 0) > 0 else ""
             return (
                 f"{emoji} *{side_label} OPENED* — {esc(event.symbol)}\n\n"
                 f"Entry: `{event.entry_price:.4f}`\n"
                 f"SL: `{event.stop_loss:.4f}`\n"
                 f"TP: `{event.take_profit:.4f}`\n\n"
-                f"Leverage: {event.leverage}x  |  Margin: ${event.margin:.2f}\n"
+                f"Leverage: {event.leverage}x  |  Margin: ${event.margin:.2f}{bal_str}\n"
                 f"Notional: ${event.notional:.2f}\n\n"
                 f"Regime: {esc(event.regime)}\n"
                 f"Tech Score: {event.tech_score:.2f}\n"
@@ -123,9 +151,10 @@ class TelegramService:
 
         if isinstance(event, TradeClosedEvent):
             emoji = "🟢" if event.realized_pnl >= 0 else "🔴"
+            bal_str = f"  |  Bal: `{event.wallet_balance:.2f} USDT`" if getattr(event, "wallet_balance", 0) > 0 else ""
             return (
                 f"{emoji} *CLOSED* — {esc(event.symbol)}\n\n"
-                f"PnL: `{event.realized_pnl:+.2f} USDT` ({event.pnl_percent:+.2f}%)\n"
+                f"PnL: `{event.realized_pnl:+.2f} USDT` ({event.pnl_percent:+.2f}%){bal_str}\n"
                 f"Reason: {esc(event.reason)}\n\n"
                 f"Held: {event.duration_minutes:.1f}m\n"
                 f"MFE: {event.mfe:+.2%}  |  MAE: {event.mae:+.2%}\n"

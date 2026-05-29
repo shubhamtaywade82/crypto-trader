@@ -188,6 +188,7 @@ def main():
         initial_balance=total_balance,
         leverage=args.leverage,
         database_url=cfg.database_url,
+        event_bus=bus,
     )
     
     event_store = None

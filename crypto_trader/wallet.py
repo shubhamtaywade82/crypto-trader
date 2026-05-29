@@ -14,7 +14,7 @@ import gzip
 import base64
 import hashlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Literal, Tuple, Callable
+from typing import Dict, List, Optional, Literal, Tuple, Callable, Any
 from typing import Protocol
 from pathlib import Path
 from enum import Enum
@@ -456,6 +456,7 @@ class EnhancedFuturesWallet:
         require_venue_sl: bool = False,
         software_sl_backup_bps: int = 15,
         database_url: str = "",
+        event_bus: Optional[Any] = None,
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -480,6 +481,7 @@ class EnhancedFuturesWallet:
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
         self.halt_on_invariant_violation = halt_on_invariant_violation
         self.event_hook = event_hook
+        self.event_bus = event_bus
         self.halted = False
         self.max_snapshots = max_snapshots
 
@@ -1093,6 +1095,25 @@ class EnhancedFuturesWallet:
                 f"Total Trade PnL={pos.partial_realized_pnl:.2f} | Reason={reason}"
             )
             self._save_state()
+            if hasattr(self, "event_bus") and self.event_bus is not None:
+                try:
+                    from .events import TradeClosedEvent
+                    pnl_pct = (float(pos.partial_realized_pnl) / float(pos.margin_used) * 100) if float(pos.margin_used) > 0 else 0
+                    duration = (time.time() - pos.open_time / 1000) / 60 if getattr(pos, 'open_time', 0) > 0 else 0
+                    self.event_bus.publish(TradeClosedEvent(
+                        symbol=symbol,
+                        side=pos.side.value,
+                        realized_pnl=float(pos.partial_realized_pnl),
+                        pnl_percent=pnl_pct,
+                        exit_price=float(execution_price),
+                        reason=reason,
+                        duration_minutes=duration,
+                        fees=float(pos.fees_paid),
+                        tds=float(pos.tds_paid),
+                        wallet_balance=float(self.wallet_balance),
+                    ))
+                except Exception as ex:
+                    logger.error("Failed to publish TradeClosedEvent from wallet: %s", ex)
             return pos
 
     def _liquidate_position(self, symbol: str, mark_price: Decimal) -> None:
@@ -1124,6 +1145,25 @@ class EnhancedFuturesWallet:
             f"Margin Lost={pos.margin_used:.2f}"
         )
         self._save_state()
+        if hasattr(self, "event_bus") and self.event_bus is not None:
+            try:
+                from .events import TradeClosedEvent
+                pnl_pct = (float(pos.partial_realized_pnl) / float(pos.margin_used) * 100) if float(pos.margin_used) > 0 else 0
+                duration = (time.time() - pos.open_time / 1000) / 60 if getattr(pos, 'open_time', 0) > 0 else 0
+                self.event_bus.publish(TradeClosedEvent(
+                    symbol=symbol,
+                    side=pos.side.value,
+                    realized_pnl=float(pos.partial_realized_pnl),
+                    pnl_percent=pnl_pct,
+                    exit_price=float(mark_price),
+                    reason="LIQUIDATION",
+                    duration_minutes=duration,
+                    fees=float(pos.fees_paid),
+                    tds=float(pos.tds_paid),
+                    wallet_balance=float(self.wallet_balance),
+                ))
+            except Exception as ex:
+                logger.error("Failed to publish TradeClosedEvent from wallet (liquidation): %s", ex)
 
     def adjust_sl_price(self, symbol: str, new_sl_price: Decimal):
         """Adjust Stop Loss price for symbol position via events."""

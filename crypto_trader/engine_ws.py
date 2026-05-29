@@ -1745,6 +1745,7 @@ class WebSocketTradingEngine:
                     funding=funding_rate,
                     oi_delta=oi_delta,
                     liquidation_price=float(self.wallet.liquidation_price(pos)),
+                    wallet_balance=float(self.wallet.wallet_balance),
                 ))
 
     # ── WebSocket Callbacks ──
