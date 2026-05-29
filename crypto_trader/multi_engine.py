@@ -6,7 +6,6 @@ import sys
 from typing import List, Optional
 import logging
 import fcntl
-from dotenv import load_dotenv
 
 from crypto_trader.engine_ws import WebSocketTradingEngine
 from crypto_trader.wallet import EnhancedFuturesWallet
@@ -17,8 +16,9 @@ from crypto_trader.telegram_bot import TelegramService
 from crypto_trader.risk import RiskManager
 from crypto_trader import safe_mode
 
-# Load environment variables for Telegram
-load_dotenv()
+# Env variables are loaded by crypto_trader.__init__ (_load_dotenv):
+#   .env        → non-sensitive config  (no-override)
+#   .env.secrets → API keys / tokens    (always overrides .env)
 
 configure_colored_logging()
 logger = logging.getLogger("multi_engine")
