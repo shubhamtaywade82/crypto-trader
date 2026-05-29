@@ -96,6 +96,7 @@ def build_router(
     cloud_api_key: str = "",
     local_host: str = "http://localhost:11434",
     local_model: str = "qwen3.5:4b",
+    local_num_predict: int = 1536,
     intraday_cache_ttl: int = 45,
     swing_cache_ttl: int = 300,
 ) -> LLMRouter:
@@ -108,7 +109,7 @@ def build_router(
 
     return LLMRouter(
         cloud_provider=OllamaCloudProvider(host=cloud_host, model=cloud_model, api_key=cloud_api_key),
-        local_provider=OllamaLocalProvider(host=local_host, model=local_model),
+        local_provider=OllamaLocalProvider(host=local_host, model=local_model, num_predict=local_num_predict),
         cache=LLMCache(intraday_ttl_s=intraday_cache_ttl, swing_ttl_s=swing_cache_ttl),
         telemetry=LLMTelemetry(),
         validator=DecisionValidator(),
