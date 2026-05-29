@@ -2,6 +2,12 @@
 crypto_trader.risk — Risk Manager & Circuit Breakers
 ======================================================
 Daily trade limits, consecutive loss tracking, and LLM failure circuit breaker.
+
+The ``can_trade()`` gate is implemented with the Specification pattern so that
+each rule is a named, independently-testable class.  Adding a new rule means:
+  1. Write a new ``_*Spec`` class.
+  2. Append ``& _NewSpec()`` to the ``_gate`` composition in ``can_trade()``.
+No other method needs to change.
 """
 
 import json
@@ -9,10 +15,13 @@ import os
 import time
 import logging
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone, date
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 from decimal import Decimal
+
+from .patterns.specification import Specification
 
 logger = logging.getLogger("crypto_trader.risk")
 
@@ -39,6 +48,120 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 
 from crypto_trader.margin_engine import MarginEngine, LeverageEngine
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Specification objects for can_trade()
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _RiskCtx:
+    """Snapshot of all state needed by the risk-gate specifications."""
+    manager: "RiskManager"
+    current_balance: Optional[float]
+    initial_daily_balance: Optional[float]
+    total_notional: float = 0.0
+
+
+class _KillSwitchSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if m.kill_switch:
+            return False, f"Kill switch active: {m.kill_switch_reason or 'unknown'}"
+        return True, ""
+
+
+class _DailyLimitSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if m._has_reached_daily_limit():
+            return False, f"Daily trade limit reached ({m.max_daily})"
+        return True, ""
+
+
+class _VelocitySpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if m._has_reached_velocity_limit():
+            count = len(m._recent_open_times)
+            return False, (
+                f"Velocity limit reached "
+                f"({count}/{m.max_orders_per_minute} orders/min)"
+            )
+        return True, ""
+
+
+class _DailyDrawdownSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if m._is_daily_drawdown_limit_hit(ctx.initial_daily_balance):
+            return False, (
+                f"Daily drawdown limit hit: {m.daily_pnl:.2f} "
+                f"({m.max_daily_drawdown_pct * 100:.1f}%)"
+            )
+        return True, ""
+
+
+class _ConsecutiveLossSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if m._is_consecutive_loss_halt_active():
+            return False, (
+                f"Consecutive loss halt ({m.max_consecutive}) "
+                f"— manual reset required"
+            )
+        return True, ""
+
+
+class _CooldownSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        in_cooldown, reason = m._check_cooldown_status()
+        if in_cooldown:
+            return False, reason
+        return True, ""
+
+
+class _MaxDrawdownSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if m._is_max_drawdown_reached(ctx.current_balance):
+            cur = m._to_float(ctx.current_balance)
+            peak = float(m.peak_balance)
+            dd = (peak - cur) / peak
+            return False, (
+                f"Max drawdown reached "
+                f"({dd:.1%} >= {m.max_drawdown_pct:.1%})"
+            )
+        return True, ""
+
+
+class _PortfolioLeverageSpec(Specification["_RiskCtx"]):
+    def is_satisfied_by(self, ctx: "_RiskCtx") -> Tuple[bool, str]:
+        m = ctx.manager
+        if ctx.current_balance and float(ctx.current_balance) > 0:
+            eff_lev = m.leverage_engine.calculate_effective_leverage(
+                ctx.total_notional, float(ctx.current_balance)
+            )
+            if float(eff_lev) > m.max_portfolio_leverage:
+                return False, (
+                    f"Portfolio leverage too high: "
+                    f"{float(eff_lev):.2f}x > {m.max_portfolio_leverage:.2f}x"
+                )
+        return True, ""
+
+
+# Composed gate — evaluated left-to-right; first failure short-circuits.
+_TRADE_GATE = (
+    _KillSwitchSpec()
+    & _DailyLimitSpec()
+    & _VelocitySpec()
+    & _DailyDrawdownSpec()
+    & _ConsecutiveLossSpec()
+    & _CooldownSpec()
+    & _MaxDrawdownSpec()
+    & _PortfolioLeverageSpec()
+)
+
 
 class RiskManager:
     """Enforces daily trade limits, portfolio exposure, and consecutive loss stops."""
@@ -163,52 +286,26 @@ class RiskManager:
             return False
 
     def can_trade(
-        self, 
-        current_balance: Optional[float] = None, 
+        self,
+        current_balance: Optional[float] = None,
         initial_daily_balance: Optional[float] = None,
-        total_notional: float = 0.0
+        total_notional: float = 0.0,
     ) -> Tuple[bool, str]:
-        """Portfolio Guard: Checks global limits before allowing a new trade."""
-        if self.kill_switch:
-            return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
+        """
+        Run all risk-gate specifications in order.
 
+        Each check is a :class:`Specification` subclass defined at module level.
+        To add a new rule, write a spec class and append it to ``_TRADE_GATE``.
+        """
         self._reset_daily_stats_if_new_day()
-
-        if self._has_reached_daily_limit():
-            return False, f"Daily trade limit reached ({self.max_daily})"
-
-        # G2: velocity circuit breaker
-        if self._has_reached_velocity_limit():
-            return False, (f"Velocity limit reached "
-                           f"({len(self._recent_open_times)}/{self.max_orders_per_minute} orders/min)")
-        
-        # Kill switch: 5% daily drawdown
-        if self._is_daily_drawdown_limit_hit(initial_daily_balance):
-            return False, f"Daily drawdown limit hit: {self.daily_pnl:.2f} ({self.max_daily_drawdown_pct*100:.1f}%)"
-
-        if self._is_consecutive_loss_halt_active():
-            return False, f"Consecutive loss halt ({self.max_consecutive}) — manual reset required"
-        
-        is_cooldown, cooldown_msg = self._check_cooldown_status()
-        if is_cooldown:
-            return False, cooldown_msg
-        
-        if self._is_max_drawdown_reached(current_balance):
-            try:
-                cur = float(current_balance)
-                peak = float(self.peak_balance)
-                dd = (peak - cur) / peak
-                return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
-            except (TypeError, ValueError):
-                return False, "Max drawdown check error"
-            
-        # Portfolio Leverage Guard
-        if current_balance and float(current_balance) > 0:
-            eff_lev = self.leverage_engine.calculate_effective_leverage(total_notional, current_balance)
-            if float(eff_lev) > self.max_portfolio_leverage:
-                return False, f"Portfolio leverage too high: {float(eff_lev):.2f}x > {self.max_portfolio_leverage:.2f}x"
-        
-        return True, "OK"
+        ctx = _RiskCtx(
+            manager=self,
+            current_balance=current_balance,
+            initial_daily_balance=initial_daily_balance,
+            total_notional=total_notional,
+        )
+        ok, reason = _TRADE_GATE.is_satisfied_by(ctx)
+        return ok, reason or "OK"
 
     def check_margin_ratio(self, ratio: float) -> Tuple[bool, str]:
         """Verify the authoritative exchange margin ratio is within safe bounds."""
@@ -373,36 +470,59 @@ class AdaptiveThresholdManager:
 
 
 class LLMCircuitBreaker:
-    """Auto-disable LLM after repeated failures."""
+    """
+    Auto-disable LLM after repeated failures.
+
+    Thin wrapper around :class:`~crypto_trader.patterns.CircuitBreaker` that
+    preserves the original ``record_success`` / ``record_failure`` / ``can_use``
+    API so existing callers don't need to change.
+    """
 
     def __init__(self, max_failures: int = 5, cooldown_minutes: int = 30):
+        from .patterns.circuit_breaker import CircuitBreaker as _CB
+        self._cb = _CB(
+            name="llm",
+            failure_threshold=max_failures,
+            recovery_timeout=cooldown_minutes * 60,
+        )
+        # Expose raw counters for compatibility with any code reading them directly.
         self.max_failures = max_failures
         self.cooldown = cooldown_minutes * 60
-        self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.disabled = False
 
-    def record_success(self):
-        self.failure_count = 0
-        self.disabled = False
+    @property
+    def failure_count(self) -> int:
+        return self._cb.failure_count
+
+    @property
+    def disabled(self) -> bool:
+        return self._cb.is_open
+
+    @disabled.setter
+    def disabled(self, value: bool) -> None:
+        if value:
+            self._cb.trip()
+        else:
+            self._cb.reset()
+
+    @property
+    def last_failure_time(self) -> Optional[float]:
+        return self._cb._last_failure_time
+
+    def record_success(self) -> None:
+        self._cb._on_success()
 
     def record_failure(self) -> bool:
-        """Record failure. Returns True if LLM should be disabled."""
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.max_failures:
-            self.disabled = True
-            logger.critical(f"[LLM CIRCUIT BREAKER] LLM disabled after {self.failure_count} failures")
-            return True
-        return False
+        """Record a failure. Returns True if the LLM is now disabled."""
+        self._cb._on_failure()
+        is_open = self._cb.is_open
+        if is_open:
+            logger.critical(
+                "[LLM CIRCUIT BREAKER] LLM disabled after %d failure(s)",
+                self._cb.failure_count,
+            )
+        return is_open
 
     def can_use(self) -> bool:
-        if not self.disabled:
-            return True
-        # Auto-re-enable after cooldown
-        if self.last_failure_time and (time.time() - self.last_failure_time) > self.cooldown:
-            logger.info("[LLM CIRCUIT BREAKER] Cooldown expired. Re-enabling LLM.")
-            self.disabled = False
-            self.failure_count = 0
-            return True
-        return False
+        from .patterns.circuit_breaker import CircuitState
+        state = self._cb.state  # triggers HALF_OPEN check automatically
+        return state != CircuitState.OPEN

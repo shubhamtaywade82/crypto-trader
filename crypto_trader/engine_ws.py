@@ -33,6 +33,7 @@ from .playbooks import PlaybookA, PlaybookB, PlaybookAres, PlaybookVolExhaust, P
 from .strategies.supertrend2 import PlaybookSupertrend2
 from .strategies.mean_reversion import PlaybookMeanReversion
 from .strategies.mr_state import MRStateManager
+from .strategies.router import StrategyRouter, RouterResult, build_legacy_router
 from .reconciliation import ExchangeStateReconciler
 from .regime import (
     MarketRegimeAnalyzer, MarketRegime, ExtendedRegime,
@@ -1147,33 +1148,14 @@ class WebSocketTradingEngine:
                     from .events import SystemFailureEvent
                     self.event_bus.publish(SystemFailureEvent(component="entry", error=str(e)))
 
-    # Regime → allowed strategy order. Empty list means no entries.
-    _REGIME_STRATEGY_MAP: dict = {
-        ExtendedRegime.TREND_EXPANSION:      ["playbook_a", "playbook_b"],
-        ExtendedRegime.BREAKOUT_ENVIRONMENT: ["playbook_b", "playbook_a", "playbook_sweep"],
-        ExtendedRegime.ACCUMULATION:         ["playbook_a", "playbook_sweep"],
-        ExtendedRegime.MEAN_REVERSION:       ["playbook_ares", "playbook_volx", "playbook_sweep"],
-        ExtendedRegime.LOW_VOL_CHOP:         ["playbook_ares", "playbook_volx"],
-        ExtendedRegime.LIQUIDATION_EVENT:    [],
-        ExtendedRegime.DEAD_MARKET:          [],
-        ExtendedRegime.HIGH_RISK_CHAOS:      [],
-    }
+    # StrategyRouter is lazily built on first use and cached.
+    # Use build_legacy_router() to customise the regime → playbook map.
+    _strategy_router: Optional[StrategyRouter] = None
 
-    @staticmethod
-    def _bias_factor(side, advice) -> float:
-        """Selection-only tiebreak: down-weight a candidate whose side contradicts
-        the LLM's recommended bias. Returns a multiplier in [0,1]. Never used for
-        the threshold gate (that uses the true fused score) — only for ranking."""
-        if advice is None:
-            return 1.0
-        rec = getattr(advice, "recommended_bias", "any")
-        if rec == "none":
-            return 0.5  # LLM wants no trades — push all candidates down
-        if rec == "long_only" and side == PositionSide.SHORT:
-            return 0.6
-        if rec == "short_only" and side == PositionSide.LONG:
-            return 0.6
-        return 1.0
+    def _get_strategy_router(self) -> StrategyRouter:
+        if self._strategy_router is None:
+            self._strategy_router = build_legacy_router()
+        return self._strategy_router
 
     def _evaluate_entry(self, df_1h, df_4h, df_15m, regime, regime_score, mark_price,
                         funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None,
@@ -1181,26 +1163,13 @@ class WebSocketTradingEngine:
                         session_ctx=None, structure_ltf=None):
         """Evaluate entry signals and execute via WebSocket LTP.
 
-        Score-based best-of: every playbook allowed for the current regime is
-        evaluated; each candidate is LLM-fused, and the highest-scoring one
-        (bias-aware ranking) that clears the dynamic threshold is executed.
+        Score-based best-of selection is delegated to :class:`StrategyRouter`.
+        This method is responsible only for:
+          - building the dict of playbook evaluator lambdas,
+          - post-selection correlation and funding-rate vetoes,
+          - dispatching to _execute_entry.
         """
-        # Determine allowed playbooks from extended regime (fallback: legacy order)
-        if regime_ctx is not None:
-            allowed = self._REGIME_STRATEGY_MAP.get(
-                regime_ctx.extended,
-                ["playbook_ares", "playbook_a", "playbook_b"],
-            )
-        else:
-            allowed = ["playbook_ares", "playbook_a", "playbook_b"]
-
-        if not allowed:
-            logger.info(f"[ROUTER] No strategies allowed for {regime_ctx.extended.value if regime_ctx else 'unknown'}")
-            return
-
-        logger.info(f"[ROUTER] allowed_strategies={allowed}")
-
-        playbook_map = {
+        playbook_evaluators = {
             "playbook_ares":  lambda: self.playbook_ares.evaluate(df_15m, adx_1h=adx_1h),
             "playbook_volx":  lambda: self.playbook_volx.evaluate(df_15m, adx_1h=adx_1h),
             "playbook_a":     lambda: self.playbook_a.evaluate(df_1h, regime, structure=structure),
@@ -1208,99 +1177,62 @@ class WebSocketTradingEngine:
             "playbook_sweep": lambda: self.playbook_sweep.evaluate(
                 df_1h, df_15m, structure, structure_ltf, regime=regime),
         }
-        playbook_labels = {
-            "playbook_ares":  "PLAYBOOK ARES",
-            "playbook_volx":  "PLAYBOOK VOLX",
-            "playbook_a":     "PLAYBOOK A",
-            "playbook_b":     "PLAYBOOK B",
-            "playbook_sweep": "PLAYBOOK SWEEP",
-        }
 
-        advice = self.advisor.get_last_advice() if self.advisor else None
-        dynamic_threshold = self.adaptive_threshold.get_threshold()
-
-        # Evaluate ALL allowed playbooks and fuse each, then pick the best.
-        candidates = []  # (rank_score, final_score, llm_weight, explanation, pb_key, setup)
-        for pb_key in allowed:
-            evaluator = playbook_map.get(pb_key)
-            if evaluator is None:
-                continue
-            try:
-                setup = evaluator()
-            except Exception as e:
-                logger.warning(f"[{playbook_labels.get(pb_key, pb_key)}] evaluate failed: {e}")
-                continue
-            if not setup:
-                continue
-
-            tech_score = setup["score"]
-            if self.advisor and advice:
-                final_score, llm_weight, explanation = self.advisor.compute_final_score(
-                    technical_score=tech_score,
-                    regime=regime.value,
-                    regime_score=regime_score,
-                    advice=advice,
-                )
-            else:
-                final_score, llm_weight, explanation = tech_score, 0.0, "LLM unavailable"
-
-            rank_score = final_score * self._bias_factor(setup["side"], advice)
-            logger.info(
-                f"[{playbook_labels[pb_key]}] candidate: {setup['side'].value} | "
-                f"tech={tech_score:.2f} | final={final_score:.2f} | rank={rank_score:.2f}"
-            )
-            candidates.append((rank_score, final_score, llm_weight, explanation, pb_key, setup))
-
-        if not candidates:
-            return
-
-        # Best-of: highest bias-aware rank score wins.
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        rank_score, final_score, llm_weight, explanation, pb_key, setup = candidates[0]
-        logger.info(
-            f"[SELECT] winner={playbook_labels[pb_key]} | {setup['side'].value} | "
-            f"final={final_score:.2f} | {len(candidates)} candidate(s)"
+        result: Optional[RouterResult] = self._get_strategy_router().select(
+            regime_ctx=regime_ctx,
+            playbook_evaluators=playbook_evaluators,
+            advisor=self.advisor,
+            dynamic_threshold=self.adaptive_threshold.get_threshold(),
+            regime=regime,
+            regime_score=regime_score,
         )
+        if result is None:
+            return
 
-        # Correlation check
-        active_positions = {s: p.to_dict() for s, p in self.wallet.positions.items() if p.status == "OPEN"}
-        ok, corr_reason = self.risk_manager.check_correlation(self.symbol, setup["side"].value, active_positions)
+        setup = result.setup
+
+        # Correlation check (wallet-state dependent — stays here, not in router)
+        active_positions = {
+            s: p.to_dict()
+            for s, p in self.wallet.positions.items()
+            if p.status == "OPEN"
+        }
+        ok, corr_reason = self.risk_manager.check_correlation(
+            self.symbol, setup["side"].value, active_positions
+        )
         if not ok:
-            logger.info(f"[BLOCKED] {corr_reason}")
+            logger.info("[BLOCKED] %s", corr_reason)
             return
 
-        if self.advisor and advice:
-            logger.info(f"[FUSION] {explanation} | final={final_score:.2f}")
+        if self.advisor and result.advice:
+            logger.info("[FUSION] %s | final=%.2f", result.explanation, result.final_score)
 
-        if final_score < dynamic_threshold:
-            logger.info(f"[BLOCKED] Final score {final_score:.2f} < {dynamic_threshold:.2f}")
-            return
+        # Funding-rate extreme gate
         _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
         if (
             (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
             or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
         ):
             logger.info(
-                f"[BLOCKED] Funding extreme for {setup['side'].value}: {funding_rate:+.4%} "
-                f"(threshold={_funding_extreme:.2%})"
+                "[BLOCKED] Funding extreme for %s: %+.4%% (threshold=%.2%%)",
+                setup["side"].value, funding_rate, _funding_extreme,
             )
             return
 
-        # Execute entry using WebSocket LTP for precise price
         self._execute_entry(EntryContext(
             setup=setup,
-            final_score=final_score,
-            llm_weight=llm_weight,
-            explanation=explanation,
+            final_score=result.final_score,
+            llm_weight=result.llm_weight,
+            explanation=result.explanation,
             mark_price=mark_price,
             funding_rate=funding_rate,
             oi_delta=oi_delta,
             taker_ratio=taker_ratio,
-            tech_score=tech_score,
+            tech_score=result.tech_score,
             regime=regime,
             regime_score=regime_score,
-            advice=advice,
-            dynamic_threshold=dynamic_threshold,
+            advice=result.advice,
+            dynamic_threshold=result.dynamic_threshold,
             regime_ctx=regime_ctx,
         ))
 

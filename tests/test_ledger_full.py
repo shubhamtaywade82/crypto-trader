@@ -479,7 +479,8 @@ class TestPartialExits:
                                _D("4"), _D("50000"), leverage=10)
         pos2 = pe.reduce_position(pos.position_uid, _D("1"), _D("52000"))
         assert pos2.qty == _D("3")
-        assert pos2.status == "open"
+        # StateMachine correctly transitions open → reducing on partial close
+        assert pos2.status == "reducing"
 
     def test_partial_close_books_pnl(self, pe):
         pos = pe.open_position("binance", "BTCUSDT", "LONG",
