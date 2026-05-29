@@ -23,6 +23,54 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 _OUTCOME_DATA_DIR = Path.home() / ".crypto_trader" / "outcomes"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _DailyJsonlJournal — shared base: daily rotation, append, generic read
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _DailyJsonlJournal:
+    """
+    Base class providing daily-rotated JSONL file management.
+
+    Subclasses call ``super().__init__(resolved_path)`` passing an already-
+    resolved ``Path`` so that each subclass controls its own default.
+    """
+
+    def __init__(self, data_dir: Union[str, Path]):
+        self._data_dir = Path(data_dir)
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._current_file: Optional[Path] = None
+        self._current_date: Optional[str] = None
+
+    def _get_file(self) -> Path:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_date:
+            self._current_date = today
+            self._current_file = self._data_dir / f"{today}.jsonl"
+        return self._current_file  # type: ignore[return-value]
+
+    def _append_line(self, payload: dict) -> None:
+        """Serialize *payload* as a single JSONL line and append to today's file."""
+        path = self._get_file()
+        with open(path, "a") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+
+    def _iter_raw_lines(self) -> Iterator[dict]:
+        """
+        Yield every successfully-parsed JSON object from all stored JSONL files,
+        in chronological order (oldest file first, line order within file).
+        """
+        for path in sorted(self._data_dir.glob("*.jsonl")):
+            with open(path, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning("[JOURNAL] Skipping malformed line in %s", path)
+
+
 @dataclass
 class TradeJournalEntry:
     trade_id: str
@@ -51,27 +99,17 @@ class TradeJournalEntry:
     tds_paid: Optional[float] = None
 
 
-class TradeJournal:
+class TradeJournal(_DailyJsonlJournal):
     """Append-only journal with daily file rotation."""
 
+    # _default_data_dir is resolved lazily in __init__ so that patching the
+    # module-level DATA_DIR constant in tests still takes effect.
     def __init__(self, data_dir: Optional[Union[str, Path]] = None):
-        self._data_dir = Path(data_dir) if data_dir else DATA_DIR
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._current_file = None
-        self._current_date = None
-
-    def _get_file(self) -> Path:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self._current_date:
-            self._current_date = today
-            self._current_file = self._data_dir / f"{today}.jsonl"
-        return self._current_file
+        super().__init__(data_dir if data_dir is not None else DATA_DIR)
 
     def log(self, entry: TradeJournalEntry):
         """Append entry to today's journal file."""
-        path = self._get_file()
-        with open(path, "a") as f:
-            f.write(json.dumps(asdict(entry), default=str) + "\n")
+        self._append_line(asdict(entry))
         logger.debug(f"[JOURNAL] Logged trade {entry.trade_id}")
 
     def log_open(
@@ -136,9 +174,7 @@ class TradeJournal:
             "slippage": slippage,
             "tds_paid": tds,
         }
-        path = self._get_file()
-        with open(path, "a") as f:
-            f.write(json.dumps(close_record, default=str) + "\n")
+        self._append_line(close_record)
 
     def get_recent(self, days: int = 7) -> List[Dict]:
         """Read recent journal entries."""
@@ -260,7 +296,7 @@ class TradeOutcomeRecord:
 # TradeOutcomeJournal — append-only JSONL sink for TradeOutcomeRecord
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TradeOutcomeJournal:
+class TradeOutcomeJournal(_DailyJsonlJournal):
     """
     Append-only JSONL journal for closed-trade outcome records.
 
@@ -274,20 +310,10 @@ class TradeOutcomeJournal:
         ``~/.crypto_trader/outcomes``.  Override in tests via ``tmp_path``.
     """
 
+    # _default_data_dir is resolved lazily in __init__ so that patching the
+    # module-level _OUTCOME_DATA_DIR constant in tests still takes effect.
     def __init__(self, data_dir: Optional[Union[str, Path]] = None):
-        self._data_dir = Path(data_dir) if data_dir else _OUTCOME_DATA_DIR
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._current_file: Optional[Path] = None
-        self._current_date: Optional[str] = None
-
-    # ── internal ──────────────────────────────────────────────
-
-    def _get_file(self) -> Path:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self._current_date:
-            self._current_date = today
-            self._current_file = self._data_dir / f"{today}.jsonl"
-        return self._current_file  # type: ignore[return-value]
+        super().__init__(data_dir if data_dir is not None else _OUTCOME_DATA_DIR)
 
     # ── write ─────────────────────────────────────────────────
 
@@ -295,9 +321,7 @@ class TradeOutcomeJournal:
         """Append a completed TradeOutcomeRecord to today's file."""
         payload = asdict(outcome)
         payload["record_type"] = _RECORD_TYPE
-        path = self._get_file()
-        with open(path, "a") as fh:
-            fh.write(json.dumps(payload, default=str) + "\n")
+        self._append_line(payload)
         logger.debug("[OUTCOME] Recorded trade %s", outcome.trade_id)
 
     # ── read ──────────────────────────────────────────────────
@@ -307,18 +331,8 @@ class TradeOutcomeJournal:
         Yield every TradeOutcomeRecord from all stored files in
         chronological order (oldest file first, line order within file).
         """
-        for path in sorted(self._data_dir.glob("*.jsonl")):
-            with open(path, "r") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.warning("[OUTCOME] Skipping malformed line in %s", path)
-                        continue
-                    if payload.get("record_type") != _RECORD_TYPE:
-                        continue  # skip non-outcome lines (e.g. mixed files)
-                    payload.pop("record_type", None)
-                    yield TradeOutcomeRecord(**payload)
+        for payload in self._iter_raw_lines():
+            if payload.get("record_type") != _RECORD_TYPE:
+                continue  # skip non-outcome lines (e.g. mixed files)
+            payload.pop("record_type", None)
+            yield TradeOutcomeRecord(**payload)
