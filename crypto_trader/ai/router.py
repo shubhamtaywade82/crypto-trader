@@ -96,6 +96,7 @@ def build_router(
     cloud_api_key: str = "",
     local_host: str = "http://localhost:11434",
     local_model: str = "qwen3.5:4b",
+    local_num_predict: int = 1536,
     intraday_cache_ttl: int = 45,
     swing_cache_ttl: int = 300,
 ) -> LLMRouter:
@@ -105,10 +106,19 @@ def build_router(
     from .cache import LLMCache
     from .telemetry import LLMTelemetry
     from .validators.decision_schema import DecisionValidator
+    from .schemas import LLMDecision
+
+    # Grammar-constrain local output to the exact decision shape (Ollama supports
+    # a JSON schema in `format`). Cloud uses OpenAI-compat response_format instead
+    # — Ollama Cloud does not support schema-based structured outputs.
+    decision_schema = LLMDecision.model_json_schema()
 
     return LLMRouter(
         cloud_provider=OllamaCloudProvider(host=cloud_host, model=cloud_model, api_key=cloud_api_key),
-        local_provider=OllamaLocalProvider(host=local_host, model=local_model),
+        local_provider=OllamaLocalProvider(
+            host=local_host, model=local_model,
+            num_predict=local_num_predict, json_schema=decision_schema,
+        ),
         cache=LLMCache(intraday_ttl_s=intraday_cache_ttl, swing_ttl_s=swing_cache_ttl),
         telemetry=LLMTelemetry(),
         validator=DecisionValidator(),

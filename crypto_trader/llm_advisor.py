@@ -601,6 +601,7 @@ class OllamaAdvisor:
                 cloud_api_key=os.getenv("CLOUD_OLLAMA_API_KEY", ""),
                 local_host=host,
                 local_model=model,
+                local_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "1536")),
             )
             logger.info("[LLM] AI subsystem router initialized (cloud+local)")
         except Exception as e:

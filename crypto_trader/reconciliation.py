@@ -85,24 +85,49 @@ class ExchangeStateReconciler:
                         except Exception as e:
                             logger.error(f"[RECONCILIATION] Failed to cancel orphaned order: {e}")
             
-            # 5. Missing Stop Loss Detection
+            # 5. Missing Stop Loss Detection & Recreation (PRD §18 / SRD §5.3)
             # If we have a position, ensure there is at least one active STOP order.
-            if ex_qty > 0 and local_pos:
+            # Only meaningful when the wallet hosts venue-resident stops; in paper
+            # mode or when venue SL is disabled, a missing venue stop is expected.
+            venue_sl_active = (
+                getattr(self.wallet, "live_execution", False)
+                and getattr(self.wallet, "venue_sl_enabled", False)
+            )
+            if ex_qty > 0 and local_pos and venue_sl_active:
                 has_stop = False
                 for o in exchange_open_orders:
                     order_type = str(o.get("order_type", o.get("type", ""))).upper()
-                    if order_type == "STOP_MARKET" or order_type == "STOP_LOSS_MARKET" or order_type == "STOP":
+                    if order_type in ("STOP_MARKET", "STOP_LOSS_MARKET", "STOP"):
                         has_stop = True
                         break
-                        
+
                 if not has_stop and local_pos.sl_price and local_pos.sl_price > 0:
-                    logger.error(f"[RECONCILIATION] CRITICAL: Missing venue stop-loss for {symbol} at {local_pos.sl_price}!")
-                    # To be perfectly safe, trigger kill switch instead of blind-recreating,
-                    # because we want to ensure the position isn't running naked without intention.
-                    msg = f"Missing venue stop-loss for open {symbol} position."
-                    self.risk_manager.trigger_kill_switch(msg)
-                    return False
-                    
+                    logger.error(
+                        f"[RECONCILIATION] Missing venue stop-loss for {symbol} at "
+                        f"{local_pos.sl_price} — recreating immediately."
+                    )
+                    # Per spec, recreate the protective stop rather than halting on a
+                    # recoverable gap (e.g. a crash between fill and SL placement, or a
+                    # venue-side cancel). Kill-switch only if recreation genuinely fails,
+                    # i.e. the position is naked and unfixable.
+                    placed = {}
+                    try:
+                        placed = self.wallet._place_protective_orders(local_pos)
+                    except Exception as e:
+                        logger.critical(
+                            f"[RECONCILIATION] Stop-loss recreation raised for {symbol}: {e}"
+                        )
+                    if placed.get("sl"):
+                        logger.warning(
+                            f"[RECONCILIATION] Recreated venue stop-loss for {symbol} at "
+                            f"{local_pos.sl_price} (order {placed['sl']})."
+                        )
+                    else:
+                        msg = f"Missing venue stop-loss for open {symbol} position; recreation failed."
+                        logger.critical(f"[RECONCILIATION] {msg}")
+                        self.risk_manager.trigger_kill_switch(msg)
+                        return False
+
             return True
             
         except Exception as e:

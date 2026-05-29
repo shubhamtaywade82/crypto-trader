@@ -27,6 +27,7 @@ import uuid
 
 from .db import LedgerDB
 from .models import Position
+from ..patterns.state_machine import StateMachine
 
 logger = logging.getLogger("crypto_trader.ledger.position_engine")
 
@@ -68,6 +69,28 @@ def compute_liquidation_price(
     if denom <= _ZERO:
         return _ZERO
     return entry / denom
+
+
+def _make_position_sm(initial_status: str = "open") -> StateMachine:
+    """
+    Build the standard isolated-margin position lifecycle state machine.
+
+    States:    open → reducing → closed
+    Triggers:  partial_close, full_close, add (open only)
+
+    The machine is per-position: instantiate one when the position is loaded
+    from the DB so the current state reflects the DB row.
+    """
+    sm = StateMachine(initial_status)
+    # add_to_position keeps status "open"
+    sm.add("open", "open",     "add")
+    # partial exit stays in "reducing" (qty > 0 after the reduction)
+    sm.add("open",     "reducing", "partial_close")
+    sm.add("reducing", "reducing", "partial_close")
+    # full close terminates from either state
+    sm.add("open",     "closed", "full_close")
+    sm.add("reducing", "closed", "full_close")
+    return sm
 
 
 class PositionEngine:
@@ -153,7 +176,8 @@ class PositionEngine:
         pos = self._load_by_uid(position_uid)
         if pos is None:
             raise ValueError(f"Position {position_uid} not found")
-        if pos.status != "open":
+        sm = _make_position_sm(pos.status)
+        if not sm.can_trigger("add"):
             raise ValueError(f"Cannot add to a {pos.status} position")
 
         total_qty   = pos.qty + qty_delta
@@ -184,7 +208,9 @@ class PositionEngine:
         pos = self._load_by_uid(position_uid)
         if pos is None:
             raise ValueError(f"Position {position_uid} not found")
-        if pos.status != "open":
+        sm = _make_position_sm(pos.status)
+        trigger = "full_close" if qty_delta >= pos.qty else "partial_close"
+        if not sm.can_trigger(trigger):
             raise ValueError(f"Cannot reduce a {pos.status} position")
         if qty_delta > pos.qty:
             raise ValueError(f"qty_delta {qty_delta} > position qty {pos.qty}")
@@ -200,12 +226,15 @@ class PositionEngine:
         pos.realized_pnl += portion_pnl
         pos.updated_at    = _now_ms()
 
-        if pos.qty <= _ZERO:
+        sm.trigger(trigger)  # advance the machine (updates sm.state, fires hooks)
+
+        if sm.state == "closed":
             pos.qty      = _ZERO
             pos.status   = "closed"
             pos.closed_at = _now_ms()
             pos.unrealized_pnl = _ZERO
         else:
+            pos.status = "reducing"
             self._recalculate(pos, mark=exit_price)
 
         self._update_position(pos)

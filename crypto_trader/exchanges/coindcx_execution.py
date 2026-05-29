@@ -93,6 +93,9 @@ class CoinDCXExecutionEngine:
         i_understand_real_money: bool = False,
     ):
         self.client = client or CoinDCXClient(api_key=api_key, api_secret=api_secret)
+        # Expose the circuit breaker so the engine/risk-manager can read its state
+        # (e.g. trip the kill-switch when the venue is OPEN for > N seconds).
+        self.circuit_breaker = self.client._cb
         self.mapper = mapper or InstrumentMapper(self.client)
         self.leverage = leverage
         self.margin_type = margin_type

@@ -3,17 +3,22 @@ crypto_trader.execution.signal_bus — decoupled signal → execution pipeline
 ===========================================================================
 Strategies stay pure: they emit a :class:`Signal` to the ``execution:signals``
 Redis stream and never touch the exchange. The :class:`SignalConsumer` drains
-the stream through a consumer group and routes each signal to a mode-specific
-adapter (``paper`` / ``live``), with the safety machinery the review called for:
+the stream through a consumer group and routes each signal through a
+Chain-of-Responsibility pipeline:
 
+  PoisonPillHandler → ParseHandler → DuplicateHandler
+      → RiskGateHandler → AdapterHandler → ExecuteHandler
+
+Each handler either stops the chain (ack + log / DLQ) or forwards to the next.
+Adding a new step means writing a new :class:`~crypto_trader.patterns.Handler`
+subclass and inserting it in ``SignalConsumer._build_pipeline()``.
+
+Safety guarantees:
 * idempotency lock (no double-fills on retry/replay),
-* a risk gate run *before* the adapter (velocity / drawdown veto),
+* risk gate run *before* the adapter (velocity / drawdown veto),
 * poison-pill → dead-letter routing (no crash loops),
 * boot-time PEL recovery (orphaned in-flight signals handled first),
 * ``XACK`` only after the adapter succeeds (at-least-once).
-
-This layer is transport-only; the actual order placement lives behind the
-``SignalAdapter`` Protocol (the live adapter calls the wallet/execution engine).
 """
 from __future__ import annotations
 
@@ -24,6 +29,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, Optional, Protocol
 
 from ..infra.redis_streams import RedisStreamBus
+from ..patterns.chain import Chain, Handler, HandlerResult
 
 logger = logging.getLogger("crypto_trader.execution.signal_bus")
 
@@ -67,6 +73,126 @@ class SignalPublisher:
         return msg_id
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline context + handler chain
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _SignalCtx:
+    """Mutable context threaded through every handler in the pipeline."""
+    msg_id: str
+    raw_data: dict
+    stream: str
+    group: str
+    bus: Any                          # RedisStreamBus
+    dlq_stream: str
+    signal: Optional["Signal"] = None
+    adapter: Optional["SignalAdapter"] = None
+
+
+class _PoisonPillHandler(Handler[_SignalCtx]):
+    def __init__(self, max_deliveries: int) -> None:
+        super().__init__()
+        self.max_deliveries = max_deliveries
+
+    def handle(self, ctx: _SignalCtx) -> HandlerResult:
+        count = ctx.bus.delivery_count(ctx.stream, ctx.group, ctx.msg_id)
+        if count > self.max_deliveries:
+            ctx.bus.to_dlq(ctx.dlq_stream, ctx.raw_data,
+                           reason=f"max_deliveries>{self.max_deliveries}")
+            ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
+            logger.error("signal %s exceeded delivery limit -> DLQ", ctx.msg_id)
+            return HandlerResult.stop("poison pill")
+        return self.forward(ctx)
+
+
+class _ParseHandler(Handler[_SignalCtx]):
+    def handle(self, ctx: _SignalCtx) -> HandlerResult:
+        try:
+            ctx.signal = Signal.from_payload(ctx.raw_data)
+        except Exception as exc:
+            ctx.bus.to_dlq(ctx.dlq_stream, ctx.raw_data, reason=f"malformed: {exc}")
+            ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
+            return HandlerResult.stop(f"malformed: {exc}")
+        return self.forward(ctx)
+
+
+class _DuplicateHandler(Handler[_SignalCtx]):
+    def handle(self, ctx: _SignalCtx) -> HandlerResult:
+        sig = ctx.signal
+        idem_key = f"idem:{sig.strategy_id}:{sig.timestamp}"
+        if ctx.bus.is_processed(idem_key):
+            logger.info("duplicate signal %s suppressed", sig.signal_id)
+            ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
+            return HandlerResult.stop("duplicate")
+        return self.forward(ctx)
+
+
+class _RiskGateHandler(Handler[_SignalCtx]):
+    def __init__(self, risk_gate: Optional[Callable[["Signal"], bool]]) -> None:
+        super().__init__()
+        self._gate = risk_gate
+
+    def handle(self, ctx: _SignalCtx) -> HandlerResult:
+        if self._gate is not None and not self._gate(ctx.signal):
+            logger.warning(
+                "risk gate vetoed signal %s (%s %s)",
+                ctx.signal.signal_id, ctx.signal.side, ctx.signal.symbol,
+            )
+            ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
+            return HandlerResult.stop("risk gate veto")
+        return self.forward(ctx)
+
+
+class _AdapterHandler(Handler[_SignalCtx]):
+    def __init__(self, adapters: Dict[str, "SignalAdapter"], dlq_stream: str) -> None:
+        super().__init__()
+        self._adapters = adapters
+
+    def handle(self, ctx: _SignalCtx) -> HandlerResult:
+        adapter = self._adapters.get(ctx.signal.mode)
+        if adapter is None:
+            ctx.bus.to_dlq(ctx.dlq_stream, ctx.raw_data,
+                           reason=f"unknown mode '{ctx.signal.mode}'")
+            ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
+            return HandlerResult.stop(f"unknown mode '{ctx.signal.mode}'")
+        ctx.adapter = adapter
+        return self.forward(ctx)
+
+
+class _ExecuteHandler(Handler[_SignalCtx]):
+    def __init__(
+        self,
+        idempotency_ttl: int,
+        record_open_fn: Optional[Callable[[], None]],
+    ) -> None:
+        super().__init__()
+        self._ttl = idempotency_ttl
+        self._record_open = record_open_fn
+
+    def handle(self, ctx: _SignalCtx) -> HandlerResult:
+        sig = ctx.signal
+        try:
+            ctx.adapter.execute(sig)
+        except Exception as exc:
+            logger.error(
+                "adapter failed for signal %s (will retry): %s", sig.signal_id, exc
+            )
+            return HandlerResult.stop(f"adapter error: {exc}")
+
+        if self._record_open is not None:
+            try:
+                self._record_open()
+            except Exception as exc:
+                logger.error("failed to record open for signal %s: %s", sig.signal_id, exc)
+
+        idem_key = f"idem:{sig.strategy_id}:{sig.timestamp}"
+        ctx.bus.mark_processed(idem_key, self._ttl)
+        ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
+        logger.debug("signal %s executed and acked", sig.signal_id)
+        return HandlerResult.proceed()
+
+
 class SignalConsumer:
     """Execution-side consumer group worker."""
 
@@ -95,6 +221,7 @@ class SignalConsumer:
         self.risk_gate = risk_gate
         self.record_open_fn = record_open_fn
         self._running = False
+        self._pipeline = self._build_pipeline()
 
     def setup(self) -> None:
         self.bus.ensure_group(self.stream, self.group)
@@ -128,91 +255,35 @@ class SignalConsumer:
     def stop(self) -> None:
         self._running = False
 
-    # ── per-message handling ──────────────────────────────────────────────────
+    # ── Pipeline construction ─────────────────────────────────────────────────
+
+    def _build_pipeline(self) -> Chain[_SignalCtx]:
+        """Build the handler chain. Called once at construction time.
+
+        To add a new processing step, write a new :class:`Handler` subclass
+        and insert it at the appropriate position here.
+        """
+        return Chain(
+            _PoisonPillHandler(self.max_deliveries),
+            _ParseHandler(),
+            _DuplicateHandler(),
+            _RiskGateHandler(self.risk_gate),
+            _AdapterHandler(self.adapters, self.dlq_stream),
+            _ExecuteHandler(self.idempotency_ttl, self.record_open_fn),
+        )
+
+    # ── Per-message dispatch ──────────────────────────────────────────────────
+
     def _handle(self, msg_id: str, data: dict) -> None:
-        if self._route_poison_pill(msg_id, data):
-            return
-
-        signal = self._parse_signal(msg_id, data)
-        if signal is None:
-            return
-
-        if self._is_duplicate(signal, msg_id):
-            return
-
-        if self._is_blocked_by_risk_gate(signal, msg_id):
-            return
-
-        adapter = self._resolve_adapter(signal, msg_id, data)
-        if adapter is None:
-            return
-
-        self._execute_and_ack(adapter, signal, msg_id)
-
-    def _route_poison_pill(self, msg_id: str, data: dict) -> bool:
-        """Poison-pill guard: stop re-delivering a message that keeps failing."""
-        if self.bus.delivery_count(self.stream, self.group, msg_id) > self.max_deliveries:
-            self.bus.to_dlq(self.dlq_stream, data, reason=f"max_deliveries>{self.max_deliveries}")
-            self.bus.ack(self.stream, self.group, msg_id)
-            logger.error("signal %s exceeded delivery limit -> DLQ", msg_id)
-            return True
-        return False
-
-    def _parse_signal(self, msg_id: str, data: dict) -> Optional[Signal]:
-        """Safely deserialize the stream payload into a Signal."""
-        try:
-            return Signal.from_payload(data)
-        except Exception as e:  # malformed payload is a poison pill
-            self.bus.to_dlq(self.dlq_stream, data, reason=f"malformed: {e}")
-            self.bus.ack(self.stream, self.group, msg_id)
-            return None
-
-    def _is_duplicate(self, signal: Signal, msg_id: str) -> bool:
-        """Idempotency: skip a signal that already COMPLETED (marker set on success).
-        The marker is intentionally not a pre-claim, so a failed attempt retries."""
-        idem_key = f"idem:{signal.strategy_id}:{signal.timestamp}"
-        if self.bus.is_processed(idem_key):
-            logger.info("duplicate signal %s suppressed (already executed)", signal.signal_id)
-            self.bus.ack(self.stream, self.group, msg_id)
-            return True
-        return False
-
-    def _is_blocked_by_risk_gate(self, signal: Signal, msg_id: str) -> bool:
-        """Risk gate runs BEFORE the adapter; a veto is terminal (acked, not retried)."""
-        if self.risk_gate is not None and not self.risk_gate(signal):
-            logger.warning("risk gate vetoed signal %s (%s %s)", signal.signal_id, signal.side, signal.symbol)
-            self.bus.ack(self.stream, self.group, msg_id)
-            return True
-        return False
-
-    def _resolve_adapter(self, signal: Signal, msg_id: str, data: dict) -> Optional[SignalAdapter]:
-        """Look up the mode-specific adapter; route to DLQ if unknown."""
-        adapter = self.adapters.get(signal.mode)
-        if adapter is None:
-            self.bus.to_dlq(self.dlq_stream, data, reason=f"unknown mode '{signal.mode}'")
-            self.bus.ack(self.stream, self.group, msg_id)
-        return adapter
-
-    def _execute_and_ack(self, adapter: SignalAdapter, signal: Signal, msg_id: str) -> None:
-        """Execute. On failure we DO NOT ack -> message stays in the PEL and is
-        retried on the next pass, eventually DLQ'd by the poison-pill guard."""
-        try:
-            adapter.execute(signal)
-        except Exception as e:
-            logger.error("adapter failed for signal %s (will retry): %s", signal.signal_id, e)
-            return
-        
-        # Success! Record the open
-        if self.record_open_fn is not None:
-            try:
-                self.record_open_fn()
-            except Exception as e:
-                logger.error("failed to record open for signal %s: %s", signal.signal_id, e)
-
-        idem_key = f"idem:{signal.strategy_id}:{signal.timestamp}"
-        self.bus.mark_processed(idem_key, self.idempotency_ttl)
-        self.bus.ack(self.stream, self.group, msg_id)
-        logger.debug("signal %s executed and acked", signal.signal_id)
+        ctx = _SignalCtx(
+            msg_id=msg_id,
+            raw_data=data,
+            stream=self.stream,
+            group=self.group,
+            bus=self.bus,
+            dlq_stream=self.dlq_stream,
+        )
+        self._pipeline.run(ctx)
 
 
 class WalletSignalAdapter:
