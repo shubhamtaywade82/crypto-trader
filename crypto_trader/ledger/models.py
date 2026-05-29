@@ -176,10 +176,17 @@ class Position:
     # ── Live formulas ────────────────────────────────────────
 
     def refresh(self, mark: Decimal) -> None:
-        """Recompute all mark-price-dependent fields in place."""
+        """Recompute all mark-price-dependent fields in place.
+
+        initial_margin is entry-price-based (fixed at open) and is NOT
+        overwritten here.  Only notional uses the current mark price.
+        PnL% = unrealized_pnl / entry_initial_margin × 100.
+        """
         self.mark_price = mark
-        self.notional = self.qty * mark
-        self.initial_margin = self.notional / _D(self.leverage)
+        self.notional = self.qty * mark      # mark-based for risk sizing
+        # Preserve entry-based initial_margin; compute it once if missing
+        if self.initial_margin is None or self.initial_margin <= _ZERO:
+            self.initial_margin = (self.qty * self.entry_price_avg) / _D(self.leverage)
         if self.side == "LONG":
             self.unrealized_pnl = (mark - self.entry_price_avg) * self.qty
         else:

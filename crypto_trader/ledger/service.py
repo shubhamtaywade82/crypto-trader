@@ -492,8 +492,13 @@ class LedgerService:
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def verify_balance_integrity(self, currency: str) -> bool:
-        """Recompute balance from entries and compare to stored value."""
+    def verify_balance_integrity(self, currency: str) -> tuple:
+        """
+        Recompute balance from entries and compare to stored value.
+
+        Returns (ok: bool, diff: Decimal) where diff = computed - stored.
+        diff == 0 means the ledger is self-consistent.
+        """
         ph = "%s" if self.db._backend == "postgres" else "?"
         acct = self.get_account(currency)
         with self.db.cursor() as cur:
@@ -507,13 +512,14 @@ class LedgerService:
             for direction, amount in cur.fetchall():
                 amt = _D(str(amount))
                 computed += amt if direction == "credit" else -amt
-        match = computed == acct.ledger_balance
+        diff = computed - acct.ledger_balance
+        match = diff == _ZERO
         if not match:
             logger.error(
-                "[LEDGER] Integrity violation for %s: stored=%s computed=%s",
-                currency, acct.ledger_balance, computed,
+                "[LEDGER] Integrity violation for %s: stored=%s computed=%s diff=%s",
+                currency, acct.ledger_balance, computed, diff,
             )
-        return match
+        return (match, diff)
 
     # ── FX rate persistence ───────────────────────────────────
 
