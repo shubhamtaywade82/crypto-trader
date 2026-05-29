@@ -145,7 +145,7 @@ class WebSocketTradingEngine:
                 initial_balance=initial_balance,
                 leverage=leverage,
             )
-        
+
         if cfg:
             self.risk_manager = RiskManager(
                 max_daily_trades=cfg.max_daily_trades,
@@ -168,13 +168,13 @@ class WebSocketTradingEngine:
         self.margin_engine = MarginEngine()
         self.leverage_engine = LeverageEngine()
         self.mr_state = MRStateManager(self.symbol)
-        
+
         self.reconciler = ExchangeStateReconciler(
             execution_engine=self.wallet.execution_engine,
             wallet=self.wallet,
             risk_manager=self.risk_manager
         )
-        
+
         if self.wallet.get_open_position(self.symbol):
             self.mr_state.reconcile_on_startup(self.wallet.get_open_position(self.symbol))
 
@@ -313,7 +313,7 @@ class WebSocketTradingEngine:
                     logger.warning("[KILL] flattened %s on remote command", self.symbol)
             except Exception as e:
                 logger.error("remote KILL flatten failed for %s: %s", self.symbol, e)
-        
+
         elif event.command == "RESUME_ALL" or (event.command == "RESUME" and event.params.get("symbol") == self.symbol):
             self._halted = False
             logger.info("[RESUMED] %s received RESUME command.", self.symbol)
@@ -408,15 +408,15 @@ class WebSocketTradingEngine:
         iteration = 0
         last_signal_time = 0
         last_recon_time = 0
-        
+
         try:
             while True:
                 now = time.time()
-                
+
                 # 1s Task: G3: supervise the WS threads
                 if not self._supervise_threads():
                     break
-                
+
                 # 1s Task: Authoritative health check (margin ratio guard)
                 self._check_authoritative_health()
 
@@ -429,14 +429,14 @@ class WebSocketTradingEngine:
                 # signal_interval Task: Signal generation tick
                 if now - last_signal_time >= signal_interval_seconds:
                     self._signal_tick()
-                    
+
                     # Delta-neutral funding-arb tick
                     if self.funding_arb is not None:
                         try:
                             self.funding_arb.on_signal_tick()
                         except Exception as e:
                             logger.error("[ARB] funding-arb tick error: %s", e)
-                    
+
                     last_signal_time = now
                     iteration += 1
                     if max_iterations and iteration >= max_iterations:
@@ -1489,9 +1489,16 @@ class WebSocketTradingEngine:
         if not margin_ok:
             logger.warning(f"[ENTRY BLOCKED] Margin Utilization: {margin_msg}")
             return
-            
-        leverage_val = self.cfg.max_leverage if self.cfg else 2
-        liq_price = entry_price * (1 - 1/leverage_val) if is_long else entry_price * (1 + 1/leverage_val)
+
+        leverage_val = self.cfg.leverage if self.cfg else 2
+        # Wallet uses mark-based margin: liq = entry / (1 ± 1/lev ∓ mmr)
+        # This matches wallet._is_liquidation_required() so the entry gate
+        # and the live liquidation check agree.
+        _mmr = float(getattr(self.wallet, "maintenance_margin_ratio", 0.005))
+        _inv_lev = 1.0 / max(leverage_val, 1)
+        liq_price = (entry_price / (1 + _inv_lev - _mmr)
+                     if is_long else
+                     entry_price / (1 - _inv_lev + _mmr))
         liq_ok, liq_msg = self.margin_engine.check_liquidation_distance(
             entry_price=entry_price,
             stop_loss_price=setup["sl_price"],
@@ -1599,7 +1606,7 @@ class WebSocketTradingEngine:
         if pos:
             self.risk_manager.record_open()
             self.adaptive_threshold.record_trade()
-            
+
             if setup.get("strategy") == "mean_reversion":
                 self.mr_state.record_entry(
                     side=setup["side"].value,

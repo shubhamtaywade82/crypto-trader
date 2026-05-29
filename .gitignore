@@ -12,6 +12,8 @@ ui/.env
 wallet_*.json
 wallet_*.db
 wallet_events_*.jsonl
+ledger_dev.db
+*.db
 
 # General
 .antigravitycli/**
