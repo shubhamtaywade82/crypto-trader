@@ -1,7 +1,7 @@
 """crypto_trader.ai.providers.ollama_local — Adapter for local qwen3.5:4b chat endpoint."""
 
 import requests
-from typing import Optional
+from typing import Optional, Union, Dict, Any
 
 from crypto_trader.ai.providers.base import LLMProvider
 
@@ -12,6 +12,7 @@ class OllamaLocalProvider:
         host: str = "http://localhost:11434",
         model: str = "qwen3.5:4b",
         num_predict: int = 1536,
+        json_schema: Optional[Dict[str, Any]] = None,
     ):
         self.host = host.rstrip("/")
         self.model = model
@@ -20,6 +21,12 @@ class OllamaLocalProvider:
         # The LLMDecision schema (entry_zone + targets list + invalidation prose
         # + warnings + reason_codes) needs ~1k+ tokens of headroom.
         self.num_predict = num_predict
+        # Ollama `format` accepts a full JSON schema object, not just "json".
+        # A schema grammar-constrains the output to the exact decision shape,
+        # so the model can't emit prose/extra fields and the JSON closes cleanly
+        # — far more robust than freeform "json". Falls back to "json" if no
+        # schema is supplied.
+        self.response_format: Union[str, Dict[str, Any]] = json_schema or "json"
         self.session = requests.Session()
 
     def health(self) -> bool:
@@ -36,7 +43,7 @@ class OllamaLocalProvider:
                 {"role": "user", "content": user_prompt},
             ],
             "stream": False,
-            "format": "json",
+            "format": self.response_format,
             "think": False,  # disable thinking tokens — 3-5x faster for qwen3.x models
             "options": {"temperature": 0.2, "num_predict": self.num_predict},
         }

@@ -178,6 +178,13 @@ class WebSocketTradingEngine:
 
         if self.wallet.get_open_position(self.symbol):
             self.mr_state.reconcile_on_startup(self.wallet.get_open_position(self.symbol))
+            # PRD §18 / SRD §5.3: on restart with an open position, immediately
+            # reconcile against the venue and recreate a missing stop-loss before
+            # resuming — don't wait for the 60s periodic reconcile tick.
+            try:
+                self.reconciler.reconcile_symbol(self.symbol)
+            except Exception as e:
+                logger.error("[ENGINE] Startup reconciliation failed for %s: %s", self.symbol, e)
 
         # Strategy
         self.regime_analyzer = MarketRegimeAnalyzer()
