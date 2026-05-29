@@ -313,6 +313,21 @@ class WalletStore:
             else:
                 return conn.execute(sql).fetchone()
 
+    def iter_snapshots(self) -> List[Tuple]:
+        """All retained snapshots oldest-first (ts, wallet_balance,
+        realized_pnl_total, state_json). Note: snapshots are rotated, so this is
+        a short tail — for a full equity curve prefer deriving from closed-trade
+        outcomes (see analytics.metrics.equity_curve_from_records)."""
+        tbl = self._t("snapshots")
+        sql = f"SELECT ts, wallet_balance, realized_pnl_total, state_json FROM {tbl} ORDER BY ts ASC"
+        with self._conn() as conn:
+            if self._use_postgres:
+                cur = conn.cursor()
+                cur.execute(sql)
+                return cur.fetchall()
+            else:
+                return conn.execute(sql).fetchall()
+
     def save_snapshot(self, ts: int, wallet_balance: str, realized_pnl_total: str, state_json: str,
                       max_snapshots: int = 10):
         tbl = self._t("snapshots")

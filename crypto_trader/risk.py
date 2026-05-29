@@ -338,8 +338,16 @@ class RiskManager:
         self._recent_open_times.append(time.time())  # G2 velocity tracking
         self._save_state()
 
-    def record_close(self, net_pnl: float):
-        """Record trade outcome. net_pnl is the FULL trade PnL (including partials)."""
+    def record_close(self, net_pnl: float, current_balance: Optional[float] = None):
+        """Record trade outcome. net_pnl is the FULL trade PnL (including partials).
+
+        When ``current_balance`` (post-close wallet balance) is supplied, also
+        enforce the daily-loss limit as a hard HALT. The pre-trade gate
+        (:class:`_DailyDrawdownSpec`) only blocks the *next* entry; a fast
+        intraday bleed across already-open positions could blow past the limit
+        before the next entry attempt. Tripping the kill switch here closes that
+        gap.
+        """
         self.daily_pnl += float(net_pnl)
         if net_pnl > 0:
             self.consecutive_losses = 0
@@ -349,6 +357,20 @@ class RiskManager:
             self.last_loss_time = time.time()
             logger.warning(f"[RISK] Loss recorded. Consecutive losses: {self.consecutive_losses}/{self.max_consecutive}. Daily PnL: {self.daily_pnl:.2f}")
         self._save_state()
+
+        # Daily-loss HALT (post-close). Reconstruct the day's opening balance the
+        # same way the live engine does: initial = current - daily_pnl
+        # (daily_pnl already includes this close). See engine_ws initial_daily_balance.
+        if current_balance is not None:
+            try:
+                initial_daily = float(current_balance) - float(self.daily_pnl)
+                if self._is_daily_drawdown_limit_hit(initial_daily):
+                    self.trigger_kill_switch(
+                        f"Daily loss limit hit: {self.daily_pnl:.2f} "
+                        f"({self.max_daily_drawdown_pct * 100:.1f}% of {initial_daily:.2f})"
+                    )
+            except (TypeError, ValueError):
+                pass
 
     def update_peak_balance(self, current_balance: float):
         cur = self._to_float(current_balance)
