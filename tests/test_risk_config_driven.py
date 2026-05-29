@@ -269,3 +269,73 @@ class TestLeverageDefaults:
         from crypto_trader.margin_engine import LeverageEngine
         le = LeverageEngine()
         assert le.hard_max_leverage == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Profile precedence: named profile values must survive into from_env()
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProfilePrecedence:
+    """Req 5 — named profiles keep their explicit risk appetites.
+
+    Precedence:
+      1. Explicit env var  →  wins when set.
+      2. Named TRADING_PROFILE active, no env override  →  profile value.
+      3. No profile, no env override  →  spec defaults (0.005 / 3).
+    """
+
+    def test_conservative_profile_preserves_risk_per_trade(self, monkeypatch):
+        """TRADING_PROFILE=conservative + no RISK_PER_TRADE_PCT → 0.01 (profile value)."""
+        monkeypatch.setenv("TRADING_PROFILE", "conservative")
+        monkeypatch.delenv("RISK_PER_TRADE_PCT", raising=False)
+        cfg = TradingConfig.from_env()
+        assert cfg.risk_per_trade_pct == pytest.approx(0.01)
+
+    def test_conservative_profile_preserves_max_consecutive_losses(self, monkeypatch):
+        """TRADING_PROFILE=conservative + no MAX_CONSECUTIVE_LOSSES → 1 (profile value)."""
+        monkeypatch.setenv("TRADING_PROFILE", "conservative")
+        monkeypatch.delenv("MAX_CONSECUTIVE_LOSSES", raising=False)
+        cfg = TradingConfig.from_env()
+        assert cfg.max_consecutive_losses == 1
+
+    def test_aggressive_profile_preserves_risk_per_trade(self, monkeypatch):
+        """TRADING_PROFILE=aggressive + no RISK_PER_TRADE_PCT → 0.04 (profile value)."""
+        monkeypatch.setenv("TRADING_PROFILE", "aggressive")
+        monkeypatch.delenv("RISK_PER_TRADE_PCT", raising=False)
+        cfg = TradingConfig.from_env()
+        assert cfg.risk_per_trade_pct == pytest.approx(0.04)
+
+    def test_aggressive_profile_preserves_max_consecutive_losses(self, monkeypatch):
+        """TRADING_PROFILE=aggressive + no MAX_CONSECUTIVE_LOSSES → 3 (profile value)."""
+        monkeypatch.setenv("TRADING_PROFILE", "aggressive")
+        monkeypatch.delenv("MAX_CONSECUTIVE_LOSSES", raising=False)
+        cfg = TradingConfig.from_env()
+        assert cfg.max_consecutive_losses == 3
+
+    def test_no_profile_no_env_uses_spec_default_risk(self, monkeypatch):
+        """No TRADING_PROFILE + no RISK_PER_TRADE_PCT → spec default 0.005."""
+        monkeypatch.delenv("TRADING_PROFILE", raising=False)
+        monkeypatch.delenv("RISK_PER_TRADE_PCT", raising=False)
+        cfg = TradingConfig.from_env()
+        assert cfg.risk_per_trade_pct == pytest.approx(0.005)
+
+    def test_no_profile_no_env_uses_spec_default_consecutive(self, monkeypatch):
+        """No TRADING_PROFILE + no MAX_CONSECUTIVE_LOSSES → spec default 3."""
+        monkeypatch.delenv("TRADING_PROFILE", raising=False)
+        monkeypatch.delenv("MAX_CONSECUTIVE_LOSSES", raising=False)
+        cfg = TradingConfig.from_env()
+        assert cfg.max_consecutive_losses == 3
+
+    def test_env_var_wins_over_conservative_profile_risk(self, monkeypatch):
+        """TRADING_PROFILE=conservative + RISK_PER_TRADE_PCT=0.005 → env wins (0.005)."""
+        monkeypatch.setenv("TRADING_PROFILE", "conservative")
+        monkeypatch.setenv("RISK_PER_TRADE_PCT", "0.005")
+        cfg = TradingConfig.from_env()
+        assert cfg.risk_per_trade_pct == pytest.approx(0.005)
+
+    def test_env_var_wins_over_conservative_profile_consecutive(self, monkeypatch):
+        """TRADING_PROFILE=conservative + MAX_CONSECUTIVE_LOSSES=5 → env wins (5)."""
+        monkeypatch.setenv("TRADING_PROFILE", "conservative")
+        monkeypatch.setenv("MAX_CONSECUTIVE_LOSSES", "5")
+        cfg = TradingConfig.from_env()
+        assert cfg.max_consecutive_losses == 5
