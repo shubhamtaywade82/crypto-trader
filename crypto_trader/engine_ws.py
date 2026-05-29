@@ -150,8 +150,12 @@ class WebSocketTradingEngine:
         if cfg:
             self.risk_manager = RiskManager(
                 max_daily_trades=cfg.max_daily_trades,
+                max_consecutive_losses=cfg.max_consecutive_losses,
+                max_drawdown_pct=cfg.max_drawdown_pct,
+                max_daily_drawdown_pct=cfg.max_daily_drawdown_pct,
+                cooldown_after_loss_minutes=cfg.cooldown_after_loss_minutes,
                 max_orders_per_minute=cfg.max_orders_per_minute,
-                max_margin_ratio=cfg.max_margin_ratio
+                max_margin_ratio=cfg.max_margin_ratio,
             )
         else:
             self.risk_manager = RiskManager()

@@ -141,7 +141,7 @@ class TradingConfig:
     data_source: DataSource = DataSource.AUTO
 
     # Risk / sizing guardrails at launch
-    max_leverage: int = 2
+    max_leverage: int = 3
     initial_balance: float = 1000.0
 
     # CoinDCX credentials (never logged / committed)
@@ -262,10 +262,12 @@ class TradingConfig:
     adaptive_min_threshold: float = 0.60
     adaptive_target_trades_per_day: float = 2.0   # decay starts after 24/target idle hours
     adaptive_decay_per_hour: float = 0.01         # threshold drop rate per idle hour
-    risk_per_trade_pct: float = 0.02
+    risk_per_trade_pct: float = 0.005
     funding_extreme_threshold: float = 0.0005
-    max_consecutive_losses: int = 2
+    max_consecutive_losses: int = 3
     max_drawdown_pct: float = 0.20
+    max_daily_drawdown_pct: float = 0.03
+    cooldown_after_loss_minutes: int = 1440
     allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
 
     # ── Strategy mode ──
@@ -397,10 +399,12 @@ class TradingConfig:
             adaptive_min_threshold=_get_float("ADAPTIVE_MIN_THRESHOLD", profile.adaptive_min_threshold),
             adaptive_target_trades_per_day=_get_float("ADAPTIVE_TARGET_TRADES_PER_DAY", profile.adaptive_target_trades_per_day),
             adaptive_decay_per_hour=_get_float("ADAPTIVE_DECAY_PER_HOUR", profile.adaptive_decay_per_hour),
-            risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", profile.risk_per_trade_pct),
+            risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", 0.005),
             funding_extreme_threshold=_get_float("FUNDING_EXTREME_THRESHOLD", profile.funding_extreme_threshold),
-            max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", profile.max_consecutive_losses),
+            max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", 3),
             max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", profile.max_drawdown_pct),
+            max_daily_drawdown_pct=_get_float("DAILY_MAX_LOSS_PCT", 0.03),
+            cooldown_after_loss_minutes=_get_int("LOSS_COOLDOWN_MINUTES", 1440),
             allowed_regimes=profile.allowed_regimes,
             strategy_mode=_get("STRATEGY_MODE", "legacy").lower(),
             st2_atr_period=_get_int("ST2_ATR_PERIOD", 10),

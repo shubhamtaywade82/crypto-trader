@@ -48,9 +48,13 @@ class LiveTradingSystem:
         self.cfg = cfg or load_config()
         self.bus = bus or global_bus
         self.risk = RiskManager(
-            max_orders_per_minute=self.cfg.max_orders_per_minute,
             max_daily_trades=self.cfg.max_daily_trades,
-            max_margin_ratio=self.cfg.max_margin_ratio
+            max_consecutive_losses=self.cfg.max_consecutive_losses,
+            max_drawdown_pct=self.cfg.max_drawdown_pct,
+            max_daily_drawdown_pct=self.cfg.max_daily_drawdown_pct,
+            cooldown_after_loss_minutes=self.cfg.cooldown_after_loss_minutes,
+            max_orders_per_minute=self.cfg.max_orders_per_minute,
+            max_margin_ratio=self.cfg.max_margin_ratio,
         )
         self.event_store = None
         self.execution_engine = None

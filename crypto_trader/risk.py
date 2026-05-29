@@ -174,10 +174,10 @@ class RiskManager:
     def __init__(
         self,
         max_daily_trades: int = 2,
-        max_consecutive_losses: int = 2,
+        max_consecutive_losses: int = 3,
         max_drawdown_pct: float = 0.20,
-        max_daily_drawdown_pct: float = 0.05,
-        cooldown_after_loss_minutes: int = 30,
+        max_daily_drawdown_pct: float = 0.03,
+        cooldown_after_loss_minutes: int = 1440,
         max_correlated_positions: int = 2,
         max_orders_per_minute: int = 6,
         max_margin_ratio: float = 0.80,

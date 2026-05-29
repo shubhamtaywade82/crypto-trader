@@ -148,6 +148,8 @@ def main():
         max_daily_trades=_early_cfg.max_daily_trades,
         max_consecutive_losses=_early_cfg.max_consecutive_losses,
         max_drawdown_pct=_early_cfg.max_drawdown_pct,
+        max_daily_drawdown_pct=_early_cfg.max_daily_drawdown_pct,
+        cooldown_after_loss_minutes=_early_cfg.cooldown_after_loss_minutes,
         max_orders_per_minute=_early_cfg.max_orders_per_minute,
         max_margin_ratio=_early_cfg.max_margin_ratio,
     )
