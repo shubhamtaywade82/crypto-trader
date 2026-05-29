@@ -240,6 +240,10 @@ def main():
         try:
             live_bal = execution_engine.sync_balance()
             if live_bal is not None:
+                mc = cfg.coindcx_margin_currency.upper()
+                if mc != "USDT":
+                    conv = float(execution_engine.get_usdt_conversion()) or 1.0
+                    live_bal = live_bal / conv
                 global_wallet.wallet_balance = global_wallet._to_decimal(live_bal)
                 total_balance = live_bal
                 # Sync peak balance in RiskManager to prevent false drawdown trip (1000 -> 0)

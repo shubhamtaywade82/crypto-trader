@@ -41,6 +41,10 @@ class ExchangeStateReconciler:
                 try:
                     live_bal = self.execution_engine.sync_balance()
                     if live_bal is not None:
+                        mc = self.execution_engine.margin_currency.upper()
+                        if mc != "USDT":
+                            conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+                            live_bal = live_bal / conv
                         old_bal = float(self.wallet.wallet_balance)
                         new_bal = float(live_bal)
                         if abs(old_bal - new_bal) > 0.01:
