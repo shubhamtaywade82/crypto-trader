@@ -236,6 +236,17 @@ def main():
         global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
+        try:
+            live_bal = execution_engine.sync_balance()
+            if live_bal is not None:
+                global_wallet.wallet_balance = global_wallet._to_decimal(live_bal)
+                total_balance = live_bal
+                # Sync peak balance in RiskManager to prevent false drawdown trip (1000 -> 0)
+                global_risk.peak_balance = live_bal
+                global_risk._save_state()
+                logger.info("[LIVE BALANCE SYNC] Synchronized wallet balance with exchange: %.4f USDT", live_bal)
+        except Exception as e:
+            logger.error("[LIVE BALANCE SYNC] Failed to sync wallet balance with exchange: %s", e)
 
     # Run pre-flight checks and state reconciliation in live mode
     if live_enabled and execution_engine is not None:

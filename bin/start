@@ -21,6 +21,11 @@ if [ "$MODE" = "live" ]; then
   echo "    Gate must be open: LIVE_TRADING_ENABLED=true, LIVE_TRADING_ACK set, no HALT file."
   read -r -p "    Type 'live' to continue, anything else to abort: " confirm
   [ "$confirm" = "live" ] || { echo "Aborted."; exit 1; }
+  # Automatically clear safety HALT file on explicit operator confirmation
+  if [ -f "$HOME/.crypto_trader/HALT" ]; then
+    echo "ℹ️  Clearing active HALT file on operator confirmation..."
+    rm -f "$HOME/.crypto_trader/HALT"
+  fi
 fi
 
 echo "--- Infrastructure (Postgres, Redis) ---"
