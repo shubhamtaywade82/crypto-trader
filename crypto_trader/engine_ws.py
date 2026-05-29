@@ -1667,7 +1667,7 @@ class WebSocketTradingEngine:
             self.journal.log_open(
                 trade_id=trade_id,
                 symbol=self.symbol,
-                regime=regime.value,
+                regime=regime.value if regime else "",
                 regime_score=regime_score,
                 setup=setup,
                 technical_score=tech_score,
@@ -1739,7 +1739,7 @@ class WebSocketTradingEngine:
                     take_profit=tp,
                     margin=pos.margin_used,
                     notional=pos.notional,
-                    regime=regime.value,
+                    regime=regime.value if regime else "",
                     tech_score=tech_score,
                     llm_decision="ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
                     funding=funding_rate,
