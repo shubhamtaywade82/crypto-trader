@@ -56,7 +56,7 @@ from pathlib import Path
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
-    parser.add_argument("--leverage", type=int, default=5, help="Leverage multiplier")
+    parser.add_argument("--leverage", type=int, default=int(os.getenv("LEVERAGE", os.getenv("MAX_LEVERAGE", 5))), help="Leverage multiplier")
     parser.add_argument("--no-llm", action="store_true",
                         default=os.getenv("USE_LLM", "true").lower() in ("false", "0", "no"),
                         help="Disable LLM advisor (also: USE_LLM=false in .env)")

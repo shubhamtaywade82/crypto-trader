@@ -1,4 +1,4 @@
-# ETH Futures Mean-Reversion Trading Bot
+# Multi-Symbol Futures Mean-Reversion Trading Bot
 
 ## Complete PRD + SRD
 
@@ -108,7 +108,7 @@ Binance USDⓈ-M Futures
 
 ## Instrument
 
-ETH/USDT perpetual futures
+{{WATCHLIST_SYMBOL}} perpetual futures
 
 ## Timeframe
 
@@ -857,7 +857,7 @@ Minimum:
 ```text
 [ENTRY OPENED]
 
-Symbol: ETH/USDT
+Symbol: {{WATCHLIST_SYMBOL}}
 Side: LONG
 Entry: 2512.5
 Qty: 0.43
@@ -873,7 +873,7 @@ Leverage: 3x
 
 | parameter      | default  |
 | -------------- | -------- |
-| symbol         | ETH/USDT |
+| symbol         | {{WATCHLIST_SYMBOL}} |
 | timeframe      | 15m      |
 | sma_period     | 20       |
 | entry_band     | 1.5%     |

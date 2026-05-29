@@ -399,40 +399,50 @@ class WebSocketTradingEngine:
 
     def run_loop(self, signal_interval_seconds: int = 300, max_iterations: int = None):
         """
-        Main loop:
-            - Every 5 min (default): REST fetch → signal generation → entry evaluation
-            - Every 1 sec (WebSocket): Position monitoring → SL/TP/Trail execution
+        Unified Engine Loop:
+            - 1s: Thread supervision & Authoritative Health (G3, G4)
+            - 60s: Exchange State Reconciliation (G5, G9)
+            - signal_interval: Signal evaluation & Playbook execution
         """
         self.start()
         iteration = 0
+        last_signal_time = 0
+        last_recon_time = 0
+        
         try:
             while True:
-                # G3: supervise the WS threads — never trade on a dead/stale feed.
+                now = time.time()
+                
+                # 1s Task: G3: supervise the WS threads
                 if not self._supervise_threads():
                     break
                 
-                # Authoritative health check (margin ratio guard)
+                # 1s Task: Authoritative health check (margin ratio guard)
                 self._check_authoritative_health()
 
-                # Periodic state reconciliation (Exchange State Consistency Layer)
-                if self.reconciler:
-                    self.reconciler.reconcile_symbol(self.symbol)
+                # 60s Task: Periodic state reconciliation
+                if now - last_recon_time >= 60:
+                    if self.reconciler:
+                        self.reconciler.reconcile_symbol(self.symbol)
+                    last_recon_time = now
 
-                # Signal generation tick (REST-based)
-                self._signal_tick()
+                # signal_interval Task: Signal generation tick
+                if now - last_signal_time >= signal_interval_seconds:
+                    self._signal_tick()
+                    
+                    # Delta-neutral funding-arb tick
+                    if self.funding_arb is not None:
+                        try:
+                            self.funding_arb.on_signal_tick()
+                        except Exception as e:
+                            logger.error("[ARB] funding-arb tick error: %s", e)
+                    
+                    last_signal_time = now
+                    iteration += 1
+                    if max_iterations and iteration >= max_iterations:
+                        break
 
-                # Delta-neutral funding-arb tick (non-directional, orthogonal).
-                if self.funding_arb is not None:
-                    try:
-                        self.funding_arb.on_signal_tick()
-                    except Exception as e:
-                        logger.error("[ARB] funding-arb tick error: %s", e)
-
-                iteration += 1
-                if max_iterations and iteration >= max_iterations:
-                    break
-
-                time.sleep(signal_interval_seconds)
+                time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Engine stopped by user")
         finally:
@@ -1480,7 +1490,7 @@ class WebSocketTradingEngine:
             logger.warning(f"[ENTRY BLOCKED] Margin Utilization: {margin_msg}")
             return
             
-        leverage_val = self.cfg.leverage if self.cfg else 2
+        leverage_val = self.cfg.max_leverage if self.cfg else 2
         liq_price = entry_price * (1 - 1/leverage_val) if is_long else entry_price * (1 + 1/leverage_val)
         liq_ok, liq_msg = self.margin_engine.check_liquidation_distance(
             entry_price=entry_price,

@@ -334,7 +334,7 @@ class TradingConfig:
             mode=mode_enum,
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
-            max_leverage=_get_int("MAX_LEVERAGE", profile.max_leverage),
+            max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
             initial_balance=_get_float("INITIAL_BALANCE", 1000.0),
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),
@@ -458,6 +458,10 @@ class TradingConfig:
             )
         return errs
 
+
+    @property
+    def leverage(self) -> int:
+        return self.max_leverage
     def redacted(self) -> dict:
         """Safe-to-log view of the config (no secrets)."""
         def mask(v: str) -> str:
