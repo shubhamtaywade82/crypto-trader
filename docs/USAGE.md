@@ -88,6 +88,19 @@ symbols; the wallet keys positions by symbol. Signals route by `Signal.symbol`.
 - `Reconciler.reconcile(symbol)` compares wallet vs venue: detects ghost/missing positions and qty
   drift, re-places vanished protective SL orders, cancels orphans. Unresolved drift trips the
   RiskManager kill switch. Runs at boot (blocks live start on failure) and periodically.
+- `ExchangeStateReconciler.reconcile_symbol(symbol)` runs every loop tick in `engine_ws`, checking
+  for phantom positions, missing positions, orphaned stop/TP orders, and missing venue stop-losses.
+  Triggers the kill switch on critical desyncs.
+
+## Risk infrastructure
+
+| Component | Module | Purpose |
+|-----------|--------|---------|
+| `MarginEngine` | `risk.py` | Blocks entries when margin utilization exceeds safe threshold (80%) or SL is too close to liquidation price. |
+| `LeverageEngine` | `risk.py` | Validates notional exposure against leverage tier limits; scales down max leverage in high-vol regimes via ATR. |
+| `OrderStateMachine` | `wallet.py` | Deterministic order lifecycle enforcement (`NEW` → `PENDING` → `FILLED`). Terminal states are immutable. |
+| `ExchangeStateReconciler` | `reconciliation.py` | Continuous exchange state consistency — detects phantom positions, orphaned orders, missing stops. |
+| `MRStateManager` | `strategies/mr_state.py` | Per-symbol mean-reversion restart recovery with atomic disk persistence. |
 
 ## Manual E2E signal injection (testing)
 
@@ -114,10 +127,17 @@ Then `curl localhost:8088/positions?mode=paper` and `.../pnl?mode=paper`.
 - **Port 8088 in use** — a previous `api_service` is still running; kill it before `bin/dev`.
 - **UI shows nothing live** — `api_service` SSE reads the `events:broadcast` stream produced by
   `run_consumer`; make sure the consumer (not just the engine) is running.
+- **`[ENTRY BLOCKED] Margin Utilization`** — margin utilization exceeds the safe threshold (80%).
+  Reduce existing exposure or increase account balance.
+- **`[ENTRY BLOCKED] Liquidation Distance`** — stop-loss is too close to the estimated liquidation
+  price. Widen the stop or reduce leverage.
+- **`[STATE MACHINE] Invalid transition rejected`** — a late/out-of-order WebSocket event tried to
+  mutate an order in a terminal state. This is safely blocked; no action needed.
 
-## Verified components (2026-05-25, paper)
+## Verified components (2026-05-28, paper)
 
 Binance REST klines + WS LTP (mark/bid/ask), CoinDCX market data + signed auth (balance), signal
 bus → consumer → paper fill (slippage applied) → projection → API/UI, risk caps + kill switch,
-live triple-gate (blocks correctly), account sync against live CoinDCX, multi-symbol, full pytest
-suite (119 passed).
+live triple-gate (blocks correctly), account sync against live CoinDCX, multi-symbol, MarginEngine +
+LeverageEngine pre-execution gates, OrderStateMachine deterministic lifecycle, ExchangeStateReconciler
+continuous state consistency, MRStateManager restart recovery, full pytest suite.

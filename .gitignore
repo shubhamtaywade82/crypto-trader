@@ -12,12 +12,22 @@ ui/.env
 wallet_*.json
 wallet_*.db
 wallet_events_*.jsonl
+ledger_dev.db
+*.db
 
 # General
 .antigravitycli/**
 
 llm_cache/**
+
+# ── Environment files ──
+# Gitignored (contain real secrets / local overrides):
 .env
+.env.secrets
+# Tracked (safe templates with placeholder values — commit these):
+!.env.example
+!.env.secrets.example
+
 **/__pycache__/
 .pytest_cache/
 __pycache__/**
@@ -25,4 +35,3 @@ crypto_trader/__pycache__/**
 tests/__pycache__/**
 ./wallet_**.json
 tests/__pycache__/**
-.env.secrets

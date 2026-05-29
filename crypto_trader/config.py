@@ -32,6 +32,24 @@ class TradingProfile(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
+class StrategyMode(str, Enum):
+    """
+    Controls which entry/exit logic the engine uses.
+
+    LEGACY          — the original multi-playbook system (A, B, Ares, VolX, Sweep).
+    SUPERTREND2     — only the Supertrend2 adaptive-ATR strategy for both entries
+                      and exits.  All legacy playbooks and regime filters are
+                      bypassed; the Supertrend flip IS the signal.
+    MEAN_REVERSION  — SMA-band mean-reversion: enter when price deviates from
+                      SMA by ``mr_entry_band``, exit when it reverts to SMA.
+                      Works on any symbol in the WATCHLIST.  Funding-rate guard
+                      and all risk/daily limits still apply.
+    """
+    LEGACY = "legacy"
+    SUPERTREND2 = "supertrend2"
+    MEAN_REVERSION = "mean_reversion"
+
+
 @dataclass
 class _ProfileDefaults:
     final_score_threshold: float
@@ -250,6 +268,48 @@ class TradingConfig:
     max_drawdown_pct: float = 0.20
     allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
 
+    # ── Strategy mode ──
+    # "legacy"         = original multi-playbook system
+    # "supertrend2"    = Supertrend2 adaptive-ATR only
+    # "mean_reversion" = SMA-band mean-reversion for all WATCHLIST symbols
+    strategy_mode: str = "legacy"
+
+    # ── Supertrend2 settings (active only when strategy_mode = "supertrend2") ──
+    st2_atr_period: int = 10             # base ATR length (scaled by timeframe when adaptive)
+    st2_factor: float = 3.0             # Supertrend multiplier
+    st2_use_adaptive_atr: bool = True   # auto-scale ATR length to the chart timeframe
+    # Timeframes
+    # ST2_TIMEFRAME controls the primary signal candles (e.g. "15m", "1h", "4h").
+    # ST2_HTF_TIMEFRAME controls the higher-timeframe alignment filter
+    # (e.g. "4h" when primary is "1h", "1d" when primary is "4h").
+    # Any Binance kline interval is valid: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M
+    st2_timeframe: str = "1h"           # primary signal timeframe
+    st2_htf_timeframe: str = "4h"       # higher-timeframe filter (must be > st2_timeframe)
+    # Entry mode
+    st2_entry_mode: str = "flip"        # "flip" | "retracement"
+    st2_retracement_pct: float = 1.0    # retracement mode: max % distance from flip close
+    st2_flip_lookback: int = 5          # retracement mode: bars to look back for a flip
+    # Optional filters
+    st2_use_htf_filter: bool = True     # require HTF Supertrend to align with signal
+    st2_use_vol_filter: bool = False    # require RVOL >= st2_vol_multiplier
+    st2_vol_multiplier: float = 1.2
+    st2_use_adx_filter: bool = False    # require ADX >= st2_adx_threshold
+    st2_adx_threshold: int = 20
+    # Exit / risk
+    st2_tp1_pct: float = 1.0           # TP1 distance from entry (%)
+    st2_use_tp: bool = True            # False = exit only via Supertrend flip
+    st2_sl_mode: str = "supertrend"    # "supertrend" | "fixed_pct" | "atr"
+    st2_sl_pct: float = 1.5            # SL % for fixed_pct mode
+    st2_sl_atr_mult: float = 2.5       # ATR multiplier for atr mode
+    st2_max_hold_hours: int = 168      # safety time-stop (7 days default)
+
+    # ── Mean Reversion settings (active only when strategy_mode = "mean_reversion") ──
+    # SRD §5: 20-period SMA on last CLOSED candle, 15m timeframe (configurable).
+    mr_timeframe: str = "15m"         # kline interval for mean-reversion signals
+    mr_sma_period: int = 20           # SMA period (PRD default: 20)
+    mr_entry_band: float = 0.015      # 1.5% deviation from SMA to trigger entry
+    mr_stop_loss_pct: float = 0.008   # 0.8% hard stop from fill price
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -274,7 +334,7 @@ class TradingConfig:
             mode=mode_enum,
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
-            max_leverage=_get_int("MAX_LEVERAGE", profile.max_leverage),
+            max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
             initial_balance=_get_float("INITIAL_BALANCE", 1000.0),
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),
@@ -342,6 +402,30 @@ class TradingConfig:
             max_consecutive_losses=_get_int("MAX_CONSECUTIVE_LOSSES", profile.max_consecutive_losses),
             max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", profile.max_drawdown_pct),
             allowed_regimes=profile.allowed_regimes,
+            strategy_mode=_get("STRATEGY_MODE", "legacy").lower(),
+            st2_atr_period=_get_int("ST2_ATR_PERIOD", 10),
+            st2_factor=_get_float("ST2_FACTOR", 3.0),
+            st2_use_adaptive_atr=_get_bool("ST2_USE_ADAPTIVE_ATR", True),
+            st2_timeframe=_get("ST2_TIMEFRAME", "1h"),
+            st2_htf_timeframe=_get("ST2_HTF_TIMEFRAME", "4h"),
+            st2_entry_mode=_get("ST2_ENTRY_MODE", "flip").lower(),
+            st2_retracement_pct=_get_float("ST2_RETRACEMENT_PCT", 1.0),
+            st2_flip_lookback=_get_int("ST2_FLIP_LOOKBACK", 5),
+            st2_use_htf_filter=_get_bool("ST2_USE_HTF_FILTER", True),
+            st2_use_vol_filter=_get_bool("ST2_USE_VOL_FILTER", False),
+            st2_vol_multiplier=_get_float("ST2_VOL_MULTIPLIER", 1.2),
+            st2_use_adx_filter=_get_bool("ST2_USE_ADX_FILTER", False),
+            st2_adx_threshold=_get_int("ST2_ADX_THRESHOLD", 20),
+            st2_tp1_pct=_get_float("ST2_TP1_PCT", 1.0),
+            st2_use_tp=_get_bool("ST2_USE_TP", True),
+            st2_sl_mode=_get("ST2_SL_MODE", "supertrend").lower(),
+            st2_sl_pct=_get_float("ST2_SL_PCT", 1.5),
+            st2_sl_atr_mult=_get_float("ST2_SL_ATR_MULT", 2.5),
+            st2_max_hold_hours=_get_int("ST2_MAX_HOLD_HOURS", 168),
+            mr_timeframe=_get("MR_TIMEFRAME", "15m"),
+            mr_sma_period=_get_int("MR_SMA_PERIOD", 20),
+            mr_entry_band=_get_float("MR_ENTRY_BAND", 0.015),
+            mr_stop_loss_pct=_get_float("MR_STOP_LOSS_PCT", 0.008),
         )
 
     @property
@@ -374,6 +458,10 @@ class TradingConfig:
             )
         return errs
 
+
+    @property
+    def leverage(self) -> int:
+        return self.max_leverage
     def redacted(self) -> dict:
         """Safe-to-log view of the config (no secrets)."""
         def mask(v: str) -> str:

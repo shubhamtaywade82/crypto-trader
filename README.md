@@ -15,10 +15,16 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
                         │    (cloud: qwen3.5 / local fallback)
                         │
                         ▼
+                   [ Risk Gate ]
+                   MarginEngine · LeverageEngine · OrderStateMachine
+                        │
+                        ▼
                    [ Signal Bus ] ──▶ [ Redis Streams ]
                                            │
 [ SolidJS UI ] ◀── [ FastAPI Dashboard ] ◀── [ Execution Consumer ]
                     (bearer token auth)         (CoinDCX Execution)
+                                               │
+                                   [ ExchangeStateReconciler ]
                                                │
                                         [ Postgres ]
                                    (events · wallet · arb)
@@ -30,6 +36,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 - **Decoupled Pipeline:** Redis Streams provide at-least-once delivery, crash recovery (PEL), and worker idempotency.
 - **Event-Sourced Wallet:** Comprehensive position lifecycle tracking with 1% TDS accounting (F2), venue-resident stops (F1), and partial close support.
 - **Relational Read-Model:** Postgres Projections transform JSONB events into queryable tables for the UI and analytics.
+- **Risk Infrastructure:** MarginEngine (utilization + liquidation distance), LeverageEngine (dynamic tiers + ATR scaling), OrderStateMachine (deterministic lifecycle), and ExchangeStateReconciler (continuous exchange state consistency).
 - **AI Advisory Subsystem:** Structured `crypto_trader/ai/` module with cloud/local adaptive routing
   (cloud-first for swing, local for intraday), SHA-256 disk cache, Pydantic-validated output schema,
   hard safety gates, and JSONL telemetry. Backed by Ollama's qwen3.5 family.
@@ -42,6 +49,11 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 | :------------------- | :------------------------------------------------------- |
 | `crypto_trader/`     | Core Python package (Engines, Exchanges, Risk, Storage). |
 | `crypto_trader/ai/`  | AI advisory subsystem: router, providers (cloud/local), cache, telemetry, validators, prompts. |
+| `crypto_trader/risk.py` | RiskManager, MarginEngine, LeverageEngine — all pre-execution safety gates. |
+| `crypto_trader/wallet.py` | Event-sourced wallet with OrderStateMachine for deterministic order lifecycle. |
+| `crypto_trader/reconciliation.py` | Exchange State Consistency Layer — detects desyncs, phantom positions, orphan orders. |
+| `crypto_trader/strategies/` | Mean-Reversion strategy, MR state persistence, and playbook implementations. |
+| `crypto_trader/execution/` | Redis consumer, reconciler, signal bus, account sync. |
 | `crypto_trader/infra/` | Shared infrastructure: `event_routing.py` (wallet event sink factory). |
 | `crypto_trader/storage/` | Persistence adapters: Postgres event store, wallet store, projection. |
 | `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
@@ -142,6 +154,10 @@ Antigravity is built for capital preservation through multiple layers of defense
 - **G3 Thread Supervisor:** Halts the engine if WebSocket or Position Manager threads die.
 - **G4 Authoritative Margin Guard:** Instant kill-switch if CoinDCX `margin_ratio_cross` exceeds config limit (default 80%).
 - **G5 Strict Reconciliation:** Reconciles real exchange positions against event-sourced wallet; optional cancel-all-on-desync behavior.
+- **G6 Margin Engine:** Dynamically validates margin utilization and strictly blocks entries if the stop-loss is placed too close to the liquidation threshold.
+- **G7 Leverage Engine:** Enforces dynamic max-notional leverage tiers, actively scaling down exposure limits during high volatility (ATR-based).
+- **G8 Deterministic Order State Machine:** Strictly enforces order lifecycle transitions (`NEW` → `PENDING` → `FILLED`/`CANCELLED`), eliminating async race conditions and phantom positions.
+- **G9 Exchange State Consistency Layer:** Continuously syncs the bot's desired state with the actual exchange state. Identifies and safely cleans up orphaned orders or actively recreates missing protective stops.
 
 ### Hardened Features (F)
 

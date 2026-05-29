@@ -4,14 +4,15 @@ Production-grade Binance USD-M Futures trading system with LLM-enhanced risk man
 
 ## Architecture
 
-```
+```text
 crypto_trader/
 ├── __init__.py         # Package exports
 ├── data_feed.py        # Binance REST client (klines, funding, OI)
-├── wallet.py           # Position tracking, PnL, partial closes
-├── risk.py             # Daily limits, consecutive loss circuit breaker
+├── wallet.py           # Position tracking, Order State Machine, PnL
+├── risk.py             # Margin/Leverage Engine, Daily limits
 ├── playbooks.py        # Intraday Snap + Swing entry logic
 ├── regime.py           # Multi-timeframe trend classification (ADX + EMA)
+├── reconciliation.py   # Exchange State Consistency Layer
 ├── llm_advisor.py      # Ollama integration (weighted fusion, not veto)
 ├── journal.py          # Append-only trade journal for analytics
 └── engine.py           # Orchestrator
@@ -260,6 +261,10 @@ parts that apply to the actual architecture.
 | **G3** | WS thread supervisor (fail-stop) | `engine_ws._supervise_threads()`, `ws_client.is_alive()` | on |
 | **G4** | Proactive rate-limit backpressure | `coindcx_client._apply_backpressure()` | on (header-driven) |
 | **G5** | Reconciler final-status + strict cancel-all | `coindcx_execution.get_order_status()` / `cancel_all_orders()`, `reconciler.py` | strict-cancel off |
+| **G6** | Margin Engine (utilization + liquidation distance) | `risk.py` `MarginEngine`, `engine_ws._execute_entry()` | on (80% util cap) |
+| **G7** | Leverage Engine (dynamic tier + ATR scaling) | `risk.py` `LeverageEngine`, `engine_ws._execute_entry()` | on |
+| **G8** | Deterministic Order State Machine | `wallet.py` `OrderStateMachine` | on |
+| **G9** | Exchange State Consistency Layer | `reconciliation.py` `ExchangeStateReconciler`, `engine_ws.run_loop()` | on |
 
 - **G1** reads the HTTP `Date` response header (no dedicated server-time endpoint
   exists) and corrects for ~½ RTT; the preflight check is **advisory** (warns,
@@ -277,6 +282,22 @@ parts that apply to the actual architecture.
   orders + recent fills; `cancel_all_orders` flattens the venue book. With
   `RECONCILE_STRICT_CANCEL=true`, an unresolved desync cancels all venue orders
   before tripping the kill switch.
+- **G6** `MarginEngine` blocks entries when margin utilization exceeds the safe
+  threshold (default 80%) **and** when the stop-loss is dangerously close to
+  the estimated liquidation price. Prevents naked exposure beyond the account's
+  ability to absorb.
+- **G7** `LeverageEngine` validates that the position's notional value is within
+  the allowed leverage tier, and dynamically scales down max leverage during
+  high-volatility regimes using 14-period ATR. Prevents over-leveraged
+  entries in choppy markets.
+- **G8** `OrderStateMachine` enforces deterministic lifecycle transitions
+  (`NEW` → `PENDING` → `PARTIALLY_FILLED` → `FILLED`). Terminal states
+  (`FILLED`, `CANCELLED`, `REJECTED`, `EXPIRED`) are locked — late
+  out-of-order WebSocket messages cannot corrupt the ledger.
+- **G9** `ExchangeStateReconciler` runs every loop tick, comparing internal
+  wallet positions against exchange API state. Detects phantom positions,
+  missing positions, orphaned protective orders, and missing stop-losses.
+  Triggers the kill switch on critical desyncs.
 
 Config keys: `CLOCK_SKEW_MAX_MS` (2000), `MAX_ORDERS_PER_MINUTE` (6),
 `THREAD_SUPERVISOR_ENABLED` (true), `RECONCILE_STRICT_CANCEL` (false).

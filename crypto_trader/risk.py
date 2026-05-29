@@ -38,8 +38,10 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
+from crypto_trader.margin_engine import MarginEngine, LeverageEngine
+
 class RiskManager:
-    """Enforces daily trade limits and consecutive loss stops."""
+    """Enforces daily trade limits, portfolio exposure, and consecutive loss stops."""
 
     _CORRELATED_GROUPS = [
         ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
@@ -56,6 +58,7 @@ class RiskManager:
         max_correlated_positions: int = 2,
         max_orders_per_minute: int = 6,
         max_margin_ratio: float = 0.80,
+        max_portfolio_notional_leverage: float = 3.0,  # Max total exposure / equity
     ):
         self.max_daily = max_daily_trades
         self.max_consecutive = max_consecutive_losses
@@ -64,20 +67,27 @@ class RiskManager:
         self.cooldown_after_loss_seconds = cooldown_after_loss_minutes * 60
         self.max_correlated_positions = max_correlated_positions
         self.max_margin_ratio = max_margin_ratio
+        self.max_portfolio_leverage = max_portfolio_notional_leverage
+        
         # G2: per-minute order velocity circuit breaker (runaway-loop guard).
-        # In-memory only; a restart resets the 60s window, which is safe.
         self.max_orders_per_minute = max_orders_per_minute
         self._recent_open_times: list = []
+        
         self.daily_count = 0
         self.daily_pnl = 0.0
         self.last_trade_date: Optional[date] = None
         self.consecutive_losses = 0
         self.last_loss_time: Optional[float] = None
         self.peak_balance: Optional[float] = None
-        # Hard kill switch (e.g. reconciliation desync, stale feed). Requires
-        # explicit clear — never auto-resets.
+        
+        # Hard kill switch
         self.kill_switch: bool = False
         self.kill_switch_reason: Optional[str] = None
+        
+        # Internalized Engines
+        self.margin_engine = MarginEngine(max_margin_utilization=0.40) # Default util
+        self.leverage_engine = LeverageEngine()
+        
         self.state_file = DATA_DIR / "risk_state.json"
         self._load_state()
 
@@ -85,7 +95,7 @@ class RiskManager:
         return datetime.now(timezone.utc).date()
 
     def trigger_kill_switch(self, reason: str):
-        """Hard-halt trading until explicitly cleared (reconciliation desync, stale feed)."""
+        """Hard-halt trading until explicitly cleared (G5/G9 safety)."""
         if not self.kill_switch:
             logger.critical(f"[KILL SWITCH] Trading halted: {reason}")
         self.kill_switch = True
@@ -122,7 +132,12 @@ class RiskManager:
     def _is_daily_drawdown_limit_hit(self, initial_daily_balance: Optional[float]) -> bool:
         if not initial_daily_balance:
             return False
-        return self.daily_pnl <= -initial_daily_balance * self.max_daily_drawdown_pct
+        try:
+            pnl = float(self.daily_pnl)
+            initial = float(initial_daily_balance)
+            return pnl <= -initial * self.max_daily_drawdown_pct
+        except (TypeError, ValueError):
+            return False
 
     def _is_consecutive_loss_halt_active(self) -> bool:
         return self.consecutive_losses >= self.max_consecutive
@@ -137,14 +152,23 @@ class RiskManager:
         return False, ""
 
     def _is_max_drawdown_reached(self, current_balance: Optional[float]) -> bool:
-        if current_balance is None or not self.peak_balance or self.peak_balance <= 0:
+        if current_balance is None or not self.peak_balance or float(self.peak_balance) <= 0:
             return False
-        cur = self._to_float(current_balance)
-        peak = float(self.peak_balance)
-        dd = (peak - cur) / peak
-        return dd >= self.max_drawdown_pct
+        try:
+            cur = float(current_balance)
+            peak = float(self.peak_balance)
+            dd = (peak - cur) / peak
+            return dd >= self.max_drawdown_pct
+        except (TypeError, ValueError):
+            return False
 
-    def can_trade(self, current_balance: Optional[float] = None, initial_daily_balance: Optional[float] = None) -> Tuple[bool, str]:
+    def can_trade(
+        self, 
+        current_balance: Optional[float] = None, 
+        initial_daily_balance: Optional[float] = None,
+        total_notional: float = 0.0
+    ) -> Tuple[bool, str]:
+        """Portfolio Guard: Checks global limits before allowing a new trade."""
         if self.kill_switch:
             return False, f"Kill switch active: {self.kill_switch_reason or 'unknown'}"
 
@@ -153,7 +177,7 @@ class RiskManager:
         if self._has_reached_daily_limit():
             return False, f"Daily trade limit reached ({self.max_daily})"
 
-        # G2: velocity circuit breaker — block runaway bursts within a 60s window.
+        # G2: velocity circuit breaker
         if self._has_reached_velocity_limit():
             return False, (f"Velocity limit reached "
                            f"({len(self._recent_open_times)}/{self.max_orders_per_minute} orders/min)")
@@ -170,10 +194,19 @@ class RiskManager:
             return False, cooldown_msg
         
         if self._is_max_drawdown_reached(current_balance):
-            cur = self._to_float(current_balance)
-            peak = float(self.peak_balance)
-            dd = (peak - cur) / peak
-            return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
+            try:
+                cur = float(current_balance)
+                peak = float(self.peak_balance)
+                dd = (peak - cur) / peak
+                return False, f"Max drawdown reached ({dd:.1%} >= {self.max_drawdown_pct:.1%})"
+            except (TypeError, ValueError):
+                return False, "Max drawdown check error"
+            
+        # Portfolio Leverage Guard
+        if current_balance and float(current_balance) > 0:
+            eff_lev = self.leverage_engine.calculate_effective_leverage(total_notional, current_balance)
+            if float(eff_lev) > self.max_portfolio_leverage:
+                return False, f"Portfolio leverage too high: {float(eff_lev):.2f}x > {self.max_portfolio_leverage:.2f}x"
         
         return True, "OK"
 

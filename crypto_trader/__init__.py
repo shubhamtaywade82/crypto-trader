@@ -19,38 +19,77 @@ Usage:
 """
 from __future__ import annotations
 
-# ── Load Environment Variables from .env ──
-def _load_dotenv():
+# ── Load Environment Variables (.env → config, .env.secrets → secrets) ──
+#
+# Loading order and override rules:
+#   1. .env          — Non-sensitive configuration. Loaded first; does NOT
+#                      overwrite variables already set in the OS environment.
+#   2. .env.secrets  — API keys, tokens, passwords, and live-trading gates.
+#                      Loaded second and ALWAYS WINS (overrides .env values
+#                      and OS env). This lets secrets stay out of git while
+#                      still taking precedence at runtime.
+#
+# Both files are searched in CWD first, then the project root (parent of
+# this package directory), mirroring normal dotenv lookup behaviour.
+def _parse_env_file(path, override: bool) -> None:
+    """Parse a .env-style file and set variables into os.environ.
+
+    Args:
+        path: Path object pointing to the env file.
+        override: When True, the file's values overwrite any existing env var.
+                  When False, existing env vars are preserved (no-overwrite).
+    """
     import os
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # Strip surrounding quotes
+                if len(val) >= 2 and (
+                    (val.startswith('"') and val.endswith('"'))
+                    or (val.startswith("'") and val.endswith("'"))
+                ):
+                    val = val[1:-1]
+                if override or key not in os.environ:
+                    os.environ[key] = val
+    except Exception:
+        pass
+
+
+def _find_env_file(filename: str):
+    """Locate an env file in CWD or the project root (package parent dir)."""
     from pathlib import Path
-    
-    # Check CWD first, then the parent directory of this package
-    cwd_env = Path.cwd() / ".env"
-    pkg_parent_env = Path(__file__).resolve().parent.parent / ".env"
-    
-    dotenv_path = None
-    if cwd_env.is_file():
-        dotenv_path = cwd_env
-    elif pkg_parent_env.is_file():
-        dotenv_path = pkg_parent_env
-        
-    if dotenv_path:
-        try:
-            with open(dotenv_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        key = key.strip()
-                        val = val.strip()
-                        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                            val = val[1:-1]
-                        if key not in os.environ:
-                            os.environ[key] = val
-        except Exception:
-            pass
+
+    candidates = [
+        Path.cwd() / filename,
+        Path(__file__).resolve().parent.parent / filename,
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def _load_dotenv() -> None:
+    """Load .env (config) then .env.secrets (secrets, highest priority)."""
+    # Step 1 — load .env; do NOT override OS env or later secrets
+    config_path = _find_env_file(".env")
+    if config_path:
+        _parse_env_file(config_path, override=False)
+
+    # Step 2 — load .env.secrets; ALWAYS overrides .env values
+    secrets_path = _find_env_file(".env.secrets")
+    if secrets_path:
+        _parse_env_file(secrets_path, override=True)
+
 
 _load_dotenv()
 
