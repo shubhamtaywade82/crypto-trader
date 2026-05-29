@@ -49,6 +49,7 @@ from .position_engine import PositionEngine, compute_liquidation_price
 from .reconciliation import ReconciliationWorker
 from .redis_layer import RedisLayer
 from .service import LedgerService
+from .unit_of_work import LedgerUnitOfWork
 from .wallet_projection import WalletProjectionService
 
 __all__ = [
@@ -61,6 +62,7 @@ __all__ = [
     "PositionEngine",
     "ReconciliationWorker",
     "RedisLayer",
+    "LedgerUnitOfWork",
     # Models
     "CurrencyAccount",
     "LedgerEntry",

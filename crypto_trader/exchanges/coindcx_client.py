@@ -24,6 +24,8 @@ from typing import Any, Optional
 
 import requests
 
+from ..patterns.circuit_breaker import CircuitBreaker, CircuitOpenError
+
 logger = logging.getLogger("crypto_trader.exchanges.coindcx")
 
 COINDCX_BASE = "https://api.coindcx.com"
@@ -47,6 +49,7 @@ class CoinDCXClient:
         max_retries: int = 3,
         backoff_base: float = 2.0,
         timeout: int = 15,
+        circuit_breaker: Optional[CircuitBreaker] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -54,6 +57,16 @@ class CoinDCXClient:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.timeout = timeout
+        # Circuit breaker trips on persistent 5xx / network failures so that a
+        # down venue fails fast instead of exhausting the full retry budget on
+        # every call.  Pass a shared instance to coordinate across all callers.
+        # When None a per-instance default is created (5 failures, 60s recovery).
+        self._cb: CircuitBreaker = circuit_breaker or CircuitBreaker(
+            name="coindcx",
+            failure_threshold=5,
+            recovery_timeout=60.0,
+            expected_exception=(CoinDCXError, requests.Timeout, OSError),
+        )
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
@@ -84,7 +97,7 @@ class CoinDCXClient:
     # ── transport ──────────────────────────────────────────────────────────
     def _send(self, method: str, url: str, *, headers: dict, data: Optional[str],
               params: Optional[dict], retry_safe: bool = True) -> Any:
-        """Send a request with bounded retries.
+        """Send a request with bounded retries and circuit-breaker protection.
 
         ``retry_safe`` MUST be False for non-idempotent order mutations
         (orders/create, positions/exit, orders/edit). CoinDCX has no
@@ -93,7 +106,19 @@ class CoinDCXClient:
         For those calls a single attempt is made and any ambiguous failure is
         surfaced to the caller (which reconciles against the venue) instead of
         being blindly retried.
+
+        The circuit breaker trips after ``failure_threshold`` consecutive venue-side
+        failures (5xx, timeouts, network errors).  Once OPEN, all calls raise
+        ``CircuitOpenError`` immediately without touching the network.  4xx errors
+        (authentication, validation) never count as failures because they indicate
+        a caller bug, not a venue outage.
         """
+        if self._cb.is_open:
+            raise CircuitOpenError(
+                f"CoinDCX circuit is OPEN — venue may be down. "
+                f"Retry in {self._cb.recovery_timeout:.0f}s."
+            )
+
         # Non-idempotent calls get exactly one attempt; 429 is the only safe
         # retry because it means the request was rejected before processing.
         max_attempts = self.max_retries if retry_safe else 1
@@ -137,6 +162,7 @@ class CoinDCXClient:
                         _safe_json(resp),
                     )
                 self._apply_backpressure(resp)
+                self._cb._on_success()
                 return _safe_json(resp)
             except requests.Timeout:
                 if not retry_safe:
@@ -159,6 +185,7 @@ class CoinDCXClient:
                 logger.warning(f"CoinDCX request error: {e}; retry in {sleep_s}s")
                 time.sleep(sleep_s)
                 last_exc = e
+        self._cb._on_failure()
         raise last_exc if last_exc else CoinDCXError("Max retries exceeded")
 
     def _apply_backpressure(self, resp: "requests.Response") -> None:
