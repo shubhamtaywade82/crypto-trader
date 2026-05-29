@@ -181,34 +181,6 @@ BINANCE_FAPI = "https://fapi.binance.com"
 INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", "1000") or 1000)
 
 
-@app.get("/metrics")
-def get_metrics(days: int = Query(30, ge=1, le=3650)):
-    """Performance metrics from the closed-trade outcome substrate: win-rate,
-    equity curve, per-regime PnL, MFE/MAE distribution, Sharpe, profit factor,
-    expectancy, and LLM attribution. File-based (no DB dependency)."""
-    import time as _time
-    from crypto_trader.analytics import metrics as _metrics
-    from crypto_trader.journal import TradeOutcomeJournal, TradeJournal
-
-    cutoff_ms = int((_time.time() - days * 86400) * 1000)
-    records = [
-        r for r in TradeOutcomeJournal().load_all()
-        if (r.closed_at or 0) >= cutoff_ms
-    ]
-    try:
-        llm_attr = TradeJournal().analyze_llm_contribution(days=days)
-    except Exception as e:
-        logger.warning("llm attribution failed: %s", e)
-        llm_attr = {}
-
-    return _metrics.summary(
-        records,
-        llm_attribution=llm_attr,
-        window_days=days,
-        initial_balance=INITIAL_BALANCE,
-    )
-
-
 async def _fetch_ltp(symbols: List[str]) -> dict:
     """Mark/last price per symbol from Binance USDⓈ-M public API (no creds)."""
     import httpx

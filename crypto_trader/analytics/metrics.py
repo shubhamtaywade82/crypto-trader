@@ -146,6 +146,102 @@ def equity_curve_from_records(
     return curve
 
 
+def _r_multiples(records: Sequence[TradeOutcomeRecord]) -> List[float]:
+    """PnL-in-R values for trades that carry a pnl_r (others are excluded)."""
+    return [float(r.pnl_r) for r in records if r.pnl_r is not None]
+
+
+def avg_win_r(records: Sequence[TradeOutcomeRecord]) -> float:
+    """Mean pnl_r over winning trades (realized_pnl > 0). 0.0 when none."""
+    wins = [
+        float(r.pnl_r)
+        for r in records
+        if r.pnl_r is not None and r.realized_pnl is not None and r.realized_pnl > 0
+    ]
+    return round(mean(wins), 4) if wins else 0.0
+
+
+def avg_loss_r(records: Sequence[TradeOutcomeRecord]) -> float:
+    """Mean pnl_r over losing trades (realized_pnl < 0); negative. 0.0 when none."""
+    losses = [
+        float(r.pnl_r)
+        for r in records
+        if r.pnl_r is not None and r.realized_pnl is not None and r.realized_pnl < 0
+    ]
+    return round(mean(losses), 4) if losses else 0.0
+
+
+def expectancy_r(records: Sequence[TradeOutcomeRecord]) -> float:
+    """Expectancy expressed in R: win_rate*avg_win_r + (1-win_rate)*avg_loss_r."""
+    wr = win_rate(records)
+    return round(wr * avg_win_r(records) + (1.0 - wr) * avg_loss_r(records), 4)
+
+
+def max_drawdown(records: Sequence[TradeOutcomeRecord]) -> float:
+    """Max peak-to-trough drop of the CUMULATIVE realized-PnL curve. >= 0.
+
+    Trades are ordered by ``closed_at`` (falling back to input order when that's
+    missing) to reconstruct the equity path."""
+    ordered = sorted(
+        (r for r in records if r.realized_pnl is not None),
+        key=lambda r: (r.closed_at is None, r.closed_at or 0),
+    )
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in ordered:
+        cum += float(r.realized_pnl)
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+    return round(max_dd, 4)
+
+
+def avg_holding_time_s(records: Sequence[TradeOutcomeRecord]) -> float:
+    """Mean holding_time_s across trades. 0.0 when none."""
+    times = [float(r.holding_time_s) for r in records if r.holding_time_s is not None]
+    return round(mean(times), 4) if times else 0.0
+
+
+def per_regime_expectancy_r(records: Sequence[TradeOutcomeRecord]) -> Dict[str, Dict]:
+    """Per-regime breakdown keyed by regime -> {win_rate, expectancy_r} (R, not currency)."""
+    groups: Dict[str, List[TradeOutcomeRecord]] = {}
+    for r in records:
+        groups.setdefault(r.regime or "unknown", []).append(r)
+    return {
+        regime: {
+            "win_rate": win_rate(rs),
+            "expectancy_r": expectancy_r(rs),
+        }
+        for regime, rs in groups.items()
+    }
+
+
+def compute_metrics(records: Sequence[TradeOutcomeRecord]) -> Dict:
+    """Required spec metric set over an iterable of TradeOutcomeRecord.
+
+    Returns a dict with EXACTLY these keys (zero-trade -> safe zeros/None):
+      total_trades, win_rate, avg_win_r, avg_loss_r, expectancy_r,
+      profit_factor, max_drawdown, avg_holding_time_s, per_regime.
+
+    profit_factor sentinel: ``None`` when there are no losing trades
+    (gross loss == 0) — the ratio is undefined; callers should treat it as
+    "no losses recorded". R-based means exclude trades lacking pnl_r and never
+    crash on them.
+    """
+    records = list(records)
+    return {
+        "total_trades": len(records),
+        "win_rate": win_rate(records),
+        "avg_win_r": avg_win_r(records),
+        "avg_loss_r": avg_loss_r(records),
+        "expectancy_r": expectancy_r(records),
+        "profit_factor": profit_factor(records),
+        "max_drawdown": max_drawdown(records),
+        "avg_holding_time_s": avg_holding_time_s(records),
+        "per_regime": per_regime_expectancy_r(records),
+    }
+
+
 def summary(
     records: Sequence[TradeOutcomeRecord],
     snapshots: Optional[Sequence[dict]] = None,

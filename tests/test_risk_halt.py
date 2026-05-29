@@ -10,6 +10,7 @@ max_daily_drawdown_pct of the day's opening balance.
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -89,3 +90,39 @@ class TestDailyLossHalt:
                                  initial_daily_balance=initial)
         assert not ok
         assert "kill switch" in reason.lower()
+
+
+class TestLiveClosePathWiring:
+    """FIX C — prove the LIVE engine close handler passes the post-close balance
+    so the daily-loss HALT actually fires (it was dead before wiring)."""
+
+    def _shim(self, risk, balance):
+        return SimpleNamespace(
+            symbol="SOLUSDT",
+            risk_manager=risk,
+            wallet=SimpleNamespace(wallet_balance=balance),
+            _persist_trade_outcome=lambda event: None,
+        )
+
+    def test_live_close_handler_trips_halt_at_breach(self):
+        from crypto_trader.engine_ws import WebSocketTradingEngine
+        r = _clean_risk(max_daily_drawdown_pct=0.03, max_daily_trades=100,
+                        max_consecutive_losses=999)
+        initial = 10_000.0
+        loss = -initial * 0.04  # -4% breaches the 3% limit
+        event = SimpleNamespace(symbol="SOLUSDT", realized_pnl=loss)
+        shim = self._shim(r, balance=initial + loss)
+        WebSocketTradingEngine._on_trade_closed(shim, event)
+        assert r.kill_switch is True
+        assert "daily loss" in (r.kill_switch_reason or "").lower()
+
+    def test_live_close_handler_no_halt_below_breach(self):
+        from crypto_trader.engine_ws import WebSocketTradingEngine
+        r = _clean_risk(max_daily_drawdown_pct=0.03, max_daily_trades=100,
+                        max_consecutive_losses=999)
+        initial = 10_000.0
+        loss = -initial * 0.02  # -2%, under the limit
+        event = SimpleNamespace(symbol="SOLUSDT", realized_pnl=loss)
+        shim = self._shim(r, balance=initial + loss)
+        WebSocketTradingEngine._on_trade_closed(shim, event)
+        assert r.kill_switch is False

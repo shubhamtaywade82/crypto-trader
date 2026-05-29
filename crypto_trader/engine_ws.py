@@ -319,7 +319,15 @@ class WebSocketTradingEngine:
     def _on_trade_closed(self, event):
         """Update risk manager when a trade is closed."""
         if event.symbol == self.symbol:
-            self.risk_manager.record_close(event.realized_pnl)
+            # Pass the post-close wallet balance so the daily-loss HALT in
+            # record_close() actually runs (it reconstructs the day's opening
+            # balance as wallet_balance - daily_pnl, matching the pre-trade gate's
+            # initial_daily_balance at line ~1157).
+            try:
+                post_close_balance = float(self.wallet.wallet_balance)
+            except (TypeError, ValueError, AttributeError):
+                post_close_balance = None
+            self.risk_manager.record_close(event.realized_pnl, current_balance=post_close_balance)
             self._persist_trade_outcome(event)
 
     def _persist_trade_outcome(self, event):
