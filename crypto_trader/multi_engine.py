@@ -174,6 +174,7 @@ def main():
             api_key=api_key,
             api_secret=api_secret,
             leverage=args.leverage,
+            margin_currency=_early_cfg.coindcx_margin_currency,
             i_understand_real_money=live_ack
         )
         logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
