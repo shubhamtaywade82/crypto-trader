@@ -48,16 +48,26 @@ def compute_liquidation_price(
     maintenance_margin_rate: _D = _MAINTENANCE_MARGIN_RATE,
 ) -> _D:
     """
-    Simplified isolated-margin liquidation price formula.
+    Isolated-margin liquidation price (mark-based margin model).
 
-    LONG:  liq = entry × (1 − 1/leverage + mmr)
-    SHORT: liq = entry × (1 + 1/leverage − mmr)
+    Derived from: margin_used(mark) + unrealized_pnl = maintenance(mark)
+      where margin_used = mark × qty / lev  (dynamic, mark-based)
+
+    LONG:  liq = entry / (1 + 1/lev − mmr)
+    SHORT: liq = entry / (1 − 1/lev + mmr)
+
+    Consistent with EnhancedFuturesWallet.liquidation_price() in wallet.py
+    so ledger and live-wallet agree when used together.
     """
     lev = _D(leverage)
+    inv_lev = _D("1") / lev
     if side == "LONG":
-        return entry * (_D("1") - _D("1") / lev + maintenance_margin_rate)
+        denom = _D("1") + inv_lev - maintenance_margin_rate
     else:
-        return entry * (_D("1") + _D("1") / lev - maintenance_margin_rate)
+        denom = _D("1") - inv_lev + maintenance_margin_rate
+    if denom <= _ZERO:
+        return _ZERO
+    return entry / denom
 
 
 class PositionEngine:

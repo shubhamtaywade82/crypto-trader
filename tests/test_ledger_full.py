@@ -314,25 +314,28 @@ class TestBalanceIntegrity:
 
 class TestLiquidationPrice:
     """
-    Isolated margin formula:
-      LONG:  liq = entry × (1 − 1/lev + mmr)   mmr=0.005
-      SHORT: liq = entry × (1 + 1/lev − mmr)
+    Mark-based isolated-margin formula (consistent with wallet.py):
+      LONG:  liq = entry / (1 + 1/lev − mmr)   mmr=0.005
+      SHORT: liq = entry / (1 − 1/lev + mmr)
     """
 
     def test_long_10x(self):
         liq = compute_liquidation_price("LONG", _D("100"), 10)
-        # 100 × (1 − 0.1 + 0.005) = 100 × 0.905 = 90.5
-        assert liq == _D("90.5")
+        # 100 / (1 + 0.1 − 0.005) = 100 / 1.095 ≈ 91.324...
+        expected = _D("100") / (_D("1") + _D("1") / _D("10") - _D("0.005"))
+        assert abs(liq - expected) < _D("0.001")
 
     def test_short_10x(self):
         liq = compute_liquidation_price("SHORT", _D("100"), 10)
-        # 100 × (1 + 0.1 − 0.005) = 100 × 1.095 = 109.5
-        assert liq == _D("109.5")
+        # 100 / (1 − 0.1 + 0.005) = 100 / 0.905 ≈ 110.497...
+        expected = _D("100") / (_D("1") - _D("1") / _D("10") + _D("0.005"))
+        assert abs(liq - expected) < _D("0.001")
 
     def test_long_20x(self):
         liq = compute_liquidation_price("LONG", _D("1000"), 20)
-        # 1000 × (1 − 0.05 + 0.005) = 1000 × 0.955 = 955
-        assert liq == _D("955")
+        # 1000 / (1 + 0.05 − 0.005) = 1000 / 1.045 ≈ 956.94...
+        expected = _D("1000") / (_D("1") + _D("1") / _D("20") - _D("0.005"))
+        assert abs(liq - expected) < _D("0.01")
 
     def test_long_liq_below_entry(self):
         liq = compute_liquidation_price("LONG", _D("50000"), 5)

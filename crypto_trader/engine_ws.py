@@ -1481,7 +1481,14 @@ class WebSocketTradingEngine:
             return
             
         leverage_val = self.cfg.leverage if self.cfg else 2
-        liq_price = entry_price * (1 - 1/leverage_val) if is_long else entry_price * (1 + 1/leverage_val)
+        # Wallet uses mark-based margin: liq = entry / (1 ± 1/lev ∓ mmr)
+        # This matches wallet._is_liquidation_required() so the entry gate
+        # and the live liquidation check agree.
+        _mmr = float(getattr(self.wallet, "maintenance_margin_ratio", 0.005))
+        _inv_lev = 1.0 / max(leverage_val, 1)
+        liq_price = (entry_price / (1 + _inv_lev - _mmr)
+                     if is_long else
+                     entry_price / (1 - _inv_lev + _mmr))
         liq_ok, liq_msg = self.margin_engine.check_liquidation_distance(
             entry_price=entry_price,
             stop_loss_price=setup["sl_price"],
