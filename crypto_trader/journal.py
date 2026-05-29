@@ -8,6 +8,7 @@ Also provides TradeOutcomeRecord + TradeOutcomeJournal for capturing the
 complete features-at-entry + outcome-at-exit record for every closed trade.
 """
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass, asdict, field
@@ -18,7 +19,7 @@ from typing import Iterator, Optional, Dict, List, Union
 logger = logging.getLogger("crypto_trader.journal")
 
 DATA_DIR = Path.home() / ".crypto_trader" / "journal"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# NOTE: no mkdir here — directory is created lazily in _DailyJsonlJournal.__init__
 
 _OUTCOME_DATA_DIR = Path.home() / ".crypto_trader" / "outcomes"
 
@@ -292,6 +293,14 @@ class TradeOutcomeRecord:
     slippage_bps: Optional[float] = None
 
 
+# Pre-compute known fields once so load_all() stays forward-compatible.
+# If a persisted line contains a key not in this set (e.g. written by a newer
+# version), it will be silently ignored rather than raising TypeError.
+_OUTCOME_FIELDS: frozenset = frozenset(
+    f.name for f in dataclasses.fields(TradeOutcomeRecord)
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TradeOutcomeJournal — append-only JSONL sink for TradeOutcomeRecord
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,4 +344,7 @@ class TradeOutcomeJournal(_DailyJsonlJournal):
             if payload.get("record_type") != _RECORD_TYPE:
                 continue  # skip non-outcome lines (e.g. mixed files)
             payload.pop("record_type", None)
-            yield TradeOutcomeRecord(**payload)
+            # Filter to known fields so unknown keys (e.g. added by a newer
+            # version) don't raise TypeError on older code.
+            filtered = {k: v for k, v in payload.items() if k in _OUTCOME_FIELDS}
+            yield TradeOutcomeRecord(**filtered)

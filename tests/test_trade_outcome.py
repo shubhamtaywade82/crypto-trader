@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import crypto_trader.journal as _journal_mod
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -209,17 +211,80 @@ def test_load_all_empty(journal):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. TradeOutcomeJournal does NOT touch ~/.crypto_trader unless told to
+# 8. Journals do NOT touch ~/.crypto_trader unless told to
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_no_home_dir_writes(tmp_path, monkeypatch):
-    """Ensure default data_dir is configurable; test harness never touches ~/.crypto_trader."""
-    real_home = Path.home() / ".crypto_trader"
-    # Just confirm our fixture uses tmp_path, not the real home dir
-    j = TradeOutcomeJournal(data_dir=tmp_path)
-    j.record(_min_record())
-    # Nothing should be created under real home as a side-effect
-    outcome_dir = real_home / "outcomes"
-    # We don't assert it doesn't exist (it might from production runs),
-    # but we assert our records are in tmp_path
-    assert list(tmp_path.glob("*.jsonl")), "expected JSONL in tmp_path"
+    """
+    Importing journal.py must NOT create ~/.crypto_trader/journal.
+    Instantiating journals with a tmp_path must write there only.
+    """
+    real_journal_dir = Path.home() / ".crypto_trader" / "journal"
+    real_outcome_dir = Path.home() / ".crypto_trader" / "outcomes"
+
+    # Snapshot existence BEFORE the test exercises anything.
+    # If the dirs already exist (e.g. from a prior production run) we record
+    # that baseline and only care that no NEW writes happen to them.
+    journal_existed_before = real_journal_dir.exists()
+    outcome_existed_before = real_outcome_dir.exists()
+
+    # Redirect the module-level path constants so any accidental default-path
+    # construction in this process would land in tmp, not home.
+    tmp_journal = tmp_path / "journal"
+    tmp_outcome = tmp_path / "outcomes"
+    monkeypatch.setattr(_journal_mod, "DATA_DIR", tmp_journal)
+    monkeypatch.setattr(_journal_mod, "_OUTCOME_DATA_DIR", tmp_outcome)
+
+    from crypto_trader.journal import TradeJournal, TradeJournalEntry
+
+    # Exercise both journal types via the patched defaults AND explicit paths.
+    tj = TradeJournal()  # uses patched DATA_DIR
+    tj_explicit = TradeJournal(data_dir=tmp_journal)
+    oj = TradeOutcomeJournal()  # uses patched _OUTCOME_DATA_DIR
+    oj_explicit = TradeOutcomeJournal(data_dir=tmp_outcome)
+
+    oj_explicit.record(_min_record())
+
+    # All writes must land in tmp_path, not home.
+    assert list(tmp_outcome.glob("*.jsonl")), "expected JSONL under tmp_path/outcomes"
+
+    # The real home dirs must not have been CREATED by this test.
+    if not journal_existed_before:
+        assert not real_journal_dir.exists(), (
+            "test unexpectedly created ~/.crypto_trader/journal"
+        )
+    if not outcome_existed_before:
+        assert not real_outcome_dir.exists(), (
+            "test unexpectedly created ~/.crypto_trader/outcomes"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. load_all() tolerates unknown keys (forward-compat: written by newer code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_load_all_ignores_unknown_keys(tmp_path):
+    """
+    A JSONL line that contains an extra key not present in TradeOutcomeRecord
+    must be loaded without raising TypeError; the unknown key is silently ignored.
+    """
+    import dataclasses
+    from crypto_trader.journal import _RECORD_TYPE, _OUTCOME_FIELDS
+
+    rec = _min_record()
+    payload = {f.name: getattr(rec, f.name) for f in dataclasses.fields(rec)}
+    payload["record_type"] = _RECORD_TYPE
+    # Inject a key that does NOT exist in the current dataclass.
+    payload["__future_field_added_by_v2__"] = "some_value"
+
+    # Write the line manually so we bypass record() (which uses asdict).
+    today_file = tmp_path / "2099-01-01.jsonl"
+    today_file.write_text(json.dumps(payload) + "\n")
+
+    journal = TradeOutcomeJournal(data_dir=tmp_path)
+    loaded = list(journal.load_all())
+
+    assert len(loaded) == 1, "expected exactly one record"
+    assert loaded[0].trade_id == rec.trade_id
+    # The unknown key must not appear anywhere on the loaded record.
+    assert not hasattr(loaded[0], "__future_field_added_by_v2__")
