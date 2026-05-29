@@ -65,6 +65,9 @@ def sharpe(records: Sequence[TradeOutcomeRecord], periods_per_year: float = 365.
 
 
 def per_regime_pnl(records: Sequence[TradeOutcomeRecord]) -> Dict[str, Dict]:
+    """Per-regime breakdown in CURRENCY (trades/pnl/win_rate/expectancy-in-currency).
+    Consumer: summary() (the /metrics dashboard payload). NOT interchangeable with
+    per_regime_expectancy_r below, which reports R-multiples for compute_metrics."""
     groups: Dict[str, List[TradeOutcomeRecord]] = {}
     for r in records:
         groups.setdefault(r.regime or "unknown", []).append(r)
@@ -102,7 +105,7 @@ def mfe_mae_distribution(records: Sequence[TradeOutcomeRecord]) -> Dict[str, Dic
     # capture ratio = realized move vs best move seen (how much of MFE was kept)
     captures = []
     for r in records:
-        if r.mfe and r.mfe != 0 and r.realized_pnl is not None and r.entry_price:
+        if r.mfe is not None and abs(r.mfe) > 1e-10 and r.realized_pnl is not None and r.entry_price:
             realized_pct = (r.realized_pnl / (abs(r.quantity) * r.entry_price)) if r.quantity else 0.0
             captures.append(realized_pct / r.mfe)
     return {
@@ -203,7 +206,10 @@ def avg_holding_time_s(records: Sequence[TradeOutcomeRecord]) -> float:
 
 
 def per_regime_expectancy_r(records: Sequence[TradeOutcomeRecord]) -> Dict[str, Dict]:
-    """Per-regime breakdown keyed by regime -> {win_rate, expectancy_r} (R, not currency)."""
+    """Per-regime breakdown keyed by regime -> {win_rate, expectancy_r} in R (NOT
+    currency). Consumer: compute_metrics() (the required spec metric set). NOT
+    interchangeable with per_regime_pnl above, which reports currency expectancy
+    for summary()."""
     groups: Dict[str, List[TradeOutcomeRecord]] = {}
     for r in records:
         groups.setdefault(r.regime or "unknown", []).append(r)

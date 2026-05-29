@@ -348,6 +348,13 @@ class RiskManager:
         before the next entry attempt. Tripping the kill switch here closes that
         gap.
         """
+        # Roll the daily counters over BEFORE accumulating, mirroring record_open
+        # and can_trade. Without this, a close after UTC midnight (or the first
+        # close of a new day before any record_open fired) would add onto
+        # yesterday's daily_pnl — corrupting both the daily-loss tracking and the
+        # `initial_daily = current_balance - daily_pnl` HALT reconstruction below.
+        # Uses the same UTC _today() basis as the pre-trade gate.
+        self._reset_daily_stats_if_new_day()
         self.daily_pnl += float(net_pnl)
         if net_pnl > 0:
             self.consecutive_losses = 0

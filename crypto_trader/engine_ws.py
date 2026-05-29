@@ -317,18 +317,31 @@ class WebSocketTradingEngine:
             self.event_bus.subscribe(TradeClosedEvent, self._on_trade_closed)
 
     def _on_trade_closed(self, event):
-        """Update risk manager when a trade is closed."""
-        if event.symbol == self.symbol:
+        """Update risk manager when a trade is closed.
+
+        This runs as an event-bus subscriber. Telemetry/risk-bookkeeping must
+        NEVER crash the trade-close path: if the bus does not isolate subscriber
+        exceptions, an unexpected throw here would propagate back into the
+        publisher (wallet.close_position). So the entire body is wrapped in a
+        swallow-and-log guard.
+        """
+        try:
+            if event.symbol != self.symbol:
+                return
             # Pass the post-close wallet balance so the daily-loss HALT in
             # record_close() actually runs (it reconstructs the day's opening
             # balance as wallet_balance - daily_pnl, matching the pre-trade gate's
-            # initial_daily_balance at line ~1157).
+            # initial_daily_balance at line ~1157). A balance-read failure must
+            # NOT skip risk bookkeeping — fall back to None so record_close still
+            # runs (gate-only, no post-close halt).
             try:
                 post_close_balance = float(self.wallet.wallet_balance)
             except (TypeError, ValueError, AttributeError):
                 post_close_balance = None
             self.risk_manager.record_close(event.realized_pnl, current_balance=post_close_balance)
             self._persist_trade_outcome(event)
+        except Exception as e:
+            logger.error("[ENGINE] _on_trade_closed failed for %s: %s", self.symbol, e)
 
     def _persist_trade_outcome(self, event):
         """Join cached open-side context with the close event and persist:

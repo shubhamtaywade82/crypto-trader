@@ -116,7 +116,7 @@ def _seed_outcomes(monkeypatch, tmp_path):
             regime=regime, pnl_r=pnl_r,
         )
 
-    # cum: 10, 6, 12, -8 -> max drawdown 20 ; 3 wins / 1 loss -> win_rate 0.75
+    # cum: 10, 6, 12, -8 -> max drawdown 20 ; 2 wins (10,6) / 2 losses (-4,-20) -> win_rate 0.5
     for r in [rec("a", 10, 1, 2.0), rec("b", -4, 2, -1.0),
               rec("c", 6, 3, 1.0), rec("d", -20, 4, -5.0, regime="chop")]:
         j.record(r)

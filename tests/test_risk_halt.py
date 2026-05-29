@@ -80,6 +80,58 @@ class TestDailyLossHalt:
         r.record_close(+500.0, current_balance=10_500.0)
         assert r.kill_switch is False
 
+    def test_record_close_rolls_over_at_day_boundary(self):
+        """FIX C1 — a close crossing UTC midnight must NOT accumulate onto the
+        prior day's daily_pnl. Day D logs a loss; on day D+1 the FIRST close
+        (before any record_open) must reset daily_pnl to ONLY day D+1's loss,
+        and the daily-loss HALT must evaluate against D+1's opening balance."""
+        r = _clean_risk(max_daily_drawdown_pct=0.03, max_daily_trades=100,
+                        max_consecutive_losses=999)
+        initial = 10_000.0
+
+        # Day D: realize a -2.9% loss (under the 3% limit on its own).
+        day_d_loss = -initial * 0.029
+        r.record_close(day_d_loss, current_balance=initial + day_d_loss)
+        assert r.kill_switch is False
+        assert r.daily_pnl == pytest.approx(day_d_loss)
+
+        # Advance to day D+1: stamp last_trade_date as yesterday so the rollover
+        # inside record_close fires (matches a real UTC-midnight crossing).
+        from datetime import timedelta
+        r.last_trade_date = r._today() - timedelta(days=1)
+
+        # Day D+1: a fresh -2.9% loss. If record_close failed to roll over, the
+        # accumulated daily_pnl would be ~-5.8% (>3%) and wrongly trip the HALT.
+        day_d1_loss = -initial * 0.029
+        r.record_close(day_d1_loss, current_balance=initial + day_d1_loss)
+
+        # daily_pnl reflects ONLY day D+1's loss, not the sum across the boundary.
+        assert r.daily_pnl == pytest.approx(day_d1_loss)
+        # And -2.9% on D+1's opening balance is under 3% -> no false-positive HALT.
+        assert r.kill_switch is False
+        assert r.last_trade_date == r._today()
+
+    def test_record_close_halts_against_new_day_balance(self):
+        """FIX C1 — after the day-boundary rollover, a -4% loss on day D+1 must
+        still correctly trip the HALT against D+1's reconstructed opening balance
+        (proving the reset doesn't suppress legitimate same-day halts)."""
+        r = _clean_risk(max_daily_drawdown_pct=0.03, max_daily_trades=100,
+                        max_consecutive_losses=999)
+        initial = 10_000.0
+        # Day D: small loss.
+        r.record_close(-initial * 0.01, current_balance=initial * 0.99)
+        assert r.kill_switch is False
+
+        # Advance to day D+1.
+        from datetime import timedelta
+        r.last_trade_date = r._today() - timedelta(days=1)
+
+        # Day D+1: -4% breaches the 3% limit on the new day's opening balance.
+        loss = -initial * 0.04
+        r.record_close(loss, current_balance=initial + loss)
+        assert r.daily_pnl == pytest.approx(loss)
+        assert r.kill_switch is True
+
     def test_halted_manager_blocks_can_trade(self):
         r = _clean_risk(max_daily_drawdown_pct=0.03, max_daily_trades=100,
                         max_consecutive_losses=999)
