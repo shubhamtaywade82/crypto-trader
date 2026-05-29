@@ -112,6 +112,12 @@ _TRADING_PROFILES: dict = {
 }
 
 
+# Spec-mandated risk defaults — single source of truth referenced by both
+# the TradingConfig dataclass field defaults and from_env().
+_SPEC_RISK_PER_TRADE_PCT: float = 0.005
+_SPEC_MAX_CONSECUTIVE_LOSSES: int = 3
+
+
 def _get(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -262,9 +268,9 @@ class TradingConfig:
     adaptive_min_threshold: float = 0.60
     adaptive_target_trades_per_day: float = 2.0   # decay starts after 24/target idle hours
     adaptive_decay_per_hour: float = 0.01         # threshold drop rate per idle hour
-    risk_per_trade_pct: float = 0.005
+    risk_per_trade_pct: float = field(default=_SPEC_RISK_PER_TRADE_PCT)
     funding_extreme_threshold: float = 0.0005
-    max_consecutive_losses: int = 3
+    max_consecutive_losses: int = field(default=_SPEC_MAX_CONSECUTIVE_LOSSES)
     max_drawdown_pct: float = 0.20
     max_daily_drawdown_pct: float = 0.03
     cooldown_after_loss_minutes: int = 1440
@@ -336,10 +342,6 @@ class TradingConfig:
         profile_explicitly_set = bool(_profile_env)
         profile_name = _profile_env if _profile_env else "moderate"
         profile = _TRADING_PROFILES.get(profile_name, _TRADING_PROFILES["moderate"])
-
-        # Spec defaults used when no TRADING_PROFILE is active
-        _SPEC_RISK_PER_TRADE_PCT = 0.005
-        _SPEC_MAX_CONSECUTIVE_LOSSES = 3
 
         return cls(
             mode=mode_enum,

@@ -43,6 +43,7 @@ from .session import get_session_context, TradingSession
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD, build_advisor
 from .journal import TradeJournal
 from .structure import MarketStructureAnalyzer
+from .config import load_config
 
 logger = logging.getLogger("crypto_trader.engine_ws")
 
@@ -158,7 +159,13 @@ class WebSocketTradingEngine:
                 max_margin_ratio=cfg.max_margin_ratio,
             )
         else:
-            self.risk_manager = RiskManager()
+            _default_cfg = load_config()
+            self.risk_manager = RiskManager(
+                max_daily_trades=_default_cfg.max_daily_trades,
+                max_consecutive_losses=_default_cfg.max_consecutive_losses,
+                max_daily_drawdown_pct=_default_cfg.max_daily_drawdown_pct,
+                cooldown_after_loss_minutes=_default_cfg.cooldown_after_loss_minutes,
+            )
         _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
         _min_threshold = cfg.adaptive_min_threshold if cfg else 0.45
         _decay_rate = cfg.adaptive_decay_per_hour if cfg else 0.01

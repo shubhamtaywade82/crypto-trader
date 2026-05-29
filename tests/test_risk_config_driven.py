@@ -12,7 +12,9 @@ import os
 import tempfile
 import time
 import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -25,16 +27,22 @@ from crypto_trader.config import TradingConfig
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clean_risk(**kw) -> RiskManager:
-    """Instantiate a RiskManager with an isolated temp state file."""
-    r = RiskManager(**kw)
-    r.state_file = Path(tempfile.gettempdir()) / f"risk_test_{uuid.uuid4().hex}.json"
-    r.kill_switch = False
-    r.daily_count = 0
-    r.consecutive_losses = 0
-    r.last_loss_time = None
-    r.daily_pnl = 0.0
-    r.peak_balance = None
-    r._recent_open_times = []
+    """Instantiate a RiskManager with an isolated temp state file.
+
+    Patches the module-level DATA_DIR path BEFORE construction so that
+    _load_state() never reads the developer's real ~/.crypto_trader/risk_state.json.
+    The returned manager has a clean zeroed state and last_trade_date set to
+    today so _reset_daily_stats_if_new_day() never clobbers test-set values.
+    """
+    isolated_dir = Path(tempfile.mkdtemp(prefix="risk_test_"))
+    # Patch DATA_DIR so that self.state_file = DATA_DIR / "risk_state.json"
+    # inside __init__ points at an empty temp directory, not the real one.
+    with patch("crypto_trader.risk.DATA_DIR", isolated_dir):
+        r = RiskManager(**kw)
+    # Ensure _reset_daily_stats_if_new_day() is a no-op during tests by
+    # pinning the date to today (UTC, matching RiskManager._today()); otherwise
+    # a None last_trade_date resets daily_pnl before the drawdown gate runs.
+    r.last_trade_date = datetime.now(timezone.utc).date()
     return r
 
 
