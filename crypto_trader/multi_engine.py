@@ -139,11 +139,10 @@ def main():
     engines = []
     threads = []
     
-    total_balance = 1000.0
-
     # Load config early so profile-driven risk parameters apply to the global risk manager
     from crypto_trader.config import load_config as _load_cfg_early
     _early_cfg = _load_cfg_early()
+    total_balance = _early_cfg.initial_balance
     global_risk = RiskManager(
         max_daily_trades=_early_cfg.max_daily_trades,
         max_consecutive_losses=_early_cfg.max_consecutive_losses,
