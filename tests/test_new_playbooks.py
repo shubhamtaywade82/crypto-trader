@@ -120,7 +120,7 @@ def test_sweep_needs_structure():
 # ── Selection: bias-aware tiebreak ──
 
 def test_bias_factor():
-    from crypto_trader.engine_ws import WebSocketTradingEngine as E
+    from crypto_trader.strategies.router import StrategyRouter as E
 
     class _Advice:
         def __init__(self, rec):
