@@ -56,7 +56,13 @@ from pathlib import Path
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Symbol WebSocket Trading Engine")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols (e.g., BTCUSDT,ETHUSDT)")
-    parser.add_argument("--leverage", type=int, default=int(os.getenv("LEVERAGE", os.getenv("MAX_LEVERAGE", 5))), help="Leverage multiplier")
+    # Default is the sentinel ``None`` (NOT an env-derived literal) so an explicit
+    # ``--leverage`` on the CLI is distinguishable from "unset". resolve_leverage()
+    # then applies precedence: explicit CLI override > cfg.leverage. Leaving this
+    # env-derived would silently disagree with cfg.leverage (which falls back to the
+    # active profile cap, e.g. 3 for moderate, not the literal 5 used here).
+    parser.add_argument("--leverage", type=int, default=None,
+                        help="Leverage multiplier (overrides cfg/profile leverage when set)")
     parser.add_argument("--no-llm", action="store_true",
                         default=os.getenv("USE_LLM", "true").lower() in ("false", "0", "no"),
                         help="Disable LLM advisor (also: USE_LLM=false in .env)")
@@ -103,6 +109,27 @@ def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
 
     return []
 
+def resolve_leverage(cli_leverage: Optional[int], cfg) -> int:
+    """Reconcile the leverage source between the engine constructor and cfg.
+
+    Precedence (intentional, documented): an explicit CLI ``--leverage`` override
+    WINS over cfg; otherwise cfg.leverage (sourced from MAX_LEVERAGE/LEVERAGE env or
+    the active trading profile cap) is used.
+
+    Why mutate cfg on override: the position-sizing path reads ``self.cfg.leverage``
+    directly (engine_ws.py:1538) while the constructor receives a separate
+    ``leverage=`` argument. If the CLI override only flowed to the constructor, the
+    two would silently disagree (constructor sees the override, sizing/liq-distance
+    sees the un-overridden cfg.leverage). To keep a single source of truth we push
+    the override back into ``cfg.max_leverage`` so both reads agree. When no CLI
+    override is supplied, cfg is left untouched and cfg.leverage governs both.
+    """
+    if cli_leverage is not None:
+        cfg.max_leverage = int(cli_leverage)
+        return int(cli_leverage)
+    return int(cfg.leverage)
+
+
 def run_preflight_checks(
     symbols: List[str],
     wallet: EnhancedFuturesWallet,
@@ -139,9 +166,18 @@ def main():
     engines = []
     threads = []
     
-    # Load config early so profile-driven risk parameters apply to the global risk manager
+    # Load config early so profile-driven risk parameters apply to the global risk
+    # manager AND to each per-symbol engine. This single cfg object is reused for
+    # the wallet, risk manager, and engines so config-gated behaviors (sizing,
+    # strategy_mode, allowed_regimes, kill-zone, basis-guard, funding thresholds,
+    # leverage, live-mode gating) are honored fleet-wide instead of each engine
+    # falling back to hardcoded defaults (self.cfg=None).
     from crypto_trader.config import load_config as _load_cfg_early
     _early_cfg = _load_cfg_early()
+    # Reconcile leverage source: explicit CLI --leverage wins over cfg, otherwise
+    # cfg.leverage governs. resolve_leverage mutates cfg.max_leverage on override so
+    # the constructor leverage and the sizing path's self.cfg.leverage never disagree.
+    resolved_leverage = resolve_leverage(args.leverage, _early_cfg)
     total_balance = _early_cfg.initial_balance
     global_risk = RiskManager(
         max_daily_trades=_early_cfg.max_daily_trades,
@@ -173,21 +209,22 @@ def main():
         execution_engine = CoinDCXExecutionEngine(
             api_key=api_key,
             api_secret=api_secret,
-            leverage=args.leverage,
+            leverage=resolved_leverage,
             margin_currency=_early_cfg.coindcx_margin_currency,
             i_understand_real_money=live_ack
         )
         logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
         
     # ── Database Projections & Event Journal for Dashboard UI ──
-    from crypto_trader.config import load_config
-    cfg = load_config()
+    # Reuse the SAME cfg object loaded above (carries any CLI leverage override) so
+    # the wallet, projections, and per-symbol engines all share one config.
+    cfg = _early_cfg
 
     # Create one shared wallet for all engines
     global_wallet = EnhancedFuturesWallet(
         symbol="GLOBAL",
         initial_balance=total_balance,
-        leverage=args.leverage,
+        leverage=resolved_leverage,
         database_url=cfg.database_url,
         event_bus=bus,
     )
@@ -275,7 +312,9 @@ def main():
     per_symbol_balance = total_balance / len(symbols)
 
     # Shared wallet: bound each symbol's per-trade risk to 1/N of the budget so
-    # N concurrent positions don't collectively risk N×2% of the whole account.
+    # N concurrent positions don't collectively risk N × cfg.risk_per_trade_pct of
+    # the whole account. This composes with cfg.risk_per_trade_pct in sizing
+    # (engine_ws.py:1510-1511): per-symbol per-trade risk = risk_per_trade_pct × 1/N.
     risk_fraction = 1.0 / max(1, len(symbols))
 
     for sym in symbols:
@@ -283,7 +322,14 @@ def main():
             symbol=sym,
             wallet=global_wallet,
             initial_balance=per_symbol_balance,
-            leverage=args.leverage,
+            leverage=resolved_leverage,
+            # Pass the loaded cfg so this engine honors the TradingConfig (sizing
+            # risk_per_trade_pct, strategy_mode, allowed_regimes, kill-zone,
+            # basis-guard, funding thresholds, leverage, live gating) instead of
+            # silently falling back to hardcoded defaults (self.cfg=None).
+            # resolved_leverage and cfg.leverage are kept consistent by
+            # resolve_leverage() above, so the constructor and sizing path agree.
+            cfg=cfg,
             use_llm=not args.no_llm,
             llm_host=args.llm_host,
             llm_model=args.llm_model,
