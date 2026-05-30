@@ -269,6 +269,17 @@ class PlaybookSupertrend2:
         self.sl_atr_mult = max(0.0, sl_atr_mult)
         self.max_hold_hours = max(1, max_hold_hours)
 
+    def apply_overrides(self, ov: dict) -> None:
+        """Live-update tunable params from a hot-reload overrides dict (keys are
+        prefixed ``st2_``). Only attributes that already exist are touched.
+        SL-defining keys (sl_*, max_hold_hours) are gated upstream to flat-only."""
+        for key, val in ov.items():
+            if not key.startswith("st2_"):
+                continue
+            attr = key[len("st2_"):]
+            if hasattr(self, attr):
+                setattr(self, attr, val)
+
     # ── helpers ──
 
     def _effective_atr_len(self) -> int:

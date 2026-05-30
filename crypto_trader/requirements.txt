@@ -13,3 +13,6 @@ redis>=5.0.0
 # Dashboard API (read-only). Only needed to run crypto_trader.api.app.
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
+# httpx backs starlette's TestClient. <0.28 because 0.28 removed the app=
+# shortcut TestClient relies on (breaks tests/test_api.py).
+httpx>=0.26,<0.28

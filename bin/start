@@ -26,6 +26,11 @@ if [ "$MODE" = "live" ]; then
     echo "ℹ️  Clearing active HALT file on operator confirmation..."
     rm -f "$HOME/.crypto_trader/HALT"
   fi
+  # Automatically clear latched risk state file on explicit operator confirmation
+  if [ -f "$HOME/.crypto_trader/risk_state.json" ]; then
+    echo "ℹ️  Clearing active risk state file on operator confirmation..."
+    rm -f "$HOME/.crypto_trader/risk_state.json"
+  fi
 fi
 
 echo "--- Infrastructure (Postgres, Redis) ---"

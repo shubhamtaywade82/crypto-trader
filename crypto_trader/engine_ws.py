@@ -42,6 +42,7 @@ from .regime import (
 from .session import get_session_context, TradingSession
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD, build_advisor
 from .journal import TradeJournal, TradeOutcomeJournal, TradeOutcomeRecord
+from .config_store import ConfigStore
 from .structure import MarketStructureAnalyzer
 from .config import load_config
 
@@ -286,6 +287,12 @@ class WebSocketTradingEngine:
         # TradeClosedEvent in _on_trade_closed to emit one TradeOutcomeRecord.
         self.outcome_journal = TradeOutcomeJournal()
         self._open_features: dict = {}
+        # Runtime config hot-reload: polled once per signal tick. Picks up the
+        # overrides file written by the calibration approver without a restart.
+        self.config_store = ConfigStore()
+        # SL-defining overrides that arrived while a position was open; retried
+        # every tick until the symbol is flat, then applied.
+        self._pending_flat_overrides: dict = {}
 
         # LLM
         self.advisor = None
@@ -593,11 +600,57 @@ class WebSocketTradingEngine:
         self._halted = True
         return False
 
+    def _apply_runtime_overrides(self) -> None:
+        """Poll the ConfigStore and apply runtime parameter overrides."""
+        ov = self.config_store.poll()
+        if ov is not None:
+            # We got new overrides (could be empty dict if file deleted)
+            for k, v in ov.items():
+                cls = ConfigStore.classify(k)
+                if cls == "safe":
+                    # Apply immediately to cfg
+                    if hasattr(self.cfg, k):
+                        setattr(self.cfg, k, v)
+                    # Apply to risk/adaptive/playbooks
+                    if self.risk_manager is not None:
+                        self.risk_manager.apply_overrides({k: v})
+                    if self.adaptive_threshold is not None:
+                        self.adaptive_threshold.apply_overrides({k: v})
+                    if k.startswith("st2_") and self.playbook_st2 is not None:
+                        self.playbook_st2.apply_overrides({k: v})
+                    if k.startswith("mr_") and self.playbook_mr is not None:
+                        self.playbook_mr.apply_overrides({k: v})
+                elif cls == "flat_only":
+                    self._pending_flat_overrides[k] = v
+                elif cls == "restart":
+                    logger.warning("[ConfigStore] Ignored restart-only parameter override: %s", k)
+                else:
+                    logger.warning("[ConfigStore] Ignored unknown/unblessed parameter override: %s", k)
+
+        # Check if we are flat to drain flat-only overrides
+        if not self._pending_flat_overrides:
+            return
+
+        position = self.wallet.get_open_position(self.symbol)
+        if position is None:
+            # Flat! Apply all deferred overrides
+            logger.info("[ConfigStore] Symbol %s is flat — draining %d deferred flat-only overrides", self.symbol, len(self._pending_flat_overrides))
+            for k, v in self._pending_flat_overrides.items():
+                if hasattr(self.cfg, k):
+                    setattr(self.cfg, k, v)
+                if k.startswith("st2_") and self.playbook_st2 is not None:
+                    self.playbook_st2.apply_overrides({k: v})
+                if k.startswith("mr_") and self.playbook_mr is not None:
+                    self.playbook_mr.apply_overrides({k: v})
+            self._pending_flat_overrides = {}
+
     def _signal_tick(self):
         """Generate signals using REST data (runs every 5 min)."""
         if self._halted:
             logger.debug("[SIGNAL-TICK] %s is halted. Skipping.", self.symbol)
             return
+
+        self._apply_runtime_overrides()
 
         logger.info("--- Signal Tick: %s ---", self.symbol)
 
@@ -1245,6 +1298,26 @@ class WebSocketTradingEngine:
                     )
 
             except Exception as e:
+                # Distinguish a benign pre-fill venue REJECTION from an ambiguous
+                # mid-entry failure that could orphan a live position.
+                #
+                # A definitive 4xx order rejection (e.g. min-notional, bad params,
+                # insufficient balance) is raised by place_order BEFORE any fill is
+                # booked — no position exists, so halting all trading is wrong.
+                # Skip this tick and keep trading. Ambiguous failures (5xx /
+                # timeout / anything not provably pre-fill) still HALT + reconcile
+                # because the order MIGHT be live.
+                if self._is_benign_entry_rejection(e):
+                    logger.warning(
+                        "[ENTRY SKIP] %s — venue rejected order pre-fill (no position "
+                        "opened), skipping tick: %s", self.symbol, e,
+                    )
+                    if self.event_bus:
+                        from .events import SignalRejectedEvent
+                        self.event_bus.publish(SignalRejectedEvent(
+                            symbol=self.symbol, reason=f"venue_rejected: {e}",
+                        ))
+                    return
                 # An exception mid-entry could leave an unmanaged live position.
                 # Fail safe: HALT and trip the kill switch.
                 logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e, exc_info=True)
@@ -1260,6 +1333,21 @@ class WebSocketTradingEngine:
                 if self.event_bus:
                     from .events import SystemFailureEvent
                     self.event_bus.publish(SystemFailureEvent(component="entry", error=str(e)))
+
+    @staticmethod
+    def _is_benign_entry_rejection(exc: Exception) -> bool:
+        """True when *exc* is a definitive venue order rejection raised BEFORE any
+        fill could be booked — safe to skip without halting.
+
+        Only a CoinDCX 4xx (client/validation error: min-notional, bad params,
+        insufficient balance, etc.) qualifies. The CoinDCX client raises 429/5xx/
+        timeout on non-idempotent calls as 'ambiguous — reconcile against venue'
+        (status_code None or >=500), which must still trip the halt."""
+        from .exchanges.coindcx_client import CoinDCXError
+        if not isinstance(exc, CoinDCXError):
+            return False
+        sc = getattr(exc, "status_code", None)
+        return isinstance(sc, int) and 400 <= sc < 500 and sc != 429
 
     # StrategyRouter is lazily built on first use and cached.
     # Use build_legacy_router() to customise the regime → playbook map.
@@ -1564,6 +1652,28 @@ class WebSocketTradingEngine:
         if not lev_ok:
             logger.warning(f"[ENTRY BLOCKED] Leverage Tier: {lev_msg}")
             return
+
+        # Local Minimum Quantity and Notional Guard
+        exec_eng = getattr(self.wallet, "execution_engine", None)
+        if exec_eng and hasattr(exec_eng, "mapper"):
+            try:
+                spec = exec_eng.mapper.get_spec(self.symbol)
+                min_n = float(spec.min_notional)
+                min_q = float(spec.min_quantity)
+                if notional < min_n:
+                    logger.warning(
+                        f"[ENTRY BLOCKED] Calculated notional {notional:.2f} for {self.symbol} is below "
+                        f"venue minimum notional {min_n:.2f}"
+                    )
+                    return
+                if float(quantity) < min_q:
+                    logger.warning(
+                        f"[ENTRY BLOCKED] Calculated quantity {float(quantity):.6f} for {self.symbol} is below "
+                        f"venue minimum quantity {min_q:.6f}"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to fetch instrument spec for pre-entry validation: {e}")
 
         # Entry order style: maker-limit only when globally enabled AND the
         # winning playbook requested it (volx/sweep); otherwise market (default).

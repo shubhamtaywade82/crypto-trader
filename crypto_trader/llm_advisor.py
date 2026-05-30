@@ -595,12 +595,16 @@ class OllamaAdvisor:
         self._router = None
         try:
             from crypto_trader.ai.router import build_router
+            use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
+            local_h = (os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+                       if use_cloud else host)
+            local_m = os.getenv("OLLAMA_MODEL", "qwen3.5:4b") if use_cloud else model
             self._router = build_router(
-                cloud_host=os.getenv("CLOUD_OLLAMA_HOST", "https://api.ollama.com"),
-                cloud_model=os.getenv("CLOUD_OLLAMA_MODEL", "qwen3.5:cloud"),
+                cloud_host=os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com"),
+                cloud_model=os.getenv("CLOUD_OLLAMA_MODEL", "gpt-oss:20b"),
                 cloud_api_key=os.getenv("CLOUD_OLLAMA_API_KEY", ""),
-                local_host=host,
-                local_model=model,
+                local_host=local_h,
+                local_model=local_m,
                 local_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "1536")),
             )
             logger.info("[LLM] AI subsystem router initialized (cloud+local)")
@@ -854,7 +858,7 @@ def build_advisor(
     use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
     if use_cloud:
         resolved_host = os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
-        resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "deepseek-v3:cloud")
+        resolved_model = os.getenv("CLOUD_OLLAMA_MODEL", "gpt-oss:20b")
         resolved_key = os.getenv("CLOUD_OLLAMA_API_KEY", "")
         import logging; logging.getLogger("crypto_trader.llm_advisor").info("[LLM] Mode: CLOUD (Target: %s)", resolved_host)
     else:
