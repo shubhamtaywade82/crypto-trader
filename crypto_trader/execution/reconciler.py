@@ -83,6 +83,34 @@ class Reconciler:
     # ── comparison ───────────────────────────────────────────────────────────
     def _compare(self, snap: AccountSnapshot,
                  symbol: Optional[str] = None) -> List[ReconciliationMismatchEvent]:
+        # Sync leverage for the target symbol or all positions in the snapshot
+        if getattr(self.wallet, "live_execution", False) and self.engine:
+            if symbol:
+                if symbol in snap.positions:
+                    lev = snap.positions[symbol].get("leverage")
+                    if lev is not None:
+                        if not hasattr(self.wallet, "symbol_leverages"):
+                            self.wallet.symbol_leverages = {}
+                        self.wallet.symbol_leverages[symbol] = int(lev)
+                        if symbol == self.wallet.symbol:
+                            self.wallet.leverage = int(lev)
+                        if hasattr(self.engine, "leverage"):
+                            self.engine.leverage = int(lev)
+                else:
+                    if hasattr(self.wallet, "sync_leverage_from_venue"):
+                        self.wallet.sync_leverage_from_venue(symbol)
+            else:
+                for sym, pos_data in snap.positions.items():
+                    lev = pos_data.get("leverage")
+                    if lev is not None:
+                        if not hasattr(self.wallet, "symbol_leverages"):
+                            self.wallet.symbol_leverages = {}
+                        self.wallet.symbol_leverages[sym] = int(lev)
+                        if sym == self.wallet.symbol:
+                            self.wallet.leverage = int(lev)
+                if getattr(self.wallet, "symbol", None) and hasattr(self.wallet, "sync_leverage_from_venue"):
+                    self.wallet.sync_leverage_from_venue(self.wallet.symbol)
+
         internal = self._internal_positions()
         venue = snap.positions
 
@@ -192,7 +220,7 @@ class Reconciler:
     def _sync_protective_stops(self, venue: dict, open_ids: set, tracked_ids: set) -> List[ReconciliationMismatchEvent]:
         out: List[ReconciliationMismatchEvent] = []
         for sym, pos in self.wallet.positions.items():
-            if getattr(pos, "status", "") != "OPEN":
+            if getattr(pos, "status", "") != "OPEN" or getattr(pos, "mode", "paper") != "live":
                 continue
             protective = getattr(pos, "protective_orders", {}) or {}
             for oid in protective.values():
@@ -213,7 +241,7 @@ class Reconciler:
 
     def _cancel_orphan_orders(self, snap: AccountSnapshot, tracked_ids: set) -> List[ReconciliationMismatchEvent]:
         out: List[ReconciliationMismatchEvent] = []
-        internal_syms = {s for s, p in self.wallet.positions.items() if getattr(p, "status", "") == "OPEN"}
+        internal_syms = {s for s, p in self.wallet.positions.items() if getattr(p, "status", "") == "OPEN" and getattr(p, "mode", "paper") == "live"}
         for o in snap.open_orders:
             oid = str(o.get("exchange_order_id") or "")
             osym = o.get("symbol", "")
@@ -237,7 +265,7 @@ class Reconciler:
     def _internal_positions(self) -> dict:
         result = {}
         for sym, pos in self.wallet.positions.items():
-            if getattr(pos, "status", "") == "OPEN":
+            if getattr(pos, "status", "") == "OPEN" and getattr(pos, "mode", "paper") == "live":
                 result[sym] = {
                     "quantity": pos.remaining_quantity,
                     "side": pos.side.value,

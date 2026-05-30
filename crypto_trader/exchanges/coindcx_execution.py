@@ -382,6 +382,27 @@ class CoinDCXExecutionEngine:
             logger.warning("set_leverage failed: %s", e)
             return False
 
+    def fetch_symbol_leverage(self, symbol: str) -> Optional[int]:
+        """Fetches the configured leverage for the symbol from CoinDCX positions list."""
+        try:
+            resp = self.client.post_signed(EP_POSITIONS, {
+                "page": "1", "size": "100",
+                "margin_currency_short_name": self.read_margin_currencies,
+            })
+            spec = self.mapper.get_spec(symbol)
+            pair = spec.pair
+            for raw in _as_list(resp):
+                r_pair = raw.get("pair") or raw.get("symbol")
+                if r_pair == pair:
+                    # Sync margin_type to engine if present
+                    if raw.get("margin_type"):
+                        self.margin_type = str(raw["margin_type"]).upper()
+                    if raw.get("leverage") is not None:
+                        return int(float(raw["leverage"]))
+        except Exception as e:
+            logger.warning("fetch_symbol_leverage failed for %s: %s", symbol, e)
+        return None
+
     def get_order_status(self, order_id: str, symbol: Optional[str] = None) -> dict:
         """Resolve a single order's terminal status (G5).
 

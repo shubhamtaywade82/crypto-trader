@@ -94,11 +94,14 @@ class _Pos:
         self.remaining_quantity = Decimal(str(qty))
         self.side = PositionSide(side)
         self.entry_price = Decimal("100")
+        self.mode = "live"
 
 
 class _Wallet:
     def __init__(self, positions):
         self.positions = positions
+        self.live_execution = True
+        self.symbol = "SOLUSDT"
 
 
 class _VenueEngine:

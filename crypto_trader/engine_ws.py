@@ -1658,7 +1658,7 @@ class WebSocketTradingEngine:
                     bumped_notional = bumped_qty * entry_price_dec
                     # Affordability / pre-send veto: required margin must fit the
                     # margin still available after existing open positions.
-                    _lev_for_afford = self.cfg.leverage if self.cfg else 2
+                    _lev_for_afford = self.wallet.get_leverage(self.symbol) if getattr(self.wallet, "live_execution", False) else (self.cfg.leverage if self.cfg else 2)
                     required_margin = float(bumped_notional) / max(_lev_for_afford, 1)
                     margin_balance_now = float(self.wallet.margin_balance)
                     used_margin_now = sum(
@@ -1713,7 +1713,7 @@ class WebSocketTradingEngine:
             logger.warning(f"[ENTRY BLOCKED] Margin Utilization: {margin_msg}")
             return
 
-        leverage_val = self.cfg.leverage if self.cfg else 2
+        leverage_val = self.wallet.get_leverage(self.symbol) if getattr(self.wallet, "live_execution", False) else (self.cfg.leverage if self.cfg else 2)
         # Wallet uses mark-based margin: liq = entry / (1 ± 1/lev ∓ mmr)
         # This matches wallet._is_liquidation_required() so the entry gate
         # and the live liquidation check agree.

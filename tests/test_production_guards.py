@@ -206,6 +206,7 @@ def test_strict_reconcile_cancels_all_on_unresolved(monkeypatch, tmp_path):
 
     ns = f"test_{uuid.uuid4().hex}"
     wallet = EnhancedFuturesWallet(symbol="SOLUSDT", state_namespace=ns, leverage=1)
+    wallet.live_execution = True
     wallet.open_position("SOLUSDT", {
         "entry_price": "100", "side": PositionSide.LONG, "playbook": Playbook.INTRADAY,
         "sl_price": "90", "tp_price": "110",

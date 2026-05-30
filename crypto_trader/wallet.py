@@ -196,7 +196,7 @@ class PortfolioReducer:
                 OrderStateMachine.transition(state.orders[oid], OrderStatus.EXPIRED.value)
             return
 
-        if et == "POSITION_OPENED":
+        if et in ("POSITION_OPENED", "POSITION_ADOPTED"):
             symbol = payload.get("symbol")
             if symbol:
                 tp_levels = []
@@ -219,6 +219,7 @@ class PortfolioReducer:
                     "tp_levels": tp_levels,
                     "trailing_active": bool(payload.get("trailing_active", False)),
                     "protective_orders": {},
+                    "mode": payload.get("mode", "live" if et == "POSITION_ADOPTED" else "paper"),
                 }
             return
 
@@ -335,6 +336,7 @@ class EnhancedPosition:
     tds_paid: Decimal = Decimal("0")
     # Resting protective orders placed on the venue (F1): {"sl": id, "tp": id}.
     protective_orders: dict = field(default_factory=dict)
+    mode: str = "paper"
 
     def __post_init__(self):
         if self.highest_price is None:
@@ -401,6 +403,7 @@ class EnhancedPosition:
             "peak_pnl_pct": self.peak_pnl_pct,
             "tds_paid": self.tds_paid,
             "protective_orders": self.protective_orders,
+            "mode": self.mode,
         }
 
     @classmethod
@@ -461,6 +464,7 @@ class EnhancedFuturesWallet:
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
         self.leverage = leverage
+        self.symbol_leverages: Dict[str, int] = {}
         self.equity_utilization = equity_utilization
         self.catastrophic_sl_pct = catastrophic_sl_pct
         self.state_namespace = state_namespace or "default"
@@ -578,12 +582,44 @@ class EnhancedFuturesWallet:
                 return False, "No available balance"
             return True, "OK"
 
+    def get_leverage(self, symbol: str) -> int:
+        """Get leverage for a symbol, defaulting to the global leverage if not set."""
+        return self.symbol_leverages.get(symbol, self.leverage)
+
+    def set_symbol_leverage(self, symbol: str, leverage: int):
+        """Set leverage for a specific symbol."""
+        self.symbol_leverages[symbol] = leverage
+
+    def sync_leverage_from_venue(self, symbol: str):
+        """Syncs the wallet's leverage settings for the symbol from the execution engine."""
+        if not (self.live_execution and self.execution_engine):
+            return
+        
+        # Try to get leverage from the execution engine
+        try:
+            if hasattr(self.execution_engine, "fetch_symbol_leverage"):
+                venue_lev = self.execution_engine.fetch_symbol_leverage(symbol)
+                if venue_lev is not None:
+                    logger.info("[LEVERAGE] Synced %s leverage from venue: %d", symbol, venue_lev)
+                    self.symbol_leverages[symbol] = venue_lev
+                    # Also update the global self.leverage if this is the main symbol
+                    if symbol == self.symbol:
+                        self.leverage = venue_lev
+                    # Also ensure the execution engine has the same leverage value in self.leverage
+                    if hasattr(self.execution_engine, "leverage"):
+                        self.execution_engine.leverage = venue_lev
+                    return
+        except Exception as e:
+            logger.warning("[LEVERAGE] Failed to sync leverage for %s: %s", symbol, e)
+
     def attach_execution_engine(self, engine, live: bool = True):
         """Wire a live execution venue. When ``live`` is True, the orchestrator
         is expected to pass venue fills into open/close via ``external_fill``."""
         self.execution_engine = engine
         self.live_execution = bool(live)
         logger.info("Execution engine attached (live=%s)", self.live_execution)
+        if self.live_execution and self.execution_engine is not None and self.symbol:
+            self.sync_leverage_from_venue(self.symbol)
 
     def apply_external_fill(
         self,
@@ -906,6 +942,7 @@ class EnhancedFuturesWallet:
                 logger.info(f"[OPEN BLOCKED] {symbol}: {reason}")
                 return None
 
+            lev = self.get_leverage(symbol)
             margin = (self._to_decimal(custom_margin) if custom_margin is not None else self.available_balance * self._to_decimal(self.equity_utilization))
             if margin <= Decimal("0"):
                 return None
@@ -914,12 +951,12 @@ class EnhancedFuturesWallet:
             if custom_quantity is not None and self._to_decimal(custom_quantity) > Decimal("0"):
                 qty = self._to_decimal(custom_quantity)
                 notional = qty * entry
-                margin = notional / self.leverage
+                margin = notional / lev
                 if margin > self.available_balance:
                     logger.info(f"[OPEN BLOCKED] {symbol}: risk-sized margin exceeds available balance")
                     return None
             else:
-                notional = margin * self.leverage
+                notional = margin * lev
                 qty = notional / entry
 
             side = setup["side"]
@@ -979,11 +1016,12 @@ class EnhancedFuturesWallet:
                 remaining_quantity=qty,
                 notional=notional,
                 margin_used=margin,
-                leverage=self.leverage,
+                leverage=lev,
                 open_time=setup.get("candle_close_time", self._now_ms()),
                 sl_price=sl_price,
                 tp_levels=tp_levels,
                 time_stop_hours=setup.get("time_stop_hours", 18),
+                mode="live" if self.live_execution else "paper",
             )
             pos.update_pnl(mark_price)
             self._emit_event("FEE_CHARGED", {"amount": fee_open, "reason": "OPEN_FEE", "symbol": symbol})
@@ -1012,9 +1050,10 @@ class EnhancedFuturesWallet:
                     "fee": fee_open,
                     "playbook": playbook.value,
                     "sl_price": sl_price,
-                    "leverage": self.leverage,
+                    "leverage": lev,
                     "open_time": pos.open_time,
                     "tp_levels": tp_levels,
+                    "mode": pos.mode,
                 },
             )
             # F1: rest a protective SL (+optional TP) on the venue (live only).
@@ -1053,7 +1092,7 @@ class EnhancedFuturesWallet:
                 logger.error("[ADOPT] %s invalid qty/entry (%s/%s); refusing", symbol, qty, entry)
                 return None
 
-            lev = int(leverage or self.leverage)
+            lev = int(leverage or self.get_leverage(symbol))
             notional = qty * entry
             margin = notional / lev
             # Protective stop on the adverse side of entry.
@@ -1075,6 +1114,7 @@ class EnhancedFuturesWallet:
                 open_time=self._now_ms(),
                 sl_price=sl_price,
                 tp_levels=[],
+                mode="live",
             )
             if mark_price is not None and self._to_decimal(mark_price) > Decimal("0"):
                 pos.update_pnl(self._to_decimal(mark_price))
@@ -1101,6 +1141,7 @@ class EnhancedFuturesWallet:
                     "open_time": pos.open_time,
                     "tp_levels": [],
                     "adopted": True,
+                    "mode": "live",
                 },
             )
             # Rest a protective SL on the venue (live only) so the adopted
@@ -1800,13 +1841,14 @@ class EnhancedFuturesWallet:
                 existing.protective_orders = pdata.get("protective_orders", existing.protective_orders)
                 existing.notional = existing.remaining_quantity * existing.entry_price
                 existing.margin_used = existing.notional / existing.leverage
+                existing.mode = pdata.get("mode", existing.mode)
                 current[symbol] = existing
             else:
                 side = PositionSide(pdata.get("side", "LONG"))
                 playbook = Playbook(pdata.get("playbook", "INTRADAY"))
                 qty = pdata["quantity"]
                 entry = pdata["entry_price"]
-                lev = int(pdata.get("leverage", self.leverage))
+                lev = int(pdata.get("leverage", self.get_leverage(symbol)))
                 prior = self.positions.get(symbol)
                 prior_tp = prior.tp_levels if prior and prior.tp_levels else []
                 tp_levels = pdata.get("tp_levels", prior_tp)
@@ -1838,6 +1880,7 @@ class EnhancedFuturesWallet:
                     highest_price=self._to_decimal(pdata.get("highest_price", entry)),
                     peak_pnl_pct=self._to_decimal(pdata.get("peak_pnl_pct", Decimal("0"))),
                     protective_orders=dict(pdata.get("protective_orders", {})),
+                    mode=pdata.get("mode", "live" if self.live_execution else "paper"),
                 )
         self.positions = current
 

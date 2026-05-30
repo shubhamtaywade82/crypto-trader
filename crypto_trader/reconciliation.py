@@ -66,9 +66,27 @@ class ExchangeStateReconciler:
                 if p.get("symbol") == symbol:
                     ex_pos = p
                     break
+
+            # Sync leverage with local DB
+            if getattr(self.wallet, "live_execution", False) and self.execution_engine:
+                if ex_pos and "leverage" in ex_pos:
+                    venue_lev = int(ex_pos["leverage"])
+                    if not hasattr(self.wallet, "symbol_leverages"):
+                        self.wallet.symbol_leverages = {}
+                    self.wallet.symbol_leverages[symbol] = venue_lev
+                    if symbol == self.wallet.symbol:
+                        self.wallet.leverage = venue_lev
+                    if hasattr(self.execution_engine, "leverage"):
+                        self.execution_engine.leverage = venue_lev
+                    logger.info("[RECONCILIATION] Synced leverage for %s from active position: %d", symbol, venue_lev)
+                else:
+                    if hasattr(self.wallet, "sync_leverage_from_venue"):
+                        self.wallet.sync_leverage_from_venue(symbol)
                     
             # 2. Fetch Desired State (Local)
             local_pos = self.wallet.get_open_position(symbol)
+            if local_pos and getattr(local_pos, "mode", "paper") != "live":
+                local_pos = None
             
             # 3. Position Size Reconciliation
             ex_qty = Decimal(str(ex_pos.get("quantity", "0"))) if ex_pos else Decimal("0")
