@@ -541,7 +541,7 @@ class WebSocketTradingEngine:
 
     def _check_authoritative_health(self):
         """Monitor authoritative exchange metrics (margin ratio) and trigger kill switch if unsafe."""
-        if not self.cfg or not self.cfg.is_live:
+        if not self.cfg or not self.cfg.uses_exchange:
             return
 
         from .exchanges.coindcx_execution import CoinDCXExecutionEngine
@@ -2022,8 +2022,8 @@ class WebSocketTradingEngine:
                     pass
                 return False
 
-            # Apply: venue first (live), then per-symbol wallet so margin math agrees.
-            if self.cfg and self.cfg.is_live and exec_eng is not None and hasattr(exec_eng, "set_leverage"):
+            # Apply: venue first (sandbox/live), then per-symbol wallet so margin math agrees.
+            if self.cfg and self.cfg.uses_exchange and exec_eng is not None and hasattr(exec_eng, "set_leverage"):
                 try:
                     exec_eng.set_leverage(self.symbol, lev)
                 except Exception as e:
@@ -2257,12 +2257,12 @@ class WebSocketTradingEngine:
                     )
                     quantity = bumped_qty
             except Exception as e:
-                # In LIVE mode the venue enforces min-notional; without the spec we
-                # cannot guarantee a legal size, so sending the risk-based qty would
-                # just earn a guaranteed rejection (and churn). Skip the entry and
-                # let the next tick retry once the spec is fetchable. In paper mode
-                # there's no venue floor — fall back to the risk-based qty as-is.
-                if self.cfg and self.cfg.is_live:
+                # When talking to an exchange (sandbox/live) the venue enforces
+                # min-notional; without the spec we cannot guarantee a legal size,
+                # so sending the risk-based qty would just earn a rejection. Skip and
+                # retry on the next tick. In paper mode there's no venue floor — fall
+                # back to the risk-based qty as-is.
+                if self.cfg and self.cfg.uses_exchange:
                     logger.warning(
                         "[ENTRY SKIP] %s instrument spec unavailable in live mode "
                         "(%s); cannot verify min-notional, skipping tick", self.symbol, e,
@@ -2427,7 +2427,7 @@ class WebSocketTradingEngine:
         # via the setup flag. Market entries are unchanged.
         external_fill = None
         book_qty = quantity
-        if use_maker and self.cfg and self.cfg.is_live:
+        if use_maker and self.cfg and self.cfg.uses_exchange:
             external_fill = self.wallet.acquire_live_entry_fill(
                 self.symbol, setup["side"], quantity, Decimal(str(entry_price)),
                 timeout_s=self.cfg.maker_limit_timeout_s,

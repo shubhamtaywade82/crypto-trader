@@ -3018,24 +3018,14 @@ class ExecutionEngine(Protocol):
 
 
 class PaperExecutionEngine:
+    """Backward-compatible alias — new code should use PaperExecutor from
+    crypto_trader.execution.adapters.paper instead."""
+
     def __init__(self, wallet: EnhancedFuturesWallet):
+        from .execution.adapters.paper import PaperExecutor
+        self._impl = PaperExecutor(wallet)
         self.wallet = wallet
-        from .exchanges.instrument_mapper import InstrumentSpec
-        class MockMapper:
-            def get_spec(self, symbol: str) -> InstrumentSpec:
-                return InstrumentSpec(
-                    internal_symbol=symbol,
-                    pair=symbol,
-                    price_increment=Decimal("0.0001"),
-                    quantity_increment=Decimal("0.001"),
-                    min_quantity=Decimal("0.001"),
-                    min_notional=Decimal("6.0"),
-                    max_leverage=20,
-                    maker_fee_rate=0.0002,
-                    taker_fee_rate=0.0005,
-                    status="active",
-                )
-        self.mapper = MockMapper()
+        self.mapper = self._impl.mapper
 
     def place_order(
         self,
@@ -3049,32 +3039,21 @@ class PaperExecutionEngine:
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
         client_order_id: Optional[str] = None,
-        leverage: Optional[float] = None,  # accepted for API parity; paper has no venue leverage
+        leverage: Optional[float] = None,
     ) -> Order:
-        return self.wallet.place_pending_order(
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            order_type=order_type,
+        return self._impl.place_order(
+            symbol, side, quantity, order_type,
             trigger_price=trigger_price,
             limit_price=limit_price,
             reduce_only=reduce_only,
             expires_at=expires_at,
+            client_order_id=client_order_id,
+            leverage=leverage,
         )
 
     def cancel_order(self, order_id: str) -> bool:
-        return self.wallet.cancel_order(order_id)
+        return self._impl.cancel_order(order_id)
 
     def sync_positions(self) -> Dict[str, dict]:
-        with self.wallet.lock:
-            return {
-                s: {
-                    "symbol": p.symbol,
-                    "side": p.side.value,
-                    "quantity": p.remaining_quantity,
-                    "entry_price": p.entry_price,
-                }
-                for s, p in self.wallet.positions.items()
-                if p.status == "OPEN"
-            }
+        return self._impl.sync_positions()
 
