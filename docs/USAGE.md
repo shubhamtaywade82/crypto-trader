@@ -50,6 +50,14 @@ cd ui && npm install && npm run dev -- --port 3030
 
 Open http://localhost:3030 — toggle PAPER/LIVE, watch positions/orders/PnL + live event feed.
 
+### Running Detached (Survives Terminal Close)
+For background operations immune to terminal/SSH session termination, a setsid-based launcher is available:
+```bash
+./bin/start-detached                    # starts infra, API, and bot in background, logs to logs/
+./bin/stop                              # stops all detached bot and API processes
+```
+Logs are saved under `logs/api_YYYYMMDD_HHMMSS.log` and `logs/bot_YYYYMMDD_HHMMSS.log`. Symlinks `logs/api.latest.log` and `logs/bot.latest.log` point to the latest runs.
+
 ## Configuration (.env)
 
 | Var | Purpose |
@@ -64,6 +72,17 @@ Open http://localhost:3030 — toggle PAPER/LIVE, watch positions/orders/PnL + l
 | `PROJECTION_ENABLED` | write the SQL read-model the UI queries |
 | `MAX_LEVERAGE` / `MAX_DAILY_TRADES` / `MAX_ORDERS_PER_MINUTE` | risk caps |
 | `COINDCX_API_KEY` / `COINDCX_API_SECRET` | venue auth (live + account sync) |
+| `USE_DYNAMIC_LEVERAGE` | Enable context-aware dynamic leverage scaling (clamped by profile and venue) |
+| `DYNAMIC_LEVERAGE_MIN` | Minimum leverage floor (e.g., 5) |
+| `DYNAMIC_LEVERAGE_MAX` | Maximum leverage ceiling (e.g., 20) |
+| `DYNAMIC_LEVERAGE_VOL_ATR_PERIOD` | Period for ATR volatility calculation (default: 14) |
+| `DYNAMIC_LEVERAGE_HIGH_VOL_THRESHOLD` | ATR% threshold above which leverage is halved (default: 0.05) |
+| `DYNAMIC_LEVERAGE_EXTREME_VOL_THRESHOLD` | ATR% threshold above which trading is halted/0x leverage (default: 0.10) |
+| `DYNAMIC_LEVERAGE_DRAWDOWN_MODERATE` | Drawdown threshold where leverage starts scaling down (default: 0.05) |
+| `DYNAMIC_LEVERAGE_DRAWDOWN_SEVERE` | Drawdown threshold at which leverage drops to floor (default: 0.10) |
+| `DYNAMIC_LEVERAGE_MARGIN_MODERATE` | Margin ratio where leverage starts scaling down (default: 0.25) |
+| `DYNAMIC_LEVERAGE_MARGIN_HIGH` | Margin ratio at which leverage drops to floor (default: 0.50) |
+| `DYNAMIC_LEVERAGE_REGIME_BOOST` | Enable regime adjustments (e.g. Trend Expansion boosts, mean reversion cuts) |
 
 ### Going live — the triple gate (all required)
 
@@ -98,9 +117,33 @@ symbols; the wallet keys positions by symbol. Signals route by `Signal.symbol`.
 |-----------|--------|---------|
 | `MarginEngine` | `risk.py` | Blocks entries when margin utilization exceeds safe threshold (80%) or SL is too close to liquidation price. |
 | `LeverageEngine` | `risk.py` | Validates notional exposure against leverage tier limits; scales down max leverage in high-vol regimes via ATR. |
+| `DynamicLeverageManager` | `margin_engine.py` | Context-aware per-symbol leverage scaling based on volatility (ATR%), drawdown, margin ratio, and regime. |
+| `Close Flip-Guard` | `wallet.py` | Prevents opposite-side exits from opening opposite positions on CoinDCX due to lack of a native reduce-only flag. |
 | `OrderStateMachine` | `wallet.py` | Deterministic order lifecycle enforcement (`NEW` → `PENDING` → `FILLED`). Terminal states are immutable. |
 | `ExchangeStateReconciler` | `reconciliation.py` | Continuous exchange state consistency — detects phantom positions, orphaned orders, missing stops. |
 | `MRStateManager` | `strategies/mr_state.py` | Per-symbol mean-reversion restart recovery with atomic disk persistence. |
+
+## Deep Dive: Key Safety Enhancements
+
+### 1. Bidirectional Dynamic Leverage Scaling (`DynamicLeverageManager`)
+Dynamic leverage is scaled within `[DYNAMIC_LEVERAGE_MIN, DYNAMIC_LEVERAGE_MAX]` based on real-time factors:
+- **Volatility (ATR%):** ATR% above the extreme threshold (e.g., 10%) triggers a halt (0x leverage); above the high threshold (e.g., 5%) cuts leverage in half.
+- **Account Drawdown:** Moderate drawdown scales leverage down; severe drawdown drops leverage to the floor (`DYNAMIC_LEVERAGE_MIN`).
+- **Margin Ratio:** Moderate margin ratio scales leverage down; high margin ratio drops leverage to the floor.
+- **Regime Boosting:** Favorable market regimes (e.g., `TREND_EXPANSION`) boost leverage toward the ceiling, while adverse regimes (e.g., `MEAN_REVERSION`, `LOW_VOL_CHOP`) pull it toward the floor.
+- **Conviction:** Optional signal conviction multiplier scales the dynamic portion of leverage.
+
+### 2. Close Flip-Guard (CoinDCX Safety)
+CoinDCX has no native `reduce-only` parameter on futures orders. If an exit order is placed for a quantity that exceeds the actual position on the exchange (e.g., if a protective stop-loss, take-profit, or liquidation was already executed on-venue), the excess quantity would open an unintended opposite-side position.
+To protect capital, the wallet uses a **Close Flip-Guard**:
+- **Venue Read:** Calls `_venue_position_qty()` before executing any closing order to verify the exact quantity active on CoinDCX.
+- **Clamp Exit Quantity:** Clamps the exit order size to the actual venue quantity, preventing a crossover fill.
+- **Skip flat venue orders:** If the venue position is already flat (`0`), the engine skips placing the exit order on the exchange and simply marks the position as closed internally.
+
+### 3. User Stream Keepalive & Real-time Reconciliation
+To keep the WebSocket feed active and avoid silent drops, the system implements:
+- **Socket.IO Keepalive:** Sends a keepalive ping every 25 seconds on a daemon thread.
+- **Immediate Position Reconciliation:** In `engine_live.py`, streaming position update events from CoinDCX trigger immediate reconciliation via `_on_stream_position` if the venue and internal quantities or open status diverge, instantly resolving any blind windows.
 
 ## Manual E2E signal injection (testing)
 

@@ -16,15 +16,20 @@ The system employs multiple discrete safety engines rather than a monolithic log
 - **Responsibility:** Validates margin availability and liquidation distance.
 - **Rule:** Rejects entries if the margin utilization exceeds the threshold or if the Stop-Loss price is too close to the exchange Liquidation Price.
 
-### 3.2 Leverage Engine (G7)
-- **Responsibility:** Enforces dynamic leverage tier limits.
-- **Rule:** Validates notional exposure against pre-defined leverage brackets and scales down exposure in high-volatility regimes.
+### 3.2 Leverage Engine & Dynamic Leverage Manager (G7)
+- **Responsibility:** Enforces dynamic leverage tier limits and scales leverage based on real-time factors.
+- **Rules:**
+  - Scales leverage dynamically between `DYNAMIC_LEVERAGE_MIN` (default 5x) and `DYNAMIC_LEVERAGE_MAX` (default 20x) using the `DynamicLeverageManager`.
+  - Multiplicative Risk Scaling: Scales leverage down based on volatility (ATR%), account drawdown, and margin ratio.
+  - Volatility Halt: Halts trading (0x leverage) if ATR% exceeds extreme threshold.
+  - Drawdown Floor: Forces leverage to minimum floor under severe drawdown.
+  - Regime adjustment: Boosts leverage in favorable regimes (e.g., Trend Expansion) and cuts it in unfavorable ones (e.g., Mean Reversion, Chop).
 
 ### 3.3 Portfolio Risk Engine
 - **Responsibility:** Caps total system exposure.
 - **Rule:** `max_daily_trades`, `max_margin_ratio` (G4 - halt if > 80%), and global `max_drawdown_pct`.
 
-## 4. Hard Safety Mandates (G1-G9 & F1-F5)
+## 4. Hard Safety Mandates (G1-G10 & F1-F5)
 The system MUST adhere to the following strict operational guards:
 
 *   **G1 (Clock Skew):** Reject entries if local↔venue clock drift > 2000ms.
@@ -33,8 +38,9 @@ The system MUST adhere to the following strict operational guards:
 *   **G4 (Authoritative Health):** Halt instantly if CoinDCX `margin_ratio_cross` > 80%.
 *   **G5 & G9 (Exchange Consistency):** Mandatory sync of internal wallet vs. exchange state on startup and continuously during runtime. Orphaned orders or phantom positions trigger an automatic kill switch.
 *   **G6 (Margin Engine):** (See section 3.1)
-*   **G7 (Leverage Engine):** (See section 3.2)
+*   **G7 (Leverage Engine & Dynamic Leverage Manager):** (See section 3.2)
 *   **G8 (Order State Machine):** Enforce deterministic order lifecycle; terminal states (FILLED, CANCELLED, REJECTED) are immutable.
+*   **G10 (Close Flip-Guard):** Clamps order exit quantity to the actual venue-reported quantity, or skips order execution if the venue is already flat, preventing unintended opposite positions from opening on CoinDCX due to lack of a native reduce-only flag.
 
 ### 4.1 Feature-Specific Guards
 *   **F1 (Venue-Resident SL):** A resting STOP_MARKET order MUST be placed on the execution venue immediately after entry.

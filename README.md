@@ -87,6 +87,12 @@ pip install -r crypto_trader/requirements.txt
 ./bin/start --tick 60       # extra args forwarded to the bot
 ```
 
+Alternatively, to run the backend and trading bot in the background (survives SSH/terminal disconnection):
+```bash
+./bin/start-detached        # starts infra, API, and bot in background, logs to logs/
+./bin/stop                  # stops background bot and API processes
+```
+
 ### 4. Launch Dashboard UI (separate terminal)
 
 ```bash
@@ -143,7 +149,7 @@ Orders are blocked unless ALL hold: `LIVE_TRADING_ENABLED=true` **and** the exac
 
 ---
 
-## 🛡️ Hardened Safety (G1–G5 & F1–F5)
+## 🛡️ Hardened Safety (G1–G10 & F1–F5)
 
 Antigravity is built for capital preservation through multiple layers of defense:
 
@@ -151,13 +157,14 @@ Antigravity is built for capital preservation through multiple layers of defense
 
 - **G1 Clock Skew:** Warnings/Halts if local clock drifts from venue (>2000ms).
 - **G2 Velocity Breaker:** Limits order frequency (default: 6 orders/min).
-- **G3 Thread Supervisor:** Halts the engine if WebSocket or Position Manager threads die.
+- **G3 Thread Supervisor:** Halts the engine if WebSocket or Position threads die.
 - **G4 Authoritative Margin Guard:** Instant kill-switch if CoinDCX `margin_ratio_cross` exceeds config limit (default 80%).
 - **G5 Strict Reconciliation:** Reconciles real exchange positions against event-sourced wallet; optional cancel-all-on-desync behavior.
 - **G6 Margin Engine:** Dynamically validates margin utilization and strictly blocks entries if the stop-loss is placed too close to the liquidation threshold.
-- **G7 Leverage Engine:** Enforces dynamic max-notional leverage tiers, actively scaling down exposure limits during high volatility (ATR-based).
+- **G7 Leverage Engine & Dynamic Leverage Manager:** Enforces dynamic max-notional leverage tiers, actively scaling down exposure limits during high volatility (ATR-based) and scaling them back up in favorable regimes.
 - **G8 Deterministic Order State Machine:** Strictly enforces order lifecycle transitions (`NEW` → `PENDING` → `FILLED`/`CANCELLED`), eliminating async race conditions and phantom positions.
 - **G9 Exchange State Consistency Layer:** Continuously syncs the bot's desired state with the actual exchange state. Identifies and safely cleans up orphaned orders or actively recreates missing protective stops.
+- **G10 Close Flip-Guard:** Clamps order exit quantity to the actual venue-reported quantity, or skips order execution if the venue is already flat, preventing unintended opposite positions from opening on CoinDCX due to lack of a native reduce-only flag.
 
 ### Hardened Features (F)
 
@@ -165,7 +172,7 @@ Antigravity is built for capital preservation through multiple layers of defense
 - **F2 TDS Accounting:** Models the 1% Indian TDS on sell-legs for accurate equity curves.
 - **F3 Basis Guard:** Rejects entries if Binance/CoinDCX prices diverge beyond threshold.
 - **F4 Execution Degradation:** Realistic paper-trading model with spread penalties.
-- **F5 User Stream:** Real-time authoritative fill/balance reconciliation.
+- **F5 User Stream:** Real-time authoritative fill/balance/position reconciliation and connection ping-keepalives.
 
 ---
 
@@ -205,6 +212,8 @@ No engine code changes required beyond these three lines.
 | Script             | Purpose                                                                     |
 | :----------------- | :-------------------------------------------------------------------------- |
 | `./bin/start`      | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
+| `./bin/start-detached` | Runs the start sequence in background processes (survives terminal close).  |
+| `./bin/stop`       | Kills all running instances of the bot and API processes.                    |
 | `./bin/dev`        | Launches the backend stack (Infra + Consumer + API).                        |
 | `./bin/bot`        | Launches **only** the multi-symbol trading bot.                             |
 | `./bin/test_ui`    | Fires a burst of tiny test signals to verify the UI/API pipeline.           |
