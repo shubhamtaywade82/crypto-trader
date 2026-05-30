@@ -1,4 +1,5 @@
 # The Complete SMC Crypto Futures Trading Guide — Production Edition
+
 ## Intraday & Swing Strategies for $100 Capital on Binance / CoinDCX
 
 ---
@@ -108,11 +109,11 @@ The pipeline is designed as a **sequential filter chain**. Each stage must pass 
 
 **Stage 1 — HTF Bias (4H/Daily):** Establish directional bias by marking swing highs and lows on the 4-hour or daily chart. If the structure shows higher highs and higher lows, your bias is bullish. Only look for long setups on lower timeframes. This single filter eliminates approximately 50% of potential losing trades.
 
-**Stage 2 — Liquidity Sweep:** Identify the nearest SSL (for longs) or BSL (for shorts) on the 1-hour chart. Wait for price to actually violate the level with a wick and immediate rejection. The sweep should be visible as a brief spike beyond the level followed by a strong reversal candle closing back within the prior range.  [(Source)](https://www.youtube.com/shorts/XjCCcEZa-Sg) 
+**Stage 2 — Liquidity Sweep:** Identify the nearest SSL (for longs) or BSL (for shorts) on the 1-hour chart. Wait for price to actually violate the level with a wick and immediate rejection. The sweep should be visible as a brief spike beyond the level followed by a strong reversal candle closing back within the prior range.  [(Source)](https://www.youtube.com/shorts/XjCCcEZa-Sg)
 
 **Stage 3 — Displacement:** After the sweep, price must explode in the intended direction with strong momentum candles. The displacement should create a visible BOS or CHoCH on the 15-minute chart. Displacement candles should be significantly larger than preceding candles with minimal wicks in the direction of the move.
 
-**Stage 4 — Order Block:** Mark the last opposite-color candle before the displacement as your order block. The OB should be "fresh" — not previously tested or mitigated. A previously tested OB has already been used by institutions and has significantly lower probability of producing another move.  [(Source)](https://www.tradingview.com/script/QMvHkvdQ-SMC-Pro-BTC-ICT-Order-Blocks-FVG-DOE/) 
+**Stage 4 — Order Block:** Mark the last opposite-color candle before the displacement as your order block. The OB should be "fresh" — not previously tested or mitigated. A previously tested OB has already been used by institutions and has significantly lower probability of producing another move.  [(Source)](https://www.tradingview.com/script/QMvHkvdQ-SMC-Pro-BTC-ICT-Order-Blocks-FVG-DOE/)
 
 **Stage 5 — FVG Formation:** The displacement should leave behind a clear fair value gap between the high of the first candle and the low of the third candle (bullish) or the low of the first and high of the third (bearish). The FVG should overlap with the order block zone for maximum confluence.
 
@@ -214,11 +215,11 @@ The production entry model follows the same three-phase sequence as the original
 
 ![SMC Entry Model](smc_entry_model.png)
 
-**Phase 1: Liquidity Sweep + OI Context.** Price sweeps beyond a visible level (SSL for longs, BSL for shorts). Before classifying this as a valid sweep, check OI: if OI is rising into the sweep, the sweep is more likely to be a genuine stop-hunt with follow-through. If OI is flat or declining, the sweep may be a low-volume wick with no institutional backing.  [(Source)](https://www.youtube.com/shorts/XjCCcEZa-Sg) 
+**Phase 1: Liquidity Sweep + OI Context.** Price sweeps beyond a visible level (SSL for longs, BSL for shorts). Before classifying this as a valid sweep, check OI: if OI is rising into the sweep, the sweep is more likely to be a genuine stop-hunt with follow-through. If OI is flat or declining, the sweep may be a low-volume wick with no institutional backing.  [(Source)](https://www.youtube.com/shorts/XjCCcEZa-Sg)
 
 **Phase 2: Displacement + Volume Confirmation.** Price explodes in the intended direction with momentum candles. The displacement must show **volume 3x+ the 20-period average**. Without this volume spike, the displacement is likely a low-conviction move that will reverse. Check RVOL: if RVOL is above 1.2, the session has genuine activity supporting the move.
 
-**Phase 3: FVG Entry + Final Score Check.** Price retraces to the FVG zone. Before placing the limit order, run the full confidence score: HTF trend alignment (15%), sweep quality (15%), structure shift (15%), OB strength (12%), FVG quality (10%), OI expansion (12%), volume confirmation (10%), RVOL (8%), and liquidation context (3%). Only if the total is ≥70/100 do you execute.  [(Source)](https://acy.com/en/market-news/education/confirmation-model-ob-fvg-liquidity-sweep-j-o-20251112-094218/) 
+**Phase 3: FVG Entry + Final Score Check.** Price retraces to the FVG zone. Before placing the limit order, run the full confidence score: HTF trend alignment (15%), sweep quality (15%), structure shift (15%), OB strength (12%), FVG quality (10%), OI expansion (12%), volume confirmation (10%), RVOL (8%), and liquidation context (3%). Only if the total is ≥70/100 do you execute.  [(Source)](https://acy.com/en/market-news/education/confirmation-model-ob-fvg-liquidity-sweep-j-o-20251112-094218/)
 
 ---
 
@@ -392,7 +393,7 @@ Binance provides the data feeds required for all production filters. Key endpoin
 | **Funding Rate** | fundingRate | Funding cost monitoring | Every 8 hours |
 | **Order Book** | depth | Spread and liquidity check | Real-time |
 
-Enable **Isolated Margin** mode so each position's liquidation is contained. Set leverage to **5x** for standard trades, up to **8x for A+ setups only** (score 85+). Use **limit orders** for entries (0.02% maker fee vs 0.05% taker) and place them at the 50% FVG fill level.  [(Source)](https://www.binance.com/en/square/post/315246295349697) 
+Enable **Isolated Margin** mode so each position's liquidation is contained. Set leverage to **5x** for standard trades, up to **8x for A+ setups only** (score 85+). Use **limit orders** for entries (0.02% maker fee vs 0.05% taker) and place them at the 50% FVG fill level.  [(Source)](https://www.binance.com/en/square/post/315246295349697)
 
 ---
 
@@ -400,7 +401,7 @@ Enable **Isolated Margin** mode so each position's liquidation is contained. Set
 
 CoinDCX offers INR deposits via UPI and operates under FIU-India compliance.  [(Source)](https://www.binance.com/en/square/post/305254282796706)  Key considerations: fees are 0.07% taker (vs Binance's 0.05%), and liquidity during volatile periods may show 0.5-1.5% slippage. Trade only BTC and ETH perpetuals where liquidity is deepest. Use limit orders exclusively to minimize fees and slippage.
 
-All crypto futures profits in India are taxed at a flat **30%** under Section 115BBH. Losses cannot be offset against other income. Maintain detailed P&L records for annual filing.  [(Source)](https://coinswitch.co/switch/crypto-futures-derivatives/crypto-futures/) 
+All crypto futures profits in India are taxed at a flat **30%** under Section 115BBH. Losses cannot be offset against other income. Maintain detailed P&L records for annual filing.  [(Source)](https://coinswitch.co/switch/crypto-futures-derivatives/crypto-futures/)
 
 ---
 
