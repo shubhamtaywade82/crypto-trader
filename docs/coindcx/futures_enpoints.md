@@ -2,7 +2,7 @@
 
 ## Glossary
 
-```
+```plain
 e - is the Event type
 p - price (LTP)
 q - quantity (trade quantity)

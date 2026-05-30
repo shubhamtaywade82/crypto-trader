@@ -261,7 +261,14 @@ class CoinDCXExecutionEngine:
         return balances
 
     def get_cross_margin_details(self) -> Optional[dict]:
-        """Fetch full cross-margin account details (pnl, margin_ratio, equity, etc)."""
+        """Fetch full cross-margin account details (pnl, margin_ratio, equity, etc).
+
+        Only applicable to USDT-cross accounts.  For INR-margined accounts CoinDCX
+        returns an empty dict, so we short-circuit to avoid wasting API quota and
+        generating transient-timeout noise in the logs.
+        """
+        if self.margin_currency != "USDT":
+            return None
         try:
             res = self.client.get_signed(EP_CROSS_MARGIN, {})
             if isinstance(res, dict):
