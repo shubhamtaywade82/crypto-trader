@@ -1686,8 +1686,17 @@ class WebSocketTradingEngine:
                     )
                     quantity = bumped_qty
             except Exception as e:
-                # Paper mode / no CoinDCX mapper / spec fetch failure → fall back
-                # to the risk-based qty as-is. Don't crash.
+                # In LIVE mode the venue enforces min-notional; without the spec we
+                # cannot guarantee a legal size, so sending the risk-based qty would
+                # just earn a guaranteed rejection (and churn). Skip the entry and
+                # let the next tick retry once the spec is fetchable. In paper mode
+                # there's no venue floor — fall back to the risk-based qty as-is.
+                if self.cfg and self.cfg.is_live:
+                    logger.warning(
+                        "[ENTRY SKIP] %s instrument spec unavailable in live mode "
+                        "(%s); cannot verify min-notional, skipping tick", self.symbol, e,
+                    )
+                    return
                 logger.warning(f"Failed to fetch instrument spec for pre-entry validation: {e}")
 
         # After any bump, a still-non-positive qty means we could not size a

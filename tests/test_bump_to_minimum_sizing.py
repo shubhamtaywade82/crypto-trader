@@ -264,3 +264,57 @@ def test_no_mapper_fallback_uses_risk_based_qty(monkeypatch, tmp_path):
     stop = abs(entry - Decimal(str(captured["sl"])))
     expected = (Decimal("10000") * Decimal("0.005") * (Decimal("1") / 4)) / stop
     assert bumped == pytest.approx(expected, rel=1e-9)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Spec-fetch failure: LIVE skips (can't verify min-notional), PAPER falls back
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _RaisingMapper:
+    def get_spec(self, symbol, *a, **kw):
+        raise RuntimeError("instrument endpoint unavailable")
+
+
+class _RaisingExecEngine:
+    def __init__(self):
+        self.mapper = _RaisingMapper()
+
+
+def test_spec_unavailable_in_live_skips_entry(monkeypatch, tmp_path):
+    """Live: without the spec we can't guarantee a venue-legal size, so sending
+    the risk-based qty would just earn a 612-INR rejection. Skip the tick."""
+    from crypto_trader.config import TradingMode
+    _isolate(monkeypatch, tmp_path)
+    cfg = TradingConfig(basis_guard_enabled=False, mode=TradingMode.LIVE)
+    assert cfg.is_live
+    wallet = _fresh_wallet("BTCUSDT")
+    wallet.wallet_balance = Decimal("10000")
+    wallet.execution_engine = _RaisingExecEngine()
+
+    eng = _build_engine(cfg, "BTCUSDT", n_symbols=4, wallet=wallet)
+    eng.ws_feed = _FakeWS(100.0)
+
+    captured = {}
+    _capture_open(monkeypatch, wallet, captured)
+    _run_entry(eng)
+
+    assert "qty" not in captured, "live entry must be skipped when spec is unverifiable"
+
+
+def test_spec_unavailable_in_paper_falls_back(monkeypatch, tmp_path):
+    """Paper: no venue floor — fall back to the risk-based qty (don't skip)."""
+    _isolate(monkeypatch, tmp_path)
+    cfg = TradingConfig(basis_guard_enabled=False)  # default PAPER
+    assert not cfg.is_live
+    wallet = _fresh_wallet("BTCUSDT")
+    wallet.wallet_balance = Decimal("10000")
+    wallet.execution_engine = _RaisingExecEngine()
+
+    eng = _build_engine(cfg, "BTCUSDT", n_symbols=4, wallet=wallet)
+    eng.ws_feed = _FakeWS(100.0)
+
+    captured = {}
+    _capture_open(monkeypatch, wallet, captured)
+    _run_entry(eng)
+
+    assert "qty" in captured, "paper entry should fall back to the risk-based order"
