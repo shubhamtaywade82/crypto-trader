@@ -272,11 +272,11 @@ class TestLeverageDefaults:
         cfg = TradingConfig()
         assert cfg.max_leverage == 3
 
-    def test_hard_cap_leverage_is_5_in_margin_engine(self):
-        """LeverageEngine hard cap must remain at 5x."""
+    def test_hard_cap_leverage_is_20_in_margin_engine(self):
+        """LeverageEngine hard cap raised to 20x (5x–20x range allowed)."""
         from crypto_trader.margin_engine import LeverageEngine
         le = LeverageEngine()
-        assert le.hard_max_leverage == 5
+        assert le.hard_max_leverage == 20
 
 
 # ─────────────────────────────────────────────────────────────────────────────

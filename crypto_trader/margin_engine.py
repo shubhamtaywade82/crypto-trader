@@ -87,7 +87,7 @@ class LeverageEngine:
     - effective portfolio leverage tracking.
     - volatility-adjusted leverage scaling.
     """
-    def __init__(self, default_leverage: int = 2, hard_max_leverage: int = 5):
+    def __init__(self, default_leverage: int = 2, hard_max_leverage: int = 20):
         self.default_leverage = default_leverage
         self.hard_max_leverage = hard_max_leverage
 
@@ -154,8 +154,8 @@ class DynamicLeverageManager:
     def __init__(self, cfg=None):
         self.cfg = cfg
         # Defaults when no cfg is provided (tests / standalone usage)
-        self.min_leverage = getattr(cfg, "dynamic_leverage_min", 1) if cfg else 1
-        self.max_leverage = getattr(cfg, "dynamic_leverage_max", 5) if cfg else 5
+        self.min_leverage = getattr(cfg, "dynamic_leverage_min", 5) if cfg else 5
+        self.max_leverage = getattr(cfg, "dynamic_leverage_max", 20) if cfg else 20
         self.vol_atr_period = getattr(cfg, "dynamic_leverage_vol_atr_period", 14) if cfg else 14
         self.high_vol_threshold = getattr(cfg, "dynamic_leverage_high_vol_threshold", 0.05) if cfg else 0.05
         self.extreme_vol_threshold = getattr(cfg, "dynamic_leverage_extreme_vol_threshold", 0.10) if cfg else 0.10

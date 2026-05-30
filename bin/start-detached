@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Detached launcher: same processes as bin/start but immune to terminal close.
+# Uses setsid so the API + bot get their own session (no controlling tty), so
+# closing the terminal / dropping SSH cannot SIGHUP-kill a live position.
+# Logs to timestamped files under logs/. Forwards extra args to the bot.
+#
+#   ./bin/start-detached --tick 60
+#
+# Stop with:  ./bin/stop   (or pkill -f 'crypto_trader.multi_engine')
+set -e
+cd "$(dirname "$0")/.."
+
+# Load .env so MODE / creds / DB are present in the detached session.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+export DATABASE_URL=${DATABASE_URL:-"postgresql://trader:trader@localhost:5435/crypto_trader"}
+export REDIS_URL=${REDIS_URL:-"redis://localhost:6382/0"}
+export MODE=${MODE:-"paper"}
+export PROJECTION_ENABLED=${PROJECTION_ENABLED:-"true"}
+export MAX_MARGIN_RATIO=${MAX_MARGIN_RATIO:-"0.80"}
+
+mkdir -p logs
+TS=$(date +%Y%m%d_%H%M%S)
+API_LOG="logs/api_${TS}.log"
+BOT_LOG="logs/bot_${TS}.log"
+
+echo "--- Infrastructure (Postgres, Redis) ---"
+docker compose up -d postgres redis >/dev/null 2>&1 || true
+
+echo "--- Cleaning any existing bot/api processes ---"
+pkill -f "python3 -m crypto_trader.multi_engine" || true
+pkill -f "python3 -m crypto_trader.api_service" || true
+sleep 2
+
+echo "--- Dashboard API (detached) on :8088 -> ${API_LOG} ---"
+setsid python3 -m crypto_trader.api_service --port 8088 >"${API_LOG}" 2>&1 < /dev/null &
+echo "    API PID: $!"
+
+echo "--- Trading bot (detached, MODE=${MODE}) -> ${BOT_LOG} ---"
+setsid python3 -m crypto_trader.multi_engine "$@" >"${BOT_LOG}" 2>&1 < /dev/null &
+echo "    BOT PID: $!"
+
+# Symlink 'latest' for convenience
+ln -sf "$(basename "${API_LOG}")" logs/api.latest.log
+ln -sf "$(basename "${BOT_LOG}")" logs/bot.latest.log
+
+sleep 2
+echo ""
+echo "===================================================="
+echo "  Detached | MODE=${MODE}"
+echo "  Bot log:  tail -f ${BOT_LOG}   (or logs/bot.latest.log)"
+echo "  API log:  tail -f ${API_LOG}"
+echo "  Survives terminal close (setsid, own session)."
+echo "===================================================="
