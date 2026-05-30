@@ -105,11 +105,19 @@ class MockWSFeed:
 
 
 def test_websocket_trading_engine_min_notional_guard():
-    """Verify that WebSocketTradingEngine._execute_entry checks min_notional/min_qty locally."""
+    """Verify that WebSocketTradingEngine._execute_entry BUMPS a sub-notional
+    risk-based size up to the venue minimum (instead of skipping) when margin
+    allows. Risk-based qty 0.04 (notional $2.00 < $6.00 min) must be bumped to
+    a venue-legal qty whose notional >= min_notional and qty >= min_quantity,
+    rounded UP to the quantity increment, and that bumped qty must reach
+    open_position."""
     wallet = MagicMock(spec=EnhancedFuturesWallet)
     wallet.margin_balance = Decimal("100.0")
     wallet.positions = {}
-    
+    wallet.leverage = 5
+    wallet.maintenance_margin_ratio = 0.005
+    wallet.open_position.return_value = None
+
     execution_engine = MagicMock()
     spec = InstrumentSpec(
         internal_symbol="SOLUSDT",
@@ -185,6 +193,14 @@ def test_websocket_trading_engine_min_notional_guard():
     )
     
     engine._execute_entry(ctx)
-    
-    # Decoupled signal publisher should not be called, and wallet.open_position should not be called.
-    wallet.open_position.assert_not_called()
+
+    # Bump-to-minimum: notional $2.00 < $6.00 → bump up. Smallest qty satisfying
+    # both min_notional ($6.0 / $50 = 0.12) and min_quantity (0.01), rounded up
+    # to the 0.01 increment, is 0.12. Margin to afford it = 6.0 / 5 = 1.2 < 100,
+    # so the bumped order is placed (not skipped).
+    wallet.open_position.assert_called_once()
+    _, kwargs = wallet.open_position.call_args
+    bumped = Decimal(str(kwargs["custom_quantity"]))
+    assert bumped == Decimal("0.12")
+    assert bumped * Decimal("50.0") >= spec.min_notional
+    assert bumped >= spec.min_quantity

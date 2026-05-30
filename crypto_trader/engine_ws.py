@@ -18,7 +18,7 @@ import uuid
 import logging
 import argparse
 from dataclasses import dataclass, field as dc_field
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -1611,6 +1611,87 @@ class WebSocketTradingEngine:
 
         trade_id = str(uuid.uuid4())[:8]
 
+        # Without a stop we cannot size at all → hard skip (covers the
+        # quantity<=0-because-stop_distance==0 case). A tiny risk_budget that
+        # yields qty<=0 with a VALID stop is handled by the bump-to-minimum
+        # logic below, not skipped here.
+        if stop_distance_dec <= 0:
+            logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
+            return
+
+        # ── Bump-to-minimum sizing ───────────────────────────────────────────
+        # On a tiny account, risk-based sizing (risk_per_trade_pct × 1/N) can
+        # produce a notional below CoinDCX's venue minimum (or a quantity that
+        # rounds to ~0), so the order would be rejected outright. Per operator
+        # decision: bump such orders UP to the smallest venue-legal size when
+        # margin allows (accepting >target risk on this trade), and skip cleanly
+        # if even that minimum can't be afforded. The bumped quantity is computed
+        # HERE so it flows into the margin/liq/leverage validations below AND into
+        # downstream order placement (no validate-one/place-another mismatch).
+        entry_price_dec = Decimal(str(entry_price))
+        exec_eng = getattr(self.wallet, "execution_engine", None)
+        if exec_eng is not None and hasattr(exec_eng, "mapper"):
+            try:
+                spec = exec_eng.mapper.get_spec(self.symbol)
+                min_n = Decimal(str(spec.min_notional))
+                min_q = Decimal(str(spec.min_quantity))
+                cur_notional = quantity * entry_price_dec
+                if quantity < min_q or cur_notional < min_n:
+                    # Smallest qty satisfying BOTH min_notional and min_quantity,
+                    # rounded UP to the venue quantity increment (never down — a
+                    # round-down could drop us back below the minimum).
+                    q_for_notional = (
+                        (min_n / entry_price_dec) if entry_price_dec > 0 else min_q
+                    )
+                    target_qty = max(q_for_notional, min_q)
+                    inc = Decimal(str(spec.quantity_increment))
+                    if inc > 0:
+                        steps = (target_qty / inc).to_integral_value(rounding=ROUND_UP)
+                        bumped_qty = steps * inc
+                    else:
+                        bumped_qty = target_qty
+                    # Guard against float-rounding leaving us a hair below either
+                    # minimum after increment rounding.
+                    while bumped_qty < min_q or (bumped_qty * entry_price_dec) < min_n:
+                        bumped_qty += inc if inc > 0 else (min_q - bumped_qty)
+
+                    bumped_notional = bumped_qty * entry_price_dec
+                    # Affordability / pre-send veto: required margin must fit the
+                    # margin still available after existing open positions.
+                    _lev_for_afford = self.cfg.leverage if self.cfg else 2
+                    required_margin = float(bumped_notional) / max(_lev_for_afford, 1)
+                    margin_balance_now = float(self.wallet.margin_balance)
+                    used_margin_now = sum(
+                        float(p.margin_used) for p in self.wallet.positions.values()
+                        if p.status == "OPEN"
+                    )
+                    available_margin = margin_balance_now - used_margin_now
+                    if required_margin > available_margin:
+                        logger.warning(
+                            "[ENTRY SKIP] %s cannot afford venue minimum notional "
+                            "(need ~$%.2f margin, have $%.2f); skipping",
+                            self.symbol, required_margin, available_margin,
+                        )
+                        return
+
+                    # Risk now exceeds the configured cap — operator MUST see this.
+                    risk_now = (bumped_qty * stop_distance_dec) / self.wallet.margin_balance \
+                        if self.wallet.margin_balance > 0 else Decimal("0")
+                    logger.warning(
+                        "[SIZING BUMP] %s risk-based notional $%.2f below venue min $%.2f "
+                        "— bumping qty %s→%s (risk now ~%.3f%% of equity, exceeds target %.3f%%)",
+                        self.symbol, float(cur_notional), float(min_n),
+                        f"{float(quantity):.8f}", f"{float(bumped_qty):.8f}",
+                        float(risk_now) * 100.0, float(_risk_pct) * 100.0,
+                    )
+                    quantity = bumped_qty
+            except Exception as e:
+                # Paper mode / no CoinDCX mapper / spec fetch failure → fall back
+                # to the risk-based qty as-is. Don't crash.
+                logger.warning(f"Failed to fetch instrument spec for pre-entry validation: {e}")
+
+        # After any bump, a still-non-positive qty means we could not size a
+        # legal order (e.g. no mapper AND tiny risk_budget) → skip.
         if quantity <= 0:
             logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
             return
@@ -1653,27 +1734,9 @@ class WebSocketTradingEngine:
             logger.warning(f"[ENTRY BLOCKED] Leverage Tier: {lev_msg}")
             return
 
-        # Local Minimum Quantity and Notional Guard
-        exec_eng = getattr(self.wallet, "execution_engine", None)
-        if exec_eng and hasattr(exec_eng, "mapper"):
-            try:
-                spec = exec_eng.mapper.get_spec(self.symbol)
-                min_n = float(spec.min_notional)
-                min_q = float(spec.min_quantity)
-                if notional < min_n:
-                    logger.warning(
-                        f"[ENTRY BLOCKED] Calculated notional {notional:.2f} for {self.symbol} is below "
-                        f"venue minimum notional {min_n:.2f}"
-                    )
-                    return
-                if float(quantity) < min_q:
-                    logger.warning(
-                        f"[ENTRY BLOCKED] Calculated quantity {float(quantity):.6f} for {self.symbol} is below "
-                        f"venue minimum quantity {min_q:.6f}"
-                    )
-                    return
-            except Exception as e:
-                logger.warning(f"Failed to fetch instrument spec for pre-entry validation: {e}")
+        # (Venue min-notional / min-quantity is enforced earlier via
+        # bump-to-minimum, so the qty reaching the margin/liq/leverage checks
+        # above and the placement below is already venue-legal.)
 
         # Entry order style: maker-limit only when globally enabled AND the
         # winning playbook requested it (volx/sweep); otherwise market (default).
