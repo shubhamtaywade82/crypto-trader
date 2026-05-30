@@ -165,6 +165,18 @@ class DynamicLeverageManager:
         self.margin_moderate = getattr(cfg, "dynamic_leverage_margin_moderate", 0.25) if cfg else 0.25
         self.regime_boost = getattr(cfg, "dynamic_leverage_regime_boost", True) if cfg else True
 
+    # Regime favourability factor (0 = stay at floor, 1 = full headroom).
+    _REGIME_FACTOR = {
+        "TREND_EXPANSION": 1.00,
+        "BREAKOUT_ENVIRONMENT": 0.85,
+        "ACCUMULATION": 0.50,
+        "MEAN_REVERSION": 0.25,
+        "LOW_VOL_CHOP": 0.20,
+        "DEAD_MARKET": 0.0,
+        "LIQUIDATION_EVENT": 0.0,
+        "HIGH_RISK_CHAOS": 0.0,
+    }
+
     def compute(
         self,
         symbol: str,
@@ -174,63 +186,73 @@ class DynamicLeverageManager:
         drawdown: float = 0.0,
         margin_ratio: float = 0.0,
         regime: Optional[str] = None,
+        conviction: Optional[float] = None,
     ) -> int:
-        """Return the dynamically scaled leverage for ``symbol``.  0 = halt trading."""
-        hard_max = venue_max_leverage or self.max_leverage
-        lev = min(base_leverage, hard_max)
+        """Bidirectional dynamic leverage in [min_leverage, max_leverage].
 
-        # 1. Volatility scaling
+        Starts at the FLOOR (min_leverage, e.g. 5x) and climbs toward the ceiling
+        (min(max_leverage, venue cap), e.g. 20x) only when conditions are
+        favourable — low volatility, strong trending regime, a healthy account,
+        and (optionally) high signal conviction. Any single risk factor pulls it
+        back toward the floor (factors are multiplicative). Returns 0 to halt on
+        extreme volatility or a no-trade regime.
+
+        ``base_leverage`` is treated as an additional upper clamp (the configured
+        MAX_LEVERAGE ceiling); it no longer acts as the default operating point.
+        ``conviction`` (0..1, e.g. LLM/technical confidence) is optional; when
+        None it does not influence the result.
+        """
+        ceiling = min(self.max_leverage, base_leverage or self.max_leverage)
+        if venue_max_leverage:
+            ceiling = min(ceiling, venue_max_leverage)
+        floor = min(self.min_leverage, ceiling)
+        span = max(0, ceiling - floor)
+        if span == 0:
+            return ceiling
+
+        # Hard halts.
         if atr_pct >= self.extreme_vol_threshold:
-            logger.warning(
-                "[DYNAMIC-LEVERAGE] %s ATR%% %.2f%% >= extreme %.2f%% → leverage 0",
-                symbol, atr_pct * 100, self.extreme_vol_threshold * 100,
-            )
+            logger.warning("[DYNAMIC-LEVERAGE] %s ATR%% %.2f%% >= extreme %.2f%% → 0 (halt)",
+                           symbol, atr_pct * 100, self.extreme_vol_threshold * 100)
             return 0
-        elif atr_pct >= self.high_vol_threshold:
-            lev = max(self.min_leverage, lev // 2)
-            logger.info(
-                "[DYNAMIC-LEVERAGE] %s ATR%% %.2f%% >= high %.2f%% → scaled to %dx",
-                symbol, atr_pct * 100, self.high_vol_threshold * 100, lev,
-            )
+        regime_up = (regime or "").upper()
+        regime_factor = self._REGIME_FACTOR.get(regime_up, 0.5)  # unknown → neutral
+        if regime_up in ("DEAD_MARKET", "LIQUIDATION_EVENT", "HIGH_RISK_CHAOS"):
+            logger.warning("[DYNAMIC-LEVERAGE] %s regime %s → 0 (halt)", symbol, regime)
+            return 0
 
-        # 2. Drawdown scaling
-        if drawdown >= self.dd_severe:
-            lev = max(self.min_leverage, lev // 2)
-            logger.info(
-                "[DYNAMIC-LEVERAGE] %s drawdown %.2f%% >= severe %.2f%% → scaled to %dx",
-                symbol, drawdown * 100, self.dd_severe * 100, lev,
-            )
-        elif drawdown >= self.dd_moderate:
-            lev = max(self.min_leverage, int(lev * 0.7))
-            logger.info(
-                "[DYNAMIC-LEVERAGE] %s drawdown %.2f%% >= moderate %.2f%% → scaled to %dx",
-                symbol, drawdown * 100, self.dd_moderate * 100, lev,
-            )
+        # Favourability factors, each in [0,1]; 1 = full headroom toward ceiling.
+        # Volatility: full headroom below high threshold, 0 at extreme (linear).
+        if atr_pct <= self.high_vol_threshold:
+            vol_factor = 1.0
+        else:
+            vol_factor = max(0.0, 1.0 - (atr_pct - self.high_vol_threshold)
+                             / max(1e-9, self.extreme_vol_threshold - self.high_vol_threshold))
 
-        # 3. Margin ratio scaling
-        if margin_ratio >= self.margin_high:
-            lev = max(self.min_leverage, lev // 2)
-            logger.info(
-                "[DYNAMIC-LEVERAGE] %s margin_ratio %.2f%% >= high %.2f%% → scaled to %dx",
-                symbol, margin_ratio * 100, self.margin_high * 100, lev,
-            )
-        elif margin_ratio >= self.margin_moderate:
-            lev = max(self.min_leverage, int(lev * 0.75))
-            logger.info(
-                "[DYNAMIC-LEVERAGE] %s margin_ratio %.2f%% >= moderate %.2f%% → scaled to %dx",
-                symbol, margin_ratio * 100, self.margin_moderate * 100, lev,
-            )
+        # Account health: drawdown.
+        if drawdown <= self.dd_moderate:
+            dd_factor = 1.0
+        elif drawdown >= self.dd_severe:
+            dd_factor = 0.0
+        else:
+            dd_factor = 1.0 - (drawdown - self.dd_moderate) / max(1e-9, self.dd_severe - self.dd_moderate)
 
-        # 4. Regime adjustments
-        if self.regime_boost and regime:
-            regime_up = regime.upper()
-            if regime_up in ("TREND_EXPANSION", "BREAKOUT_ENVIRONMENT"):
-                lev = min(lev + 1, hard_max)
-                logger.info("[DYNAMIC-LEVERAGE] %s regime %s → boost to %dx", symbol, regime, lev)
-            elif regime_up in ("LOW_VOL_CHOP", "MEAN_REVERSION", "DEAD_MARKET"):
-                lev = max(self.min_leverage, lev - 1)
-                logger.info("[DYNAMIC-LEVERAGE] %s regime %s → reduce to %dx", symbol, regime, lev)
+        # Account health: margin utilization.
+        if margin_ratio <= self.margin_moderate:
+            mr_factor = 1.0
+        elif margin_ratio >= self.margin_high:
+            mr_factor = 0.0
+        else:
+            mr_factor = 1.0 - (margin_ratio - self.margin_moderate) / max(1e-9, self.margin_high - self.margin_moderate)
 
-        # 5. Final clamp
-        lev = max(self.min_leverage, min(lev, hard_max, self.max_leverage))
+        conv_factor = 1.0 if conviction is None else max(0.0, min(1.0, float(conviction)))
+
+        # Multiplicative: lever up only when ALL conditions are favourable.
+        score = vol_factor * regime_factor * dd_factor * mr_factor * conv_factor
+        lev = int(round(floor + score * span))
+        lev = max(floor, min(lev, ceiling))
+        logger.info(
+            "[DYNAMIC-LEVERAGE] %s → %dx (floor=%d ceil=%d score=%.2f | vol=%.2f regime=%.2f dd=%.2f mr=%.2f conv=%.2f)",
+            symbol, lev, floor, ceiling, score, vol_factor, regime_factor, dd_factor, mr_factor, conv_factor,
+        )
         return lev

@@ -39,30 +39,89 @@ def test_config_env_enables_dynamic(monkeypatch):
 
 # ── band math ────────────────────────────────────────────────────────────────
 
-def test_band_clamped_5_to_20():
+def test_band_floor_and_ceiling():
     m = DynamicLeverageManager()
     assert m.min_leverage == 5 and m.max_leverage == 20
-    # base above band → clamped to 20
-    assert m.compute("S", base_leverage=50, venue_max_leverage=20) == 20
-    # quiet trend → boost but never below 5 / above 20
-    lev = m.compute("S", base_leverage=10, venue_max_leverage=20, regime="TREND_EXPANSION")
-    assert 5 <= lev <= 20 and lev == 11
+    # all conditions favourable (low vol, strong trend, healthy) → climbs to ceiling 20
+    top = m.compute("S", base_leverage=20, venue_max_leverage=20,
+                    atr_pct=0.0, drawdown=0.0, margin_ratio=0.0, regime="TREND_EXPANSION")
+    assert top == 20
+    # everything in band
+    assert 5 <= m.compute("S", base_leverage=20, venue_max_leverage=20, regime="ACCUMULATION") <= 20
 
 
-def test_high_vol_halves_to_floor():
+def test_strong_setup_climbs_high():
     m = DynamicLeverageManager()
-    assert m.compute("S", base_leverage=10, venue_max_leverage=20, atr_pct=0.06) == 5
+    lev = m.compute("S", base_leverage=20, venue_max_leverage=20,
+                    atr_pct=0.0, drawdown=0.0, margin_ratio=0.0, regime="TREND_EXPANSION")
+    assert lev == 20
+
+
+def test_weak_regime_stays_low():
+    m = DynamicLeverageManager()
+    # mean-reversion (factor 0.25), calm → low end of band
+    lev = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="MEAN_REVERSION")
+    # floor 5 + 0.25*15 ≈ 8.75 → 9
+    assert lev <= 10 and lev >= 5
+
+
+def test_default_mid_band():
+    m = DynamicLeverageManager()
+    # neutral regime, calm, healthy → mid-ish (not pinned at 20)
+    lev = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="ACCUMULATION")
+    assert 5 <= lev < 20    # NOT the ceiling by default
+
+
+def test_high_vol_pulls_toward_floor():
+    m = DynamicLeverageManager()
+    # atr between high(0.05) and extreme(0.10) with strong regime → reduced, not 20
+    lev = m.compute("S", base_leverage=20, venue_max_leverage=20,
+                    atr_pct=0.075, regime="TREND_EXPANSION")
+    assert 5 <= lev < 20
 
 
 def test_extreme_vol_halts():
     m = DynamicLeverageManager()
-    assert m.compute("S", base_leverage=10, venue_max_leverage=20, atr_pct=0.11) == 0
+    assert m.compute("S", base_leverage=20, venue_max_leverage=20, atr_pct=0.11,
+                     regime="TREND_EXPANSION") == 0
+
+
+def test_no_trade_regime_halts():
+    m = DynamicLeverageManager()
+    assert m.compute("S", base_leverage=20, venue_max_leverage=20, regime="DEAD_MARKET") == 0
+
+
+def test_drawdown_suppresses_leverage():
+    m = DynamicLeverageManager()
+    healthy = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="TREND_EXPANSION")
+    drawn = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="TREND_EXPANSION",
+                      drawdown=0.10)  # severe
+    assert drawn < healthy and drawn == 5
+
+
+def test_conviction_scales_when_provided():
+    m = DynamicLeverageManager()
+    high = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="TREND_EXPANSION",
+                     conviction=1.0)
+    low = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="TREND_EXPANSION",
+                    conviction=0.3)
+    assert low < high
 
 
 def test_venue_max_caps_band():
     m = DynamicLeverageManager()
-    # venue only allows 8x → result can't exceed 8
-    assert m.compute("S", base_leverage=20, venue_max_leverage=8) <= 8
+    # venue only allows 8x → result can't exceed 8 even on a perfect setup
+    lev = m.compute("S", base_leverage=20, venue_max_leverage=8,
+                    atr_pct=0.0, regime="TREND_EXPANSION")
+    assert lev <= 8
+
+
+def test_configured_ceiling_caps_band():
+    m = DynamicLeverageManager()
+    # base_leverage (configured MAX_LEVERAGE) below band max acts as upper clamp
+    lev = m.compute("S", base_leverage=10, venue_max_leverage=20,
+                    atr_pct=0.0, regime="TREND_EXPANSION")
+    assert lev <= 10
 
 
 # ── engine wiring ────────────────────────────────────────────────────────────
