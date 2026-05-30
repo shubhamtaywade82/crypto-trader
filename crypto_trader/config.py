@@ -214,6 +214,16 @@ class TradingConfig:
     use_dynamic_leverage: bool = False
     dynamic_leverage_min: int = 5
     dynamic_leverage_max: int = 20
+    # Scaling-sensitivity thresholds (when leverage is pulled toward the floor).
+    # ATR% is fraction-of-price; drawdown / margin_ratio are fractions (0–1).
+    dynamic_leverage_vol_atr_period: int = 14
+    dynamic_leverage_high_vol_threshold: float = 0.05      # above this, vol starts cutting
+    dynamic_leverage_extreme_vol_threshold: float = 0.10   # above this, halt (0x)
+    dynamic_leverage_drawdown_moderate: float = 0.05       # full headroom below this
+    dynamic_leverage_drawdown_severe: float = 0.10         # floor at/above this
+    dynamic_leverage_margin_moderate: float = 0.25
+    dynamic_leverage_margin_high: float = 0.50
+    dynamic_leverage_regime_boost: bool = True
 
     # ── Paper execution-degradation model (F4) ──
     # Make paper fills realistic vs thin CoinDCX liquidity.
@@ -397,6 +407,14 @@ class TradingConfig:
             use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", False),
             dynamic_leverage_min=_get_int("DYNAMIC_LEVERAGE_MIN", 5),
             dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 20),
+            dynamic_leverage_vol_atr_period=_get_int("DYNAMIC_LEVERAGE_VOL_ATR_PERIOD", 14),
+            dynamic_leverage_high_vol_threshold=_get_float("DYNAMIC_LEVERAGE_HIGH_VOL_THRESHOLD", 0.05),
+            dynamic_leverage_extreme_vol_threshold=_get_float("DYNAMIC_LEVERAGE_EXTREME_VOL_THRESHOLD", 0.10),
+            dynamic_leverage_drawdown_moderate=_get_float("DYNAMIC_LEVERAGE_DRAWDOWN_MODERATE", 0.05),
+            dynamic_leverage_drawdown_severe=_get_float("DYNAMIC_LEVERAGE_DRAWDOWN_SEVERE", 0.10),
+            dynamic_leverage_margin_moderate=_get_float("DYNAMIC_LEVERAGE_MARGIN_MODERATE", 0.25),
+            dynamic_leverage_margin_high=_get_float("DYNAMIC_LEVERAGE_MARGIN_HIGH", 0.50),
+            dynamic_leverage_regime_boost=_get_bool("DYNAMIC_LEVERAGE_REGIME_BOOST", True),
             initial_balance=_get_float("INITIAL_BALANCE", 1000.0),
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),
