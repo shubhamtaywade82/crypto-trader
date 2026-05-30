@@ -123,6 +123,8 @@ class CoinDCXClient:
         # retry because it means the request was rejected before processing.
         max_attempts = self.max_retries if retry_safe else 1
         last_exc: Optional[Exception] = None
+        # Short endpoint label for diagnosable logs (which call timed out / 429'd).
+        _ep = f"{method} {'/'.join(url.split('/')[-3:])}"
         # Proactive throttle: keep request rate under CoinDCX's limits before we
         # ever hit a 429. The 429/Retry-After handling below stays as the
         # reactive safety net. Acquired once per call (not per retry).
@@ -141,12 +143,12 @@ class CoinDCXClient:
                     # safe to retry even for order mutations (request rejected).
                     retry_after = _parse_float(resp.headers.get("Retry-After"))
                     sleep_s = retry_after if retry_after and retry_after > 0 else 5 * (attempt + 1)
-                    logger.warning(f"CoinDCX rate limited; backing off {sleep_s:.1f}s")
+                    logger.warning(f"CoinDCX rate limited on {_ep}; backing off {sleep_s:.1f}s")
                     if not retry_safe:
                         # Give the venue its requested cool-off, then one retry is
                         # still safe because a 429 was never processed.
                         time.sleep(sleep_s)
-                        raise CoinDCXError("rate limited (429)", 429, resp.text)
+                        raise CoinDCXError(f"rate limited (429) on {_ep}", 429, resp.text)
                     time.sleep(sleep_s)
                     continue
                 if resp.status_code >= 500:
@@ -158,9 +160,9 @@ class CoinDCXClient:
                             resp.status_code, resp.text,
                         )
                     sleep_s = self.backoff_base ** attempt
-                    logger.warning(f"CoinDCX {resp.status_code}; retry in {sleep_s}s")
+                    logger.warning(f"CoinDCX {resp.status_code} on {_ep} (attempt {attempt+1}); retry in {sleep_s}s")
                     time.sleep(sleep_s)
-                    last_exc = CoinDCXError("server error", resp.status_code, resp.text)
+                    last_exc = CoinDCXError(f"server error on {_ep}", resp.status_code, resp.text)
                     continue
                 if resp.status_code >= 400:
                     # 4xx (auth/validation) is not retryable
@@ -181,20 +183,21 @@ class CoinDCXClient:
                         "(not retried — reconcile against venue)"
                     )
                 sleep_s = self.backoff_base ** attempt
-                logger.warning(f"CoinDCX timeout (attempt {attempt+1}); retry in {sleep_s}s")
+                logger.warning(f"CoinDCX timeout on {_ep} (attempt {attempt+1}); retry in {sleep_s}s")
                 time.sleep(sleep_s)
-                last_exc = requests.Timeout("CoinDCX request timed out")
+                last_exc = requests.Timeout(f"CoinDCX request timed out on {_ep}")
             except CoinDCXError:
                 raise
             except Exception as e:  # network blip
                 if not retry_safe:
                     raise
                 sleep_s = self.backoff_base ** attempt
-                logger.warning(f"CoinDCX request error: {e}; retry in {sleep_s}s")
+                logger.warning(f"CoinDCX request error on {_ep}: {e}; retry in {sleep_s}s")
                 time.sleep(sleep_s)
                 last_exc = e
         self._cb._on_failure()
-        raise last_exc if last_exc else CoinDCXError("Max retries exceeded")
+        logger.error("CoinDCX %s failed after %d attempt(s): %s", _ep, max_attempts, last_exc)
+        raise last_exc if last_exc else CoinDCXError(f"Max retries exceeded on {_ep}")
 
     def _apply_backpressure(self, resp: "requests.Response") -> None:
         """Proactively throttle before hitting 429 (G4).
