@@ -307,6 +307,9 @@ class WebSocketTradingEngine:
         self.advisor = None
         self._llm_thread = None
         self.advisor = build_advisor(use_llm, llm_host=llm_host, llm_model=llm_model, llm_logged=llm_logged)
+        # M-8: tracks how many signal ticks have fired with LLM enabled but no
+        # advice available yet (cold-start window).  Reset once advice arrives.
+        self._llm_cold_start_ticks = 0
 
         # WebSocket position manager (high-frequency exits)
         self.ws_pm = WebSocketPositionManager(
@@ -678,6 +681,22 @@ class WebSocketTradingEngine:
 
         structure, structure_ltf = self._compute_market_structure(data)
         self._start_llm_async(data, regime, regime_score, regime_ctx, session_ctx, rvol)
+
+        # M-8: LLM cold-start warning — alert the operator when LLM is enabled
+        # but hasn't produced its first response yet.  Scores during this window
+        # are purely technical; the operator should know fusion is not active.
+        if self.use_llm and self.advisor:
+            _first_advice = self.advisor.get_last_advice()
+            if _first_advice is None:
+                self._llm_cold_start_ticks += 1
+                logger.warning(
+                    "[LLM COLD-START] %s: LLM enabled but no advice yet after %d tick(s). "
+                    "Scores are purely technical until the first LLM response arrives.",
+                    self.symbol, self._llm_cold_start_ticks,
+                )
+            else:
+                self._llm_cold_start_ticks = 0
+
         self._evaluate_and_enter(data, regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx, structure, structure_ltf)
         self.wallet.print_summary()
 
