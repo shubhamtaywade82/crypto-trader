@@ -18,11 +18,13 @@ class FakeEngine:
         self._open_orders = open_orders if open_orders is not None else []
 
     def place_order(self, symbol, side, quantity, order_type, *, trigger_price=None,
-                    limit_price=None, reduce_only=False, expires_at=None, client_order_id=None):
+                    limit_price=None, reduce_only=False, expires_at=None, client_order_id=None,
+                    leverage=None):
         self._n += 1
         self.calls.append({
             "symbol": symbol, "side": side, "qty": Decimal(str(quantity)),
             "type": order_type, "trigger": trigger_price, "reduce_only": reduce_only,
+            "leverage": leverage,
         })
         if order_type == OrderType.MARKET:
             return Order(id=f"ex-{self._n}", symbol=symbol, side=side, order_type=order_type,
