@@ -32,6 +32,7 @@ from .risk import RiskManager, AdaptiveThresholdManager, MarginEngine, LeverageE
 from .playbooks import PlaybookA, PlaybookB, PlaybookAres, PlaybookVolExhaust, PlaybookSweepMSS
 from .strategies.supertrend2 import PlaybookSupertrend2
 from .strategies.mean_reversion import PlaybookMeanReversion
+from .strategies.smc_pipeline import PlaybookSMC
 from .strategies.mr_state import MRStateManager
 from .strategies.router import StrategyRouter, RouterResult, build_legacy_router
 from .reconciliation import ExchangeStateReconciler
@@ -274,6 +275,33 @@ class WebSocketTradingEngine:
                 self.playbook_mr.stop_loss_pct * 100,
                 self.playbook_mr.timeframe,
                 self.symbol,
+            )
+
+        # SMC pipeline playbook (instantiated from cfg when strategy_mode=smc)
+        self.playbook_smc: Optional[PlaybookSMC] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "smc":
+            self.playbook_smc = PlaybookSMC(
+                entry_timeframe=getattr(cfg, "smc_entry_timeframe", "15m"),
+                htf_timeframe=getattr(cfg, "smc_htf_timeframe", "4h"),
+                swing_window=getattr(cfg, "smc_swing_window", 3),
+                min_score=getattr(cfg, "smc_min_score", 70.0),
+                sweep_lookback=getattr(cfg, "smc_sweep_lookback", 12),
+                structure_lookback=getattr(cfg, "smc_structure_lookback", 12),
+                oi_expansion_pct=getattr(cfg, "smc_oi_expansion_pct", 3.0),
+                volume_mult_target=getattr(cfg, "smc_volume_mult_target", 3.0),
+                rvol_target=getattr(cfg, "smc_rvol_target", 1.2),
+                liq_cascade_threshold=getattr(cfg, "smc_liq_cascade_threshold", 0.5),
+                atr_period=getattr(cfg, "smc_atr_period", 14),
+                sl_buffer_atr=getattr(cfg, "smc_sl_buffer_atr", 0.5),
+                sl_atr_mult=getattr(cfg, "smc_sl_atr_mult", 1.5),
+                tp_rr=getattr(cfg, "smc_tp_rr", 2.0),
+                max_hold_hours=getattr(cfg, "smc_max_hold_hours", 24),
+            )
+            logger.info(
+                "[SMC] SMC pipeline mode active: entry_tf=%s htf=%s min_score=%.0f "
+                "swing=%d symbol=%s",
+                self.playbook_smc.entry_timeframe, self.playbook_smc.htf_timeframe,
+                self.playbook_smc.min_score, self.playbook_smc.swing_window, self.symbol,
             )
 
         # Regime / Session engine
@@ -636,6 +664,8 @@ class WebSocketTradingEngine:
                         self.playbook_st2.apply_overrides({k: v})
                     if k.startswith("mr_") and self.playbook_mr is not None:
                         self.playbook_mr.apply_overrides({k: v})
+                    if k.startswith("smc_") and self.playbook_smc is not None:
+                        self.playbook_smc.apply_overrides({k: v})
                 elif cls == "flat_only":
                     self._pending_flat_overrides[k] = v
                 elif cls == "restart":
@@ -658,6 +688,8 @@ class WebSocketTradingEngine:
                     self.playbook_st2.apply_overrides({k: v})
                 if k.startswith("mr_") and self.playbook_mr is not None:
                     self.playbook_mr.apply_overrides({k: v})
+                if k.startswith("smc_") and self.playbook_smc is not None:
+                    self.playbook_smc.apply_overrides({k: v})
             self._pending_flat_overrides = {}
 
     def _signal_tick(self):
@@ -817,6 +849,32 @@ class WebSocketTradingEngine:
                 except Exception as e:
                     logger.warning("[MR] Failed to fetch %s klines: %s — will retry in tick", mr_tf, e)
                     data["df_mr"] = None
+
+        # ── SMC pipeline configurable timeframes ─────────────────────────────
+        # Pre-fetch entry + HTF frames so _evaluate_entry_smc never makes a
+        # synchronous REST call inside the signal-tick hot path.
+        if self.playbook_smc is not None:
+            _baseline_map_smc = {"15m": df_15m, "5m": df_5m, "1h": df_1h, "4h": df_4h}
+            smc_tf = self.playbook_smc.entry_timeframe
+            smc_htf = self.playbook_smc.htf_timeframe
+            if smc_tf in _baseline_map_smc:
+                data["df_smc"] = _baseline_map_smc[smc_tf]
+            else:
+                try:
+                    data["df_smc"] = self.data_feed.get_klines(
+                        self.symbol, smc_tf, limit=self._kline_limit(smc_tf))
+                except Exception as e:
+                    logger.warning("[SMC] Failed to fetch entry TF %s: %s — falling back to 15m", smc_tf, e)
+                    data["df_smc"] = df_15m
+            if smc_htf in _baseline_map_smc:
+                data["df_smc_htf"] = _baseline_map_smc[smc_htf]
+            else:
+                try:
+                    data["df_smc_htf"] = self.data_feed.get_klines(
+                        self.symbol, smc_htf, limit=self._kline_limit(smc_htf))
+                except Exception as e:
+                    logger.warning("[SMC] Failed to fetch HTF %s: %s — falling back to 4h", smc_htf, e)
+                    data["df_smc_htf"] = df_4h
 
         return data
 
@@ -1239,6 +1297,89 @@ class WebSocketTradingEngine:
             regime_ctx=regime_ctx,
         ))
 
+    def _evaluate_entry_smc(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """Entry evaluation path for strategy_mode == "smc".
+
+        Runs the 10-stage SMC pipeline on the entry/HTF frames, fusing structure
+        with participation (RVOL, liquidation intensity from the regime context).
+        OI delta is not yet tracked engine-side, so the OI factor is dropped and
+        the remaining weights renormalised (oi_available=False) rather than
+        silently scored zero.
+        """
+        if self.playbook_smc is None:
+            return
+
+        df_smc = data.get("df_smc") or data.get("df_15m")
+        df_smc_htf = data.get("df_smc_htf") or data.get("df_4h")
+        if df_smc is None:
+            logger.warning("[SMC ENTRY] %s — no entry-TF klines available", self.symbol)
+            return
+
+        rvol = getattr(regime_ctx, "rvol", 1.0) if regime_ctx else 1.0
+        liq_intensity = getattr(regime_ctx, "liquidation_intensity", 0.0) if regime_ctx else 0.0
+
+        setup = self.playbook_smc.evaluate(
+            df_smc, df_smc_htf,
+            oi_delta=None, oi_available=False,
+            rvol=rvol, liquidation_intensity=liq_intensity,
+        )
+        if not setup:
+            ev = getattr(self.playbook_smc, "last_eval", None)
+            if ev and "confidence" in ev:
+                logger.info(
+                    "[SMC EVAL] %s %s score=%.0f < min %.0f → no signal (factors=%s)",
+                    self.symbol, ev.get("side"), ev["confidence"], ev["min_score"],
+                    ev.get("factors"),
+                )
+                reason = f"smc_score {ev['confidence']:.0f} < {ev['min_score']:.0f}"
+            elif ev:
+                logger.info("[SMC EVAL] %s gate failed at stage=%s → no signal",
+                            self.symbol, ev.get("stage"))
+                reason = f"smc_gate {ev.get('stage')}"
+            else:
+                logger.info("[SMC EVAL] %s no signal (insufficient data)", self.symbol)
+                reason = "smc_no_data"
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(symbol=self.symbol, reason=reason))
+            return
+
+        logger.info("[SMC SIGNAL] %s | %s | %s", self.symbol, setup["side"].value, setup["reason"])
+
+        # Funding-rate extreme guard (consistent with other strategies).
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
+        ):
+            logger.info("[SMC BLOCKED] %s — funding extreme %+.4f%%", self.symbol, funding_rate * 100)
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=setup["score"],
+            llm_weight=0.0,
+            explanation=f"SMC pipeline score={setup['confidence_score']:.0f}/100",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=setup["score"],
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=setup["score"],  # strategy gates internally at min_score
+            regime_ctx=regime_ctx,
+        ))
+
     # ─── Position update helpers ────────────────────────────────────────────
 
     def _update_open_position(self, data: dict, regime, session_ctx):
@@ -1321,6 +1462,7 @@ class WebSocketTradingEngine:
         if not self.wallet.get_open_position(self.symbol) and can_trade:
             _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
             _mr_mode  = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "mean_reversion"
+            _smc_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "smc"
 
             try:
                 if _st2_mode:
@@ -1335,6 +1477,13 @@ class WebSocketTradingEngine:
                     # SMA-band signal; funding-rate guard applied inside.
                     # Symbol-agnostic: works for all WATCHLIST symbols.
                     self._evaluate_entry_mr(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                elif _smc_mode:
+                    # ── SMC pipeline path ─────────────────────────────────────
+                    # 10-stage structure+participation filter; the composite
+                    # score gate (min_score) is applied inside the strategy.
+                    self._evaluate_entry_smc(
                         data, mark_price, funding_rate, taker_ratio, regime_ctx
                     )
                 else:

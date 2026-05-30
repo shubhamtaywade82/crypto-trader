@@ -382,6 +382,26 @@ class TradingConfig:
     mr_entry_band: float = 0.015      # 1.5% deviation from SMA to trigger entry
     mr_stop_loss_pct: float = 0.008   # 0.8% hard stop from fill price
 
+    # ── SMC pipeline settings (active only when strategy_mode = "smc") ──
+    # Production 10-stage SMC pipeline with a 9-factor weighted 0-100 score
+    # (see docs/smc_crypto_futures_guide_refined). Only trades clearing
+    # smc_min_score with all hard gates passing are taken.
+    smc_entry_timeframe: str = "15m"  # entry/setup timeframe
+    smc_htf_timeframe: str = "4h"     # higher-timeframe bias
+    smc_swing_window: int = 3         # swing-pivot radius
+    smc_min_score: float = 70.0       # composite score threshold (guide: ≥70)
+    smc_sweep_lookback: int = 12      # max candles since liquidity sweep
+    smc_structure_lookback: int = 12  # max candles since BOS/CHoCH
+    smc_oi_expansion_pct: float = 3.0       # OI %Δ for full OI factor
+    smc_volume_mult_target: float = 3.0     # displacement vol / 20-avg for full vol factor
+    smc_rvol_target: float = 1.2            # RVOL for full RVOL factor
+    smc_liq_cascade_threshold: float = 0.5  # liquidation intensity ≥ ⇒ reject
+    smc_atr_period: int = 14
+    smc_sl_buffer_atr: float = 0.5    # ATR padding beyond sweep wick for SL
+    smc_sl_atr_mult: float = 1.5      # ATR cap on stop distance (keeps RR sane)
+    smc_tp_rr: float = 2.0            # TP risk-reward ceiling / fallback
+    smc_max_hold_hours: int = 24      # safety time-stop
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -527,6 +547,21 @@ class TradingConfig:
             mr_sma_period=_get_int("MR_SMA_PERIOD", 20),
             mr_entry_band=_get_float("MR_ENTRY_BAND", 0.015),
             mr_stop_loss_pct=_get_float("MR_STOP_LOSS_PCT", 0.008),
+            smc_entry_timeframe=_valid_interval("SMC_ENTRY_TIMEFRAME", "15m"),
+            smc_htf_timeframe=_valid_interval("SMC_HTF_TIMEFRAME", "4h"),
+            smc_swing_window=_get_int("SMC_SWING_WINDOW", 3),
+            smc_min_score=_get_float("SMC_MIN_SCORE", 70.0),
+            smc_sweep_lookback=_get_int("SMC_SWEEP_LOOKBACK", 12),
+            smc_structure_lookback=_get_int("SMC_STRUCTURE_LOOKBACK", 12),
+            smc_oi_expansion_pct=_get_float("SMC_OI_EXPANSION_PCT", 3.0),
+            smc_volume_mult_target=_get_float("SMC_VOLUME_MULT_TARGET", 3.0),
+            smc_rvol_target=_get_float("SMC_RVOL_TARGET", 1.2),
+            smc_liq_cascade_threshold=_get_float("SMC_LIQ_CASCADE_THRESHOLD", 0.5),
+            smc_atr_period=_get_int("SMC_ATR_PERIOD", 14),
+            smc_sl_buffer_atr=_get_float("SMC_SL_BUFFER_ATR", 0.5),
+            smc_sl_atr_mult=_get_float("SMC_SL_ATR_MULT", 1.5),
+            smc_tp_rr=_get_float("SMC_TP_RR", 2.0),
+            smc_max_hold_hours=_get_int("SMC_MAX_HOLD_HOURS", 24),
         )
 
     @property
