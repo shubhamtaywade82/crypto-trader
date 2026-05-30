@@ -156,6 +156,12 @@ def test_websocket_trading_engine_min_notional_guard():
     cfg.allowed_regimes = None
     cfg.leverage = 5
     cfg.entry_basis_buffer = 0.0
+    # Pin newer config knobs to real values so the engine's fee/spread gates
+    # don't compare a float against a bare MagicMock (added after this test).
+    cfg.fee_awareness_enabled = False
+    cfg.entry_order_style = "market"
+    cfg.adaptive_entry_spread_threshold_bps = 2.0
+    cfg.is_live = False  # unit test: keep the market path, skip live maker-limit
     engine.cfg = cfg
     
     # Use EntryContext setup: stop distance = 5.0 (from 50.0 to 45.0)

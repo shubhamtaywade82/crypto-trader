@@ -2,8 +2,11 @@
 import threading
 import time
 
+import pytest
+
 from crypto_trader.infra.rate_limiter import (
     TokenBucket, get_rest_limiter, reset_rest_limiter,
+    get_coindcx_limiter, reset_coindcx_limiter,
 )
 
 
@@ -70,3 +73,22 @@ def test_singleton_identity_and_reset():
     c = get_rest_limiter()
     assert c is not a
     reset_rest_limiter()
+
+
+def test_coindcx_limiter_singleton_and_default_rate():
+    reset_coindcx_limiter()
+    a = get_coindcx_limiter()
+    b = get_coindcx_limiter()
+    assert a is b
+    # default 600/min = 10/s, well under spot's 2000/60s ceiling
+    assert a.rate == pytest.approx(10.0)
+    reset_coindcx_limiter()
+    assert get_coindcx_limiter() is not a
+    reset_coindcx_limiter()
+
+
+def test_coindcx_limiter_env_override(monkeypatch):
+    reset_coindcx_limiter()
+    monkeypatch.setenv("COINDCX_RATE_PER_MIN", "1200")
+    assert get_coindcx_limiter().rate == pytest.approx(20.0)
+    reset_coindcx_limiter()

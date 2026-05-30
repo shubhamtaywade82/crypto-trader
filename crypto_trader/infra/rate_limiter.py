@@ -105,3 +105,45 @@ def reset_rest_limiter() -> None:
     global _rest_limiter
     with _singleton_lock:
         _rest_limiter = None
+
+
+# ── CoinDCX signed-REST limiter ──────────────────────────────────────────────
+# CoinDCX publishes per-endpoint count/window limits for SPOT only (most
+# endpoints 2000/60s; Cancel All 30/60s; Active Order 300/60s). No FUTURES
+# numbers are published. We apply ONE conservative global token bucket well
+# under the generous spot ceiling — the bot's call volume is low (per-symbol
+# 60s reconcile + signal ticks), so a single shared bucket plus the client's
+# reactive 429/Retry-After backoff is ample. Tune with COINDCX_RATE_PER_MIN.
+_coindcx_limiter: Optional[TokenBucket] = None
+_coindcx_lock = threading.Lock()
+
+# 600/min (10/s) — << spot's 2000/60s create-order ceiling, leaving headroom.
+_COINDCX_DEFAULT_RATE = 600.0 / 60.0
+_COINDCX_DEFAULT_CAPACITY = 20.0
+
+
+def get_coindcx_limiter() -> TokenBucket:
+    """Lazily build and return the shared CoinDCX signed-REST limiter."""
+    global _coindcx_limiter
+    if _coindcx_limiter is None:
+        with _coindcx_lock:
+            if _coindcx_limiter is None:
+                import os
+                try:
+                    rate = float(os.getenv("COINDCX_RATE_PER_MIN", "600")) / 60.0
+                except (TypeError, ValueError):
+                    rate = _COINDCX_DEFAULT_RATE
+                try:
+                    cap = float(os.getenv("COINDCX_BURST_CAPACITY",
+                                          str(_COINDCX_DEFAULT_CAPACITY)))
+                except (TypeError, ValueError):
+                    cap = _COINDCX_DEFAULT_CAPACITY
+                _coindcx_limiter = TokenBucket(rate_per_sec=rate, capacity=cap)
+    return _coindcx_limiter
+
+
+def reset_coindcx_limiter() -> None:
+    """Test hook: drop the CoinDCX singleton."""
+    global _coindcx_limiter
+    with _coindcx_lock:
+        _coindcx_limiter = None

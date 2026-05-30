@@ -123,6 +123,14 @@ class CoinDCXClient:
         # retry because it means the request was rejected before processing.
         max_attempts = self.max_retries if retry_safe else 1
         last_exc: Optional[Exception] = None
+        # Proactive throttle: keep request rate under CoinDCX's limits before we
+        # ever hit a 429. The 429/Retry-After handling below stays as the
+        # reactive safety net. Acquired once per call (not per retry).
+        try:
+            from ..infra.rate_limiter import get_coindcx_limiter
+            get_coindcx_limiter().acquire(weight=1.0, timeout=float(self.timeout))
+        except Exception as e:  # never let the limiter break a request
+            logger.debug("coindcx rate limiter skipped: %s", e)
         for attempt in range(max_attempts):
             try:
                 resp = self.session.request(
