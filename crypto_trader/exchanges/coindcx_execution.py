@@ -383,22 +383,31 @@ class CoinDCXExecutionEngine:
             return False
 
     def fetch_symbol_leverage(self, symbol: str) -> Optional[int]:
-        """Fetches the configured leverage for the symbol from CoinDCX positions list."""
+        """Returns the maximum leverage allowed by the venue instrument spec.
+
+        Previously this scanned the positions list and returned the *current*
+        position's leverage, which could be stale (e.g. a grandfathered 20×
+        position when the venue now caps at 5×).  New orders must use the
+        instrument max or they are rejected by the venue.
+        """
         try:
-            resp = self.client.post_signed(EP_POSITIONS, {
-                "page": "1", "size": "100",
-                "margin_currency_short_name": self.read_margin_currencies,
-            })
             spec = self.mapper.get_spec(symbol)
-            pair = spec.pair
-            for raw in _as_list(resp):
-                r_pair = raw.get("pair") or raw.get("symbol")
-                if r_pair == pair:
-                    # Sync margin_type to engine if present
-                    if raw.get("margin_type"):
+            # Still sync margin_type from an existing position if one exists,
+            # but return the instrument cap for leverage.
+            try:
+                resp = self.client.post_signed(EP_POSITIONS, {
+                    "page": "1", "size": "100",
+                    "margin_currency_short_name": self.read_margin_currencies,
+                })
+                pair = spec.pair
+                for raw in _as_list(resp):
+                    r_pair = raw.get("pair") or raw.get("symbol")
+                    if r_pair == pair and raw.get("margin_type"):
                         self.margin_type = str(raw["margin_type"]).lower()
-                    if raw.get("leverage") is not None:
-                        return int(float(raw["leverage"]))
+                        break
+            except Exception:
+                pass  # margin_type sync is best-effort
+            return spec.max_leverage
         except Exception as e:
             logger.warning("fetch_symbol_leverage failed for %s: %s", symbol, e)
         return None

@@ -32,6 +32,12 @@ class _MockEngine:
 
     def place_order(self, symbol, side, qty, otype, *, trigger_price=None, limit_price=None,
                     reduce_only=False, expires_at=None, client_order_id=None, leverage=None):
+        self.update_calls.append({
+            "symbol": symbol, "side": side, "qty": qty, "otype": otype,
+            "trigger_price": trigger_price, "limit_price": limit_price,
+            "reduce_only": reduce_only, "client_order_id": client_order_id,
+            "leverage": leverage
+        })
         return SimpleNamespace(
             id="mock-ord-1",
             avg_fill_price=Decimal("100.0"),
@@ -204,3 +210,29 @@ def test_exchange_state_reconciler_quantity_drift_auto_align():
     assert risk.kill_switch is False
     assert pos_live.remaining_quantity == Decimal("6.04")
     assert pos_live.original_quantity == Decimal("6.04")
+
+
+def test_wallet_passes_leverage_to_order_placement():
+    import uuid
+    w = EnhancedFuturesWallet(symbol="SOLUSDT", state_namespace=f"test_{uuid.uuid4().hex}", leverage=15)
+    setup = {
+        "entry_price": 100.0, "side": PositionSide.LONG, "playbook": Playbook.INTRADAY,
+        "sl_price": 95.0, "tp_price": 105.0,
+    }
+    
+    # attach execution engine with leverage = 15
+    engine = _MockEngine(leverage=15)
+    w.attach_execution_engine(engine, live=True)
+    
+    w.venue_sl_enabled = True
+    pos = w.open_position("SOLUSDT", setup, mark_price=100.0, custom_quantity=1.0)
+    
+    # 1. Verification of entry order (market) leverage
+    entry_call = engine.update_calls[0]
+    assert entry_call["otype"] == OrderType.MARKET
+    assert entry_call["leverage"] == 15
+    
+    # 2. Verification of protective stop leverage
+    sl_call = engine.update_calls[1]
+    assert sl_call["otype"] == OrderType.STOP_MARKET
+    assert sl_call["leverage"] == 15

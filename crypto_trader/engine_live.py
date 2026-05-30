@@ -174,7 +174,13 @@ class LiveTradingSystem:
         usdt_equiv = 0.0
         try:
             avail = float(self.execution_engine.sync_balance())
-            conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+            conv_raw = self.execution_engine.get_usdt_conversion()
+            conv = float(conv_raw) if conv_raw else 0.0
+            if mc != "USDT" and conv <= 0:
+                raise RuntimeError(
+                    f"USDT/{mc} conversion rate unavailable or invalid ({conv_raw!r}). "
+                    f"Cannot safely convert balance for {mc}-margined account."
+                )
             usdt_equiv = avail / conv if mc != "USDT" else avail
             checks.append(Check("coindcx_auth", True, f"avail {avail} {mc} (~{usdt_equiv:.2f} USDT)"))
         except Exception as e:
@@ -286,7 +292,13 @@ class LiveTradingSystem:
         if str(currency).upper() == str(mc).upper():
             try:
                 bal_val = float(balance_update.get("balance", 0) or 0)
-                conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+                conv_raw = self.execution_engine.get_usdt_conversion()
+                conv = float(conv_raw) if conv_raw else 0.0
+                if mc.upper() != "USDT" and conv <= 0:
+                    raise RuntimeError(
+                        f"USDT/{mc} conversion rate unavailable or invalid ({conv_raw!r}). "
+                        f"Cannot safely process stream balance for {mc}-margined account."
+                    )
                 usdt_equiv = bal_val / conv if mc.upper() != "USDT" else bal_val
                 
                 logger.info("[STREAM] Received balance update: %.4f %s (~%.2f USDT)", bal_val, mc, usdt_equiv)

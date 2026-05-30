@@ -663,9 +663,16 @@ class EnhancedFuturesWallet:
         """
         from .execution.client_order_id import make_client_order_id  # lazy: avoid import cycle
         coid = make_client_order_id(symbol, intent, nonce=str(self._now_ms()))
+        import inspect
+        sig = inspect.signature(self.execution_engine.place_order)
+        kwargs = {}
+        if "leverage" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+            kwargs["leverage"] = self.get_leverage(symbol)
+
         order = self.execution_engine.place_order(
             symbol, order_side, quantity, OrderType.MARKET,
             reduce_only=reduce_only, client_order_id=coid,
+            **kwargs
         )
         price = order.avg_fill_price if order.avg_fill_price and order.avg_fill_price > 0 else Decimal("0")
         if price <= Decimal("0"):
@@ -719,8 +726,15 @@ class EnhancedFuturesWallet:
 
         coid = make_client_order_id(symbol, "entry", nonce=str(self._now_ms()))
         try:
+            import inspect
+            sig = inspect.signature(self.execution_engine.place_order)
+            kwargs = {}
+            if "leverage" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+                kwargs["leverage"] = self.get_leverage(symbol)
+
             order = self.execution_engine.place_order(
                 symbol, side, qty, OrderType.LIMIT, limit_price=post_px, client_order_id=coid,
+                **kwargs
             )
         except Exception as e:
             logger.warning("[MAKER-LIMIT] place failed for %s: %s", symbol, e)

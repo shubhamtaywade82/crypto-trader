@@ -280,7 +280,13 @@ def main():
             if live_bal is not None:
                 mc = cfg.coindcx_margin_currency.upper()
                 if mc != "USDT":
-                    conv = float(execution_engine.get_usdt_conversion()) or 1.0
+                    conv_raw = execution_engine.get_usdt_conversion()
+                    conv = float(conv_raw) if conv_raw else 0.0
+                    if conv <= 0:
+                        raise RuntimeError(
+                            f"USDT/{mc} conversion rate unavailable or invalid ({conv_raw!r}). "
+                            f"Cannot safely convert balance for {mc}-margined account."
+                        )
                     live_bal = live_bal / conv
                 global_wallet.wallet_balance = global_wallet._to_decimal(live_bal)
                 total_balance = live_bal
