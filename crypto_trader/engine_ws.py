@@ -1747,13 +1747,56 @@ class WebSocketTradingEngine:
         # bump-to-minimum, so the qty reaching the margin/liq/leverage checks
         # above and the placement below is already venue-legal.)
 
-        # Entry order style: maker-limit only when globally enabled AND the
-        # winning playbook requested it (volx/sweep); otherwise market (default).
+        # ── F6: Fee-adjusted expected profit gate ─────────────────────────────
+        fee_gate_ok = True
+        if self.cfg and getattr(self.cfg, "fee_awareness_enabled", False):
+            taker_rate = float(getattr(self.wallet, "taker_fee_rate", Decimal("0.0005")))
+            safety_buffer = getattr(self.cfg, "fee_safety_buffer_bps", 5.0) / 10000.0
+            min_ratio = getattr(self.cfg, "min_profit_vs_fees_ratio", 1.5)
+
+            # Conservative: assume taker on both entry and exit
+            round_trip_fee = notional * taker_rate * 2.0
+            total_cost = round_trip_fee + (notional * safety_buffer)
+
+            # Expected profit to first TP (or 1% default if none set)
+            tp = setup.get("tp_price")
+            if not tp and setup.get("tp_levels"):
+                tp = setup["tp_levels"][0].get("price")
+            if tp:
+                expected_profit = abs(float(tp) - entry_price) * float(quantity)
+            else:
+                expected_profit = notional * 0.01  # 1% default move
+
+            if expected_profit < total_cost * min_ratio:
+                logger.warning(
+                    "[ENTRY BLOCKED] Fee gate: expected_profit=$%.2f < cost×ratio=$%.2f "
+                    "(fees=$%.2f + buffer=$%.2f, ratio=%.1f) | notional=$%.2f",
+                    expected_profit, total_cost * min_ratio,
+                    round_trip_fee, notional * safety_buffer, min_ratio, notional
+                )
+                fee_gate_ok = False
+
+        if not fee_gate_ok:
+            return
+
+        # ── Adaptive entry order style ────────────────────────────────────────
+        # If spread is tight (< threshold) → market (speed matters).
+        # If spread is wide (>= threshold) → maker_limit (fee savings worth waiting).
         cfg_style = getattr(self.cfg, "entry_order_style", "market") if self.cfg else "market"
-        use_maker = (
-            str(cfg_style).lower() == "maker_limit"
-            and str(setup.get("entry_order_style", "market")).lower() == "maker_limit"
-        )
+        threshold_bps = getattr(self.cfg, "adaptive_entry_spread_threshold_bps", 2.0)
+        spread_bps = spread_pct * 100.0  # convert % → bps
+
+        if str(cfg_style).lower() == "maker_limit":
+            # Global override: always use maker-limit when playbook agrees
+            use_maker = str(setup.get("entry_order_style", "market")).lower() == "maker_limit"
+        else:
+            # Adaptive: switch to maker_limit on wide spreads
+            use_maker = spread_bps >= threshold_bps
+            if use_maker:
+                logger.info(
+                    "[ENTRY STYLE] Spread %.2f bps >= threshold %.2f bps → maker_limit",
+                    spread_bps, threshold_bps
+                )
         setup["entry_order_style"] = "maker_limit" if use_maker else "market"
 
         # Decoupled path: publish the entry as a signal. The in-process consumer

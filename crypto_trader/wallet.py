@@ -332,6 +332,9 @@ class EnhancedPosition:
     close_reason: Optional[str] = None
     highest_price: Optional[Decimal] = None
     peak_pnl_pct: Decimal = Decimal("0")
+    # Fees and TDS tracking for accurate net-PnL reporting.
+    fees_paid: Decimal = Decimal("0")
+    funding_paid: Decimal = Decimal("0")
     # TDS deducted on the sell leg of this trade (F2).
     tds_paid: Decimal = Decimal("0")
     # Resting protective orders placed on the venue (F1): {"sl": id, "tp": id}.
@@ -405,6 +408,8 @@ class EnhancedPosition:
             "close_reason": self.close_reason,
             "highest_price": self.highest_price,
             "peak_pnl_pct": self.peak_pnl_pct,
+            "fees_paid": self.fees_paid,
+            "funding_paid": self.funding_paid,
             "tds_paid": self.tds_paid,
             "protective_orders": self.protective_orders,
             "mode": self.mode,
@@ -414,7 +419,7 @@ class EnhancedPosition:
     def from_dict(cls, data: dict) -> "EnhancedPosition":
         data["side"] = PositionSide(data["side"])
         data["playbook"] = Playbook(data["playbook"])
-        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct", "tds_paid"]:
+        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct", "fees_paid", "funding_paid", "tds_paid"]:
             if k in data and data[k] is not None:
                 data[k] = Decimal(str(data[k]))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
@@ -615,6 +620,33 @@ class EnhancedFuturesWallet:
                     return
         except Exception as e:
             logger.warning("[LEVERAGE] Failed to sync leverage for %s: %s", symbol, e)
+
+    def sync_fee_rates_from_spec(self, symbol: str):
+        """Sync wallet fee rates from the execution engine's instrument spec.
+
+        The wallet defaults to hardcoded 0.02%/0.05% which may not match the
+        venue's actual schedule.  Calling this after the mapper has loaded the
+        instrument updates the wallet so paper simulations and pre-trade fee
+        estimates use the real rates.
+        """
+        if not (self.live_execution and self.execution_engine) or symbol == "GLOBAL":
+            return
+        try:
+            if hasattr(self.execution_engine, "mapper"):
+                spec = self.execution_engine.mapper.get_spec(symbol)
+                if spec.maker_fee_rate > 0 and spec.taker_fee_rate > 0:
+                    old_maker = float(self.maker_fee_rate)
+                    old_taker = float(self.taker_fee_rate)
+                    self.maker_fee_rate = self._to_decimal(spec.maker_fee_rate)
+                    self.taker_fee_rate = self._to_decimal(spec.taker_fee_rate)
+                    if abs(old_maker - float(self.maker_fee_rate)) > 0.000001 or \
+                       abs(old_taker - float(self.taker_fee_rate)) > 0.000001:
+                        logger.info(
+                            "[FEES] Synced %s fee rates from venue spec: maker=%.4f%% taker=%.4f%%",
+                            symbol, float(self.maker_fee_rate) * 100, float(self.taker_fee_rate) * 100
+                        )
+        except Exception as e:
+            logger.warning("[FEES] Failed to sync fee rates for %s: %s", symbol, e)
 
     def attach_execution_engine(self, engine, live: bool = True):
         """Wire a live execution venue. When ``live`` is True, the orchestrator
@@ -1041,6 +1073,7 @@ class EnhancedFuturesWallet:
                 time_stop_hours=setup.get("time_stop_hours", 18),
                 mode="live" if self.live_execution else "paper",
             )
+            pos.fees_paid += fee_open
             pos.update_pnl(mark_price)
             self._emit_event("FEE_CHARGED", {"amount": fee_open, "reason": "OPEN_FEE", "symbol": symbol})
             # F2: TDS on the SELL leg — for a SHORT, the sell happens at open.
@@ -1217,6 +1250,7 @@ class EnhancedFuturesWallet:
                     "tp_label": tp_label,
                 },
             )
+            pos.fees_paid += fee_close
             pos.partial_realized_pnl += (pnl_slice - fee_close)
 
             # F2: TDS on the SELL leg — for a LONG, each partial close is a sell.
@@ -1277,6 +1311,7 @@ class EnhancedFuturesWallet:
             pos.update_pnl(execution_price)
             remaining_pnl = pos.unrealized_pnl  # Only the still-open portion
             fee_close = self._calculate_fee(execution_price * pos.remaining_quantity, is_taker=True)
+            pos.fees_paid += fee_close
 
             # Credit remaining PnL
             self._emit_event(
@@ -2092,10 +2127,19 @@ class EnhancedFuturesWallet:
             # Longs usually pay when positive, shorts receive; simplified sign by side.
             direction = Decimal("-1") if pos.side == PositionSide.LONG else Decimal("1")
             amount = (notional * funding_rate) * direction
+
+            # Actually apply funding to wallet balance and position tracking.
+            # amount > 0 means the position receives funding (credited).
+            # amount < 0 means the position pays funding (debited).
+            self.wallet_balance += amount
+            pos.funding_paid += amount
+            pos.partial_realized_pnl += amount
+
             self._emit_event(
                 "FUNDING_APPLIED",
                 {"symbol": symbol, "rate": funding_rate, "notional": notional, "amount": amount},
             )
+            self._save_state()
             self.assert_runtime_matches_replay()
             return amount
 

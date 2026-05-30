@@ -365,6 +365,7 @@ class LiveTradingSystem:
 
         if self.cfg.is_live:
             self.wallet.attach_execution_engine(self.execution_engine, live=True)
+            self.wallet.sync_fee_rates_from_spec(self.cfg.symbol)
             self._maybe_start_user_stream()
         if self.cfg.projection_enabled and self.cfg.database_url:
             try:

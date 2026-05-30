@@ -220,6 +220,16 @@ class TradingConfig:
     maker_limit_offset_bps: float = 1.0      # post this far inside the spread (bps)
     maker_limit_fallback: str = "market"     # "market" | "skip" when unfilled
 
+    # ── Fee-awareness & execution quality (F6) ──
+    # Reject entries where expected profit does not cover round-trip fees + slippage.
+    fee_awareness_enabled: bool = True
+    # Minimum expected-profit / round-trip-fee ratio. 1.5 = profit must be 1.5× fees.
+    min_profit_vs_fees_ratio: float = 1.5
+    # Safety buffer added to fee estimate (fraction of notional). 0.0005 = 5 bps.
+    fee_safety_buffer_bps: float = 5.0
+    # Spread threshold (bps) for adaptive entry style. Below = market, above = maker_limit.
+    adaptive_entry_spread_threshold_bps: float = 2.0
+
     # ── Delta-neutral funding-rate arbitrage (Strategy C, default-off) ──
     # Non-directional spot+perp carry. Phased rollout: paper -> live observe-only
     # -> tiny live. Requires the spot execution engine to be wired.
@@ -396,6 +406,10 @@ class TradingConfig:
             entry_order_style=os.getenv("ENTRY_ORDER_STYLE", "market").lower(),
             maker_limit_timeout_s=_get_float("MAKER_LIMIT_TIMEOUT_S", 8.0),
             maker_limit_offset_bps=_get_float("MAKER_LIMIT_OFFSET_BPS", 1.0),
+            fee_awareness_enabled=_get_bool("FEE_AWARENESS_ENABLED", True),
+            min_profit_vs_fees_ratio=_get_float("MIN_PROFIT_VS_FEES_RATIO", 1.5),
+            fee_safety_buffer_bps=_get_float("FEE_SAFETY_BUFFER_BPS", 5.0),
+            adaptive_entry_spread_threshold_bps=_get_float("ADAPTIVE_ENTRY_SPREAD_THRESHOLD_BPS", 2.0),
             maker_limit_fallback=os.getenv("MAKER_LIMIT_FALLBACK", "market").lower(),
             funding_arb_enabled=_get_bool("FUNDING_ARB_ENABLED", False),
             funding_arb_notional_usdt=_get_float("FUNDING_ARB_NOTIONAL_USDT", 0.0),

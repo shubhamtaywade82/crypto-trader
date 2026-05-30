@@ -275,6 +275,10 @@ def main():
         global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
+        # Sync per-symbol fee rates from venue instrument specs so the wallet
+        # uses real CoinDCX maker/taker rates instead of hardcoded defaults.
+        for sym in symbols:
+            global_wallet.sync_fee_rates_from_spec(sym)
         try:
             live_bal = execution_engine.sync_balance()
             if live_bal is not None:
