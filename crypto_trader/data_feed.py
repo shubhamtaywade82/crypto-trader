@@ -55,6 +55,14 @@ class BinanceDataFeed:
         if self.log_responses:
             logger.info(f"[REST API Request] {method} {url} | Params: {params}")
 
+        # Proactive shared throttle across all per-symbol feeds (token bucket).
+        # The 418/429 backoff below remains the reactive safety net.
+        try:
+            from .infra.rate_limiter import get_rest_limiter
+            get_rest_limiter().acquire(weight=1.0, timeout=15.0)
+        except Exception as e:  # never let the limiter break a data fetch
+            logger.debug("rate limiter skipped: %s", e)
+
         for attempt in range(self.max_retries):
             try:
                 if method == "GET":

@@ -90,6 +90,16 @@ class PlaybookMeanReversion:
         # Duplicate-candle guard: skip if we've already processed this bar.
         self._last_processed_ts: pd.Timestamp = _SENTINEL_TS
 
+    def apply_overrides(self, ov: dict) -> None:
+        """Live-update tunable params from a hot-reload overrides dict (keys are
+        prefixed ``mr_``). Only attributes that already exist are touched."""
+        for key, val in ov.items():
+            if not key.startswith("mr_"):
+                continue
+            attr = key[len("mr_"):]
+            if hasattr(self, attr):
+                setattr(self, attr, val)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Core maths
     # ─────────────────────────────────────────────────────────────────────────

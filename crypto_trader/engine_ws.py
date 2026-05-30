@@ -18,7 +18,7 @@ import uuid
 import logging
 import argparse
 from dataclasses import dataclass, field as dc_field
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -42,6 +42,7 @@ from .regime import (
 from .session import get_session_context, TradingSession
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD, build_advisor
 from .journal import TradeJournal, TradeOutcomeJournal, TradeOutcomeRecord
+from .config_store import ConfigStore
 from .structure import MarketStructureAnalyzer
 from .config import load_config
 
@@ -286,6 +287,12 @@ class WebSocketTradingEngine:
         # TradeClosedEvent in _on_trade_closed to emit one TradeOutcomeRecord.
         self.outcome_journal = TradeOutcomeJournal()
         self._open_features: dict = {}
+        # Runtime config hot-reload: polled once per signal tick. Picks up the
+        # overrides file written by the calibration approver without a restart.
+        self.config_store = ConfigStore()
+        # SL-defining overrides that arrived while a position was open; retried
+        # every tick until the symbol is flat, then applied.
+        self._pending_flat_overrides: dict = {}
 
         # LLM
         self.advisor = None
@@ -593,11 +600,57 @@ class WebSocketTradingEngine:
         self._halted = True
         return False
 
+    def _apply_runtime_overrides(self) -> None:
+        """Poll the ConfigStore and apply runtime parameter overrides."""
+        ov = self.config_store.poll()
+        if ov is not None:
+            # We got new overrides (could be empty dict if file deleted)
+            for k, v in ov.items():
+                cls = ConfigStore.classify(k)
+                if cls == "safe":
+                    # Apply immediately to cfg
+                    if hasattr(self.cfg, k):
+                        setattr(self.cfg, k, v)
+                    # Apply to risk/adaptive/playbooks
+                    if self.risk_manager is not None:
+                        self.risk_manager.apply_overrides({k: v})
+                    if self.adaptive_threshold is not None:
+                        self.adaptive_threshold.apply_overrides({k: v})
+                    if k.startswith("st2_") and self.playbook_st2 is not None:
+                        self.playbook_st2.apply_overrides({k: v})
+                    if k.startswith("mr_") and self.playbook_mr is not None:
+                        self.playbook_mr.apply_overrides({k: v})
+                elif cls == "flat_only":
+                    self._pending_flat_overrides[k] = v
+                elif cls == "restart":
+                    logger.warning("[ConfigStore] Ignored restart-only parameter override: %s", k)
+                else:
+                    logger.warning("[ConfigStore] Ignored unknown/unblessed parameter override: %s", k)
+
+        # Check if we are flat to drain flat-only overrides
+        if not self._pending_flat_overrides:
+            return
+
+        position = self.wallet.get_open_position(self.symbol)
+        if position is None:
+            # Flat! Apply all deferred overrides
+            logger.info("[ConfigStore] Symbol %s is flat — draining %d deferred flat-only overrides", self.symbol, len(self._pending_flat_overrides))
+            for k, v in self._pending_flat_overrides.items():
+                if hasattr(self.cfg, k):
+                    setattr(self.cfg, k, v)
+                if k.startswith("st2_") and self.playbook_st2 is not None:
+                    self.playbook_st2.apply_overrides({k: v})
+                if k.startswith("mr_") and self.playbook_mr is not None:
+                    self.playbook_mr.apply_overrides({k: v})
+            self._pending_flat_overrides = {}
+
     def _signal_tick(self):
         """Generate signals using REST data (runs every 5 min)."""
         if self._halted:
             logger.debug("[SIGNAL-TICK] %s is halted. Skipping.", self.symbol)
             return
+
+        self._apply_runtime_overrides()
 
         logger.info("--- Signal Tick: %s ---", self.symbol)
 
@@ -1245,6 +1298,26 @@ class WebSocketTradingEngine:
                     )
 
             except Exception as e:
+                # Distinguish a benign pre-fill venue REJECTION from an ambiguous
+                # mid-entry failure that could orphan a live position.
+                #
+                # A definitive 4xx order rejection (e.g. min-notional, bad params,
+                # insufficient balance) is raised by place_order BEFORE any fill is
+                # booked — no position exists, so halting all trading is wrong.
+                # Skip this tick and keep trading. Ambiguous failures (5xx /
+                # timeout / anything not provably pre-fill) still HALT + reconcile
+                # because the order MIGHT be live.
+                if self._is_benign_entry_rejection(e):
+                    logger.warning(
+                        "[ENTRY SKIP] %s — venue rejected order pre-fill (no position "
+                        "opened), skipping tick: %s", self.symbol, e,
+                    )
+                    if self.event_bus:
+                        from .events import SignalRejectedEvent
+                        self.event_bus.publish(SignalRejectedEvent(
+                            symbol=self.symbol, reason=f"venue_rejected: {e}",
+                        ))
+                    return
                 # An exception mid-entry could leave an unmanaged live position.
                 # Fail safe: HALT and trip the kill switch.
                 logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e, exc_info=True)
@@ -1260,6 +1333,21 @@ class WebSocketTradingEngine:
                 if self.event_bus:
                     from .events import SystemFailureEvent
                     self.event_bus.publish(SystemFailureEvent(component="entry", error=str(e)))
+
+    @staticmethod
+    def _is_benign_entry_rejection(exc: Exception) -> bool:
+        """True when *exc* is a definitive venue order rejection raised BEFORE any
+        fill could be booked — safe to skip without halting.
+
+        Only a CoinDCX 4xx (client/validation error: min-notional, bad params,
+        insufficient balance, etc.) qualifies. The CoinDCX client raises 429/5xx/
+        timeout on non-idempotent calls as 'ambiguous — reconcile against venue'
+        (status_code None or >=500), which must still trip the halt."""
+        from .exchanges.coindcx_client import CoinDCXError
+        if not isinstance(exc, CoinDCXError):
+            return False
+        sc = getattr(exc, "status_code", None)
+        return isinstance(sc, int) and 400 <= sc < 500 and sc != 429
 
     # StrategyRouter is lazily built on first use and cached.
     # Use build_legacy_router() to customise the regime → playbook map.
@@ -1523,6 +1611,87 @@ class WebSocketTradingEngine:
 
         trade_id = str(uuid.uuid4())[:8]
 
+        # Without a stop we cannot size at all → hard skip (covers the
+        # quantity<=0-because-stop_distance==0 case). A tiny risk_budget that
+        # yields qty<=0 with a VALID stop is handled by the bump-to-minimum
+        # logic below, not skipped here.
+        if stop_distance_dec <= 0:
+            logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
+            return
+
+        # ── Bump-to-minimum sizing ───────────────────────────────────────────
+        # On a tiny account, risk-based sizing (risk_per_trade_pct × 1/N) can
+        # produce a notional below CoinDCX's venue minimum (or a quantity that
+        # rounds to ~0), so the order would be rejected outright. Per operator
+        # decision: bump such orders UP to the smallest venue-legal size when
+        # margin allows (accepting >target risk on this trade), and skip cleanly
+        # if even that minimum can't be afforded. The bumped quantity is computed
+        # HERE so it flows into the margin/liq/leverage validations below AND into
+        # downstream order placement (no validate-one/place-another mismatch).
+        entry_price_dec = Decimal(str(entry_price))
+        exec_eng = getattr(self.wallet, "execution_engine", None)
+        if exec_eng is not None and hasattr(exec_eng, "mapper"):
+            try:
+                spec = exec_eng.mapper.get_spec(self.symbol)
+                min_n = Decimal(str(spec.min_notional))
+                min_q = Decimal(str(spec.min_quantity))
+                cur_notional = quantity * entry_price_dec
+                if quantity < min_q or cur_notional < min_n:
+                    # Smallest qty satisfying BOTH min_notional and min_quantity,
+                    # rounded UP to the venue quantity increment (never down — a
+                    # round-down could drop us back below the minimum).
+                    q_for_notional = (
+                        (min_n / entry_price_dec) if entry_price_dec > 0 else min_q
+                    )
+                    target_qty = max(q_for_notional, min_q)
+                    inc = Decimal(str(spec.quantity_increment))
+                    if inc > 0:
+                        steps = (target_qty / inc).to_integral_value(rounding=ROUND_UP)
+                        bumped_qty = steps * inc
+                    else:
+                        bumped_qty = target_qty
+                    # Guard against float-rounding leaving us a hair below either
+                    # minimum after increment rounding.
+                    while bumped_qty < min_q or (bumped_qty * entry_price_dec) < min_n:
+                        bumped_qty += inc if inc > 0 else (min_q - bumped_qty)
+
+                    bumped_notional = bumped_qty * entry_price_dec
+                    # Affordability / pre-send veto: required margin must fit the
+                    # margin still available after existing open positions.
+                    _lev_for_afford = self.cfg.leverage if self.cfg else 2
+                    required_margin = float(bumped_notional) / max(_lev_for_afford, 1)
+                    margin_balance_now = float(self.wallet.margin_balance)
+                    used_margin_now = sum(
+                        float(p.margin_used) for p in self.wallet.positions.values()
+                        if p.status == "OPEN"
+                    )
+                    available_margin = margin_balance_now - used_margin_now
+                    if required_margin > available_margin:
+                        logger.warning(
+                            "[ENTRY SKIP] %s cannot afford venue minimum notional "
+                            "(need ~$%.2f margin, have $%.2f); skipping",
+                            self.symbol, required_margin, available_margin,
+                        )
+                        return
+
+                    # Risk now exceeds the configured cap — operator MUST see this.
+                    risk_now = (bumped_qty * stop_distance_dec) / self.wallet.margin_balance \
+                        if self.wallet.margin_balance > 0 else Decimal("0")
+                    logger.warning(
+                        "[SIZING BUMP] %s risk-based notional $%.2f below venue min $%.2f "
+                        "— bumping qty %s→%s (risk now ~%.3f%% of equity, exceeds target %.3f%%)",
+                        self.symbol, float(cur_notional), float(min_n),
+                        f"{float(quantity):.8f}", f"{float(bumped_qty):.8f}",
+                        float(risk_now) * 100.0, float(_risk_pct) * 100.0,
+                    )
+                    quantity = bumped_qty
+            except Exception as e:
+                # Paper mode / no CoinDCX mapper / spec fetch failure → fall back
+                # to the risk-based qty as-is. Don't crash.
+                logger.warning(f"Failed to fetch instrument spec for pre-entry validation: {e}")
+
+        # After any bump, a still-non-positive qty means we could not size a
+        # legal order (e.g. no mapper AND tiny risk_budget) → skip.
         if quantity <= 0:
             logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
             return
@@ -1564,6 +1733,10 @@ class WebSocketTradingEngine:
         if not lev_ok:
             logger.warning(f"[ENTRY BLOCKED] Leverage Tier: {lev_msg}")
             return
+
+        # (Venue min-notional / min-quantity is enforced earlier via
+        # bump-to-minimum, so the qty reaching the margin/liq/leverage checks
+        # above and the placement below is already venue-legal.)
 
         # Entry order style: maker-limit only when globally enabled AND the
         # winning playbook requested it (volx/sweep); otherwise market (default).

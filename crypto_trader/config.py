@@ -9,6 +9,7 @@ Loaded from environment variables (the package's ``__init__`` already populates
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -138,6 +139,28 @@ def _get_int(name: str, default: int) -> int:
         return int(float(_get(name, str(default))))
     except ValueError:
         return default
+
+
+# Valid Binance kline intervals. A malformed env value (e.g. a missing newline
+# merging MR_TIMEFRAME with the next line → "15mCLOUD_OLLAMA_API_KEY=key_1")
+# would otherwise flow straight into the Binance kline URL and cause 400s.
+_VALID_KLINE_INTERVALS = {
+    "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d", "3d", "1w", "1M",
+}
+
+
+def _valid_interval(name: str, default: str) -> str:
+    """Resolve an env timeframe, falling back to ``default`` (with a WARNING) if
+    the value isn't a recognized Binance kline interval."""
+    val = _get(name, default)
+    if val not in _VALID_KLINE_INTERVALS:
+        logging.getLogger("crypto_trader.config").warning(
+            "[CONFIG] invalid %s %r — falling back to %s", name, val, default
+        )
+        return default
+    return val
 
 
 @dataclass
@@ -427,8 +450,8 @@ class TradingConfig:
             st2_atr_period=_get_int("ST2_ATR_PERIOD", 10),
             st2_factor=_get_float("ST2_FACTOR", 3.0),
             st2_use_adaptive_atr=_get_bool("ST2_USE_ADAPTIVE_ATR", True),
-            st2_timeframe=_get("ST2_TIMEFRAME", "1h"),
-            st2_htf_timeframe=_get("ST2_HTF_TIMEFRAME", "4h"),
+            st2_timeframe=_valid_interval("ST2_TIMEFRAME", "1h"),
+            st2_htf_timeframe=_valid_interval("ST2_HTF_TIMEFRAME", "4h"),
             st2_entry_mode=_get("ST2_ENTRY_MODE", "flip").lower(),
             st2_retracement_pct=_get_float("ST2_RETRACEMENT_PCT", 1.0),
             st2_flip_lookback=_get_int("ST2_FLIP_LOOKBACK", 5),
@@ -443,7 +466,7 @@ class TradingConfig:
             st2_sl_pct=_get_float("ST2_SL_PCT", 1.5),
             st2_sl_atr_mult=_get_float("ST2_SL_ATR_MULT", 2.5),
             st2_max_hold_hours=_get_int("ST2_MAX_HOLD_HOURS", 168),
-            mr_timeframe=_get("MR_TIMEFRAME", "15m"),
+            mr_timeframe=_valid_interval("MR_TIMEFRAME", "15m"),
             mr_sma_period=_get_int("MR_SMA_PERIOD", 20),
             mr_entry_band=_get_float("MR_ENTRY_BAND", 0.015),
             mr_stop_loss_pct=_get_float("MR_STOP_LOSS_PCT", 0.008),

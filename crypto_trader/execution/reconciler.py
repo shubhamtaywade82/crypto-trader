@@ -57,7 +57,7 @@ class Reconciler:
             # caller (gate / runtime loop) pauses trading for now and retries.
             logger.warning("Reconciliation snapshot unavailable: %s", snap.error)
             return []
-        mismatches = self._compare(snap)
+        mismatches = self._compare(snap, symbol)
         for m in mismatches:
             if self.bus:
                 self.bus.publish(m)
@@ -77,9 +77,19 @@ class Reconciler:
         return mismatches
 
     # ── comparison ───────────────────────────────────────────────────────────
-    def _compare(self, snap: AccountSnapshot) -> List[ReconciliationMismatchEvent]:
+    def _compare(self, snap: AccountSnapshot,
+                 symbol: Optional[str] = None) -> List[ReconciliationMismatchEvent]:
         internal = self._internal_positions()
         venue = snap.positions
+
+        # The venue snapshot returns ALL open positions, but a per-symbol
+        # reconcile must only compare THAT symbol — otherwise a live position in
+        # one symbol is flagged as a "missing_position" on every OTHER watchlist
+        # symbol's pass, tripping a false kill switch. Scope both sides to the
+        # target symbol when one is given (None = whole-account reconcile).
+        if symbol is not None:
+            internal = {s: p for s, p in internal.items() if s == symbol}
+            venue = {s: p for s, p in venue.items() if s == symbol}
 
         out: List[ReconciliationMismatchEvent] = []
         out.extend(self._find_ghost_positions(internal, venue))

@@ -2600,6 +2600,22 @@ class ExecutionEngine(Protocol):
 class PaperExecutionEngine:
     def __init__(self, wallet: EnhancedFuturesWallet):
         self.wallet = wallet
+        from .exchanges.instrument_mapper import InstrumentSpec
+        class MockMapper:
+            def get_spec(self, symbol: str) -> InstrumentSpec:
+                return InstrumentSpec(
+                    internal_symbol=symbol,
+                    pair=symbol,
+                    price_increment=Decimal("0.0001"),
+                    quantity_increment=Decimal("0.001"),
+                    min_quantity=Decimal("0.001"),
+                    min_notional=Decimal("6.0"),
+                    max_leverage=20,
+                    maker_fee_rate=0.0002,
+                    taker_fee_rate=0.0005,
+                    status="active",
+                )
+        self.mapper = MockMapper()
 
     def place_order(
         self,

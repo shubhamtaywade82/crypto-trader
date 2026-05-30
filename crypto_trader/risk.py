@@ -395,6 +395,25 @@ class RiskManager:
         self._save_state()
         logger.info("[RISK] Consecutive loss counter manually reset")
 
+    def apply_overrides(self, ov: dict) -> None:
+        """Live-update risk caps from a hot-reload overrides dict. Idempotent —
+        safe to call repeatedly (shared across engines). Only the whitelisted
+        caps below are touched; kill switch and counters are never altered."""
+        if "max_daily_trades" in ov:
+            self.max_daily = int(ov["max_daily_trades"])
+        if "max_consecutive_losses" in ov:
+            self.max_consecutive = int(ov["max_consecutive_losses"])
+        if "max_orders_per_minute" in ov:
+            self.max_orders_per_minute = int(ov["max_orders_per_minute"])
+        if "max_margin_ratio" in ov:
+            self.max_margin_ratio = float(ov["max_margin_ratio"])
+        if "max_drawdown_pct" in ov:
+            self.max_drawdown_pct = float(ov["max_drawdown_pct"])
+        if "max_daily_drawdown_pct" in ov:
+            self.max_daily_drawdown_pct = float(ov["max_daily_drawdown_pct"])
+        if "cooldown_after_loss_minutes" in ov:
+            self.cooldown_after_loss_seconds = int(ov["cooldown_after_loss_minutes"]) * 60
+
     def _save_state(self):
         state = {
             "daily_count": self.daily_count,
@@ -480,6 +499,18 @@ class AdaptiveThresholdManager:
         self.last_trade_time = time.time()
         self._save_state()
         logger.info(f"[ADAPTIVE] Trade recorded. Threshold reset to {self.base_threshold:.2f}")
+
+    def apply_overrides(self, ov: dict) -> None:
+        """Live-update adaptive-threshold params from a hot-reload overrides dict."""
+        if "final_score_threshold" in ov:
+            self.base_threshold = float(ov["final_score_threshold"])
+        if "adaptive_min_threshold" in ov:
+            self.min_threshold = float(ov["adaptive_min_threshold"])
+        if "adaptive_decay_per_hour" in ov:
+            self.decay_rate = float(ov["adaptive_decay_per_hour"])
+        if "adaptive_target_trades_per_day" in ov:
+            tpd = float(ov["adaptive_target_trades_per_day"])
+            self.target_interval = 24.0 / tpd if tpd > 0 else 24.0
 
     def _save_state(self):
         try:

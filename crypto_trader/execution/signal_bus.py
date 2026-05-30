@@ -344,6 +344,30 @@ class WalletSignalAdapter:
         style = str(meta.get("entry_order_style", "market")).lower()
         setup["entry_order_style"] = style
         qty = float(signal.quantity)
+
+        # Local Minimum Quantity and Notional Guard
+        exec_eng = getattr(self.wallet, "execution_engine", None)
+        if exec_eng and hasattr(exec_eng, "mapper"):
+            try:
+                spec = exec_eng.mapper.get_spec(signal.symbol)
+                min_n = float(spec.min_notional)
+                min_q = float(spec.min_quantity)
+                notional = qty * entry
+                if notional < min_n:
+                    logger.warning(
+                        f"[ENTRY BLOCKED] Signal notional {notional:.2f} for {signal.symbol} is below "
+                        f"venue minimum notional {min_n:.2f}"
+                    )
+                    return
+                if qty < min_q:
+                    logger.warning(
+                        f"[ENTRY BLOCKED] Signal quantity {qty:.6f} for {signal.symbol} is below "
+                        f"venue minimum quantity {min_q:.6f}"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to fetch instrument spec for validation in adapter: {e}")
+
         external_fill = None
         if style == "maker_limit" and getattr(self.wallet, "live_execution", False):
             external_fill = self.wallet.acquire_live_entry_fill(
