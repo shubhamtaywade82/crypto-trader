@@ -99,6 +99,21 @@ class InstrumentMapper:
         inst = raw.get("instrument") if isinstance(raw, dict) else None
         if not inst:
             raise ValueError(f"No instrument data for {pair}: {raw}")
+        # CoinDCX docs: max_leverage_long/short are "Ignore this". The real
+        # leverage cap is dynamic_position_leverage_details — a {leverage: max
+        # notional} tier table. The usable max is the highest tier whose notional
+        # ceiling is non-trivial; venue enforces the per-position-size gating at
+        # order time, so we take the top tier as the instrument ceiling and let
+        # our own band / hard cap (20x) be the real limiter. Fall back to
+        # max_leverage_long only if the tier table is absent.
+        dyn = inst.get("dynamic_position_leverage_details") or {}
+        tier_max = 0
+        try:
+            tier_max = max((int(k) for k in dyn.keys()), default=0)
+        except (TypeError, ValueError):
+            tier_max = 0
+        legacy_max = int(float(inst.get("max_leverage_long", 1) or 1))
+        max_leverage = tier_max or legacy_max or 1
         spec = InstrumentSpec(
             internal_symbol=internal,
             pair=pair,
@@ -106,7 +121,7 @@ class InstrumentMapper:
             quantity_increment=Decimal(str(inst["quantity_increment"])),
             min_quantity=Decimal(str(inst.get("min_quantity", inst.get("min_trade_size", "0")))),
             min_notional=Decimal(str(inst.get("min_notional", "0"))),
-            max_leverage=int(float(inst.get("max_leverage_long", 1))),
+            max_leverage=max_leverage,
             maker_fee_rate=float(inst.get("maker_fee", 0.0)) / 100.0,
             taker_fee_rate=float(inst.get("taker_fee", 0.0)) / 100.0,
             status=inst.get("status", "active"),

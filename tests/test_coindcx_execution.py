@@ -252,3 +252,41 @@ def test_market_fill_unconfirmed_raises(gate_open, monkeypatch):
     monkeypatch.setattr(_t, "sleep", lambda *_: None)
     with pytest.raises(CoinDCXError):
         eng.place_order("SOLUSDT", PositionSide.LONG, Decimal("1.0"), OrderType.MARKET)
+
+
+# ── leverage cap sourced from dynamic tier table (not max_leverage_long) ──
+
+class _TierClient:
+    """Public-only client returning an instrument with the real dynamic tier
+    table. max_leverage_long is the docs' 'ignore this' field (5x); the tiers
+    permit far higher leverage for small positions."""
+    def get_public(self, endpoint, params=None):
+        return {"instrument": {
+            "pair": params["pair"], "price_increment": 0.01, "quantity_increment": 0.01,
+            "min_quantity": 0.01, "min_notional": 6.0,
+            "max_leverage_long": 5.0, "max_leverage_short": 5.0,
+            "dynamic_position_leverage_details": {
+                "2": 52000000, "5": 50000001, "10": 50000000,
+                "15": 20000000, "20": 15000000, "50": 1000000, "100": 10000,
+            },
+            "maker_fee": 0.0236, "taker_fee": 0.059, "status": "active",
+        }}
+
+
+def test_spec_max_leverage_from_dynamic_tiers_not_legacy_field():
+    spec = InstrumentMapper(_TierClient()).get_spec("SOLUSDT")
+    # top tier is 100x — NOT the 5x max_leverage_long 'ignore this' field
+    assert spec.max_leverage == 100
+    assert spec.max_leverage != 5
+
+
+def test_spec_falls_back_to_legacy_when_no_tier_table():
+    class _NoTier:
+        def get_public(self, endpoint, params=None):
+            return {"instrument": {
+                "pair": params["pair"], "price_increment": 0.01, "quantity_increment": 0.01,
+                "min_quantity": 0.01, "min_notional": 6.0, "max_leverage_long": 7.0,
+                "maker_fee": 0.0236, "taker_fee": 0.059, "status": "active",
+            }}
+    spec = InstrumentMapper(_NoTier()).get_spec("BTCUSDT")
+    assert spec.max_leverage == 7  # fell back to max_leverage_long

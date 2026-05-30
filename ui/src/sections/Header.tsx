@@ -3,6 +3,8 @@ import type { AppMode, ConnState } from "@/types";
 interface HeaderProps {
   mode: AppMode;
   setMode: (m: AppMode) => void;
+  dataSource: "browser" | "backend";
+  setDataSource: (d: "browser" | "backend") => void;
   equity: number;
   unrealizedPnl: number;
   realizedPnl: number;
@@ -25,7 +27,7 @@ function formatAge(ms: number | null): string {
   return `${Math.round(sec / 60)}m ago`;
 }
 
-export function Header({ mode, setMode, equity, unrealizedPnl, realizedPnl, totalFees, activeTrades, connState, lastEventAge }: HeaderProps) {
+export function Header({ mode, setMode, dataSource, setDataSource, equity, unrealizedPnl, realizedPnl, totalFees, activeTrades, connState, lastEventAge }: HeaderProps) {
   return (
     <header className="flex items-center h-12 min-h-[48px] bg-[var(--bg-header)] border-b border-[var(--border-main)] px-3 gap-4 z-10">
       {/* Brand */}
@@ -73,6 +75,28 @@ export function Header({ mode, setMode, equity, unrealizedPnl, realizedPnl, tota
 
       {/* Controls */}
       <div className="ml-auto flex items-center gap-4">
+        {/* Source Toggle */}
+        <div className="flex bg-[var(--bg-main)] border border-[var(--border-main)] p-0.5 rounded">
+          <button
+            className={`px-2 py-[3px] border-none bg-transparent text-[10px] font-bold rounded-[3px] transition-all duration-150 uppercase cursor-pointer ${
+              dataSource === "backend" ? "bg-amber-500/15 text-amber-400 font-extrabold" : "text-[var(--text-muted)] hover:text-[var(--text-bright)]"
+            }`}
+            onClick={() => setDataSource("backend")}
+            title="Connect to Python Bot Backend"
+          >
+            Backend
+          </button>
+          <button
+            className={`px-2 py-[3px] border-none bg-transparent text-[10px] font-bold rounded-[3px] transition-all duration-150 uppercase cursor-pointer ${
+              dataSource === "browser" ? "bg-blue-500/15 text-blue-400 font-extrabold" : "text-[var(--text-muted)] hover:text-[var(--text-bright)]"
+            }`}
+            onClick={() => setDataSource("browser")}
+            title="Run Simulated Bot in Browser Sandbox"
+          >
+            Sandbox
+          </button>
+        </div>
+
         {/* Mode Toggle */}
         <div className="flex bg-[var(--bg-main)] border border-[var(--border-main)] p-0.5 rounded">
           <button
