@@ -139,6 +139,7 @@ def _shim(dyn, *, is_live=False, set_lev_calls=None):
         wallet=wallet,
         risk_manager=SimpleNamespace(peak_balance=0),
         _last_signal_df_1h=None,
+        _reject=lambda *a, **k: None,   # mirror engine API (publishes rejection events)
     )
 
 

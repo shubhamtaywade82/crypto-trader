@@ -89,6 +89,8 @@ class PlaybookMeanReversion:
 
         # Duplicate-candle guard: skip if we've already processed this bar.
         self._last_processed_ts: pd.Timestamp = _SENTINEL_TS
+        # Last evaluate() diagnostic (close/sma/deviation/band) for heartbeat logs.
+        self.last_eval: Optional[dict] = None
 
     def apply_overrides(self, ov: dict) -> None:
         """Live-update tunable params from a hot-reload overrides dict (keys are
@@ -208,6 +210,16 @@ class PlaybookMeanReversion:
 
         lower_trigger = sma * (1.0 - self.entry_band)
         upper_trigger = sma * (1.0 + self.entry_band)
+
+        # Diagnostic snapshot for the engine's per-tick heartbeat log (set even
+        # when there is no signal, so observers can see how close we are).
+        signed_dev = (close - sma) / sma if sma > 0 else 0.0
+        self.last_eval = {
+            "close": close, "sma": sma,
+            "deviation": signed_dev,            # signed fraction vs SMA
+            "band": self.entry_band,
+            "lower": lower_trigger, "upper": upper_trigger,
+        }
 
         side: Optional[PositionSide] = None
         reason: str = ""

@@ -1008,7 +1008,15 @@ class WebSocketTradingEngine:
 
         setup = self.playbook_st2.evaluate(df_st2, df_st2_htf)
         if not setup:
-            logger.debug("[ST2 ENTRY] No signal this tick")
+            # INFO heartbeat (was DEBUG/invisible): prove ST2 is evaluating.
+            direction = None
+            try:
+                direction = self.playbook_st2.get_current_direction(df_st2)
+            except Exception:
+                pass
+            logger.info("[ST2 EVAL] %s no flip this tick (direction=%s) → no signal",
+                        self.symbol, direction)
+            self._reject(f"st2_no_signal direction={direction}")
             return
 
         logger.info("[ST2 SIGNAL] %s | %s", setup["side"].value, setup["reason"])
@@ -1023,6 +1031,7 @@ class WebSocketTradingEngine:
                 "[ST2 BLOCKED] Funding extreme %+.4%% (threshold %.4%%)",
                 funding_rate, _funding_extreme,
             )
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
             return
 
         dynamic_threshold = self.adaptive_threshold.get_threshold()
@@ -1145,7 +1154,23 @@ class WebSocketTradingEngine:
 
         setup = self.playbook_mr.evaluate(df_mr)
         if not setup:
-            logger.debug("[MR ENTRY] No signal this tick for %s", self.symbol)
+            # INFO heartbeat: prove the symbol is being evaluated + show how close
+            # it is to a signal (dominant path — was DEBUG/invisible before).
+            ev = getattr(self.playbook_mr, "last_eval", None)
+            if ev:
+                logger.info(
+                    "[MR EVAL] %s close=%.4f sma=%.4f dev=%+.2f%% (need ±%.2f%%) → no signal",
+                    self.symbol, ev["close"], ev["sma"],
+                    ev["deviation"] * 100, ev["band"] * 100,
+                )
+                if self.event_bus:
+                    from .events import SignalRejectedEvent
+                    self.event_bus.publish(SignalRejectedEvent(
+                        symbol=self.symbol,
+                        reason=f"no_signal dev={ev['deviation']*100:+.2f}% < band ±{ev['band']*100:.2f}%",
+                    ))
+            else:
+                logger.info("[MR EVAL] %s no signal (insufficient data / dup candle)", self.symbol)
             return
 
         logger.info(
@@ -1163,6 +1188,7 @@ class WebSocketTradingEngine:
                 "[MR BLOCKED] %s — funding extreme %+.4f%% (threshold %.4f%%)",
                 self.symbol, funding_rate * 100, _funding_extreme * 100,
             )
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}% > ±{_funding_extreme*100:.4f}%")
             return
 
         dynamic_threshold = self.adaptive_threshold.get_threshold()
@@ -1286,6 +1312,7 @@ class WebSocketTradingEngine:
                             "[REGIME-BLOCK] No entry — extended regime is %s",
                             regime_ctx.extended.value,
                         )
+                        self._reject(f"regime_blocks_entry {regime_ctx.extended.value}")
                         return
 
                     # Profile-based regime filter
@@ -1295,6 +1322,7 @@ class WebSocketTradingEngine:
                                 "[PROFILE-BLOCK] %s regime not allowed by '%s' profile",
                                 regime_ctx.extended.value, self.cfg.trading_profile,
                             )
+                            self._reject(f"profile_regime_filter {regime_ctx.extended.value} not in {self.cfg.trading_profile}")
                             return
 
                     latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
@@ -1396,6 +1424,10 @@ class WebSocketTradingEngine:
             regime_score=regime_score,
         )
         if result is None:
+            logger.info("[LEGACY EVAL] %s no playbook passed threshold %.2f → no signal",
+                        self.symbol, self.adaptive_threshold.get_threshold())
+            self._reject(f"no_candidate_above_threshold {self.adaptive_threshold.get_threshold():.2f}",
+                         threshold=self.adaptive_threshold.get_threshold())
             return
 
         setup = result.setup
@@ -1411,6 +1443,7 @@ class WebSocketTradingEngine:
         )
         if not ok:
             logger.info("[BLOCKED] %s", corr_reason)
+            self._reject(f"correlation: {corr_reason}")
             return
 
         if self.advisor and result.advice:
@@ -1426,6 +1459,7 @@ class WebSocketTradingEngine:
                 "[BLOCKED] Funding extreme for %s: %+.4%% (threshold=%.2%%)",
                 setup["side"].value, funding_rate, _funding_extreme,
             )
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
             return
 
         self._execute_entry(EntryContext(
@@ -1483,6 +1517,20 @@ class WebSocketTradingEngine:
                 ))
             return False, basis
         return True, basis
+
+    def _reject(self, reason: str, final_score: float = 0.0, threshold: float = 0.0) -> None:
+        """Publish a SignalRejectedEvent so every veto is observable (UI/metrics),
+        not just logged. Best-effort — never raises into the entry path."""
+        if not self.event_bus:
+            return
+        try:
+            from .events import SignalRejectedEvent
+            self.event_bus.publish(SignalRejectedEvent(
+                symbol=self.symbol, reason=reason,
+                final_score=float(final_score), threshold=float(threshold),
+            ))
+        except Exception:
+            pass
 
     def _apply_dynamic_leverage(self, setup, entry_price, regime_ctx) -> bool:
         """Compute and apply per-trade leverage in the [5x,20x] band.
@@ -1543,6 +1591,12 @@ class WebSocketTradingEngine:
             if lev <= 0:
                 logger.warning("[DYNAMIC-LEVERAGE] %s computed 0 (volatility halt) — skipping entry",
                                self.symbol)
+                # Guard the reject so a publish error can't bubble to the outer
+                # except and flip this HALT into a trade.
+                try:
+                    self._reject("dynamic_leverage_halt (extreme vol / no-trade regime)")
+                except Exception:
+                    pass
                 return False
 
             # Apply: venue first (live), then per-symbol wallet so margin math agrees.
@@ -1612,6 +1666,7 @@ class WebSocketTradingEngine:
         if not self.ws_feed.is_fresh(stale_ms):
             age = self.ws_feed.data_age_ms()
             logger.warning("[ENTRY] WS feed stale (age=%sms > %dms) — vetoing entry", age, stale_ms)
+            self._reject(f"feed_stale age={age}ms > {stale_ms}ms")
             return
 
         # Get current LTP and spread from WebSocket
@@ -1621,6 +1676,7 @@ class WebSocketTradingEngine:
 
         if ltp <= 0 or mid <= 0:
             logger.warning("[ENTRY] WebSocket LTP/mid unavailable (ltp=%.4f mid=%.4f) — vetoing entry", ltp, mid)
+            self._reject(f"ltp_unavailable ltp={ltp} mid={mid}")
             return
 
         # Slippage estimate: if spread > 0.1%, log warning
@@ -1763,6 +1819,7 @@ class WebSocketTradingEngine:
                             "(need ~$%.2f margin, have $%.2f); skipping",
                             self.symbol, required_margin, available_margin,
                         )
+                        self._reject(f"min_notional_unaffordable need=${required_margin:.2f} have=${available_margin:.2f}")
                         return
 
                     # Risk now exceeds the configured cap — operator MUST see this.
@@ -1787,6 +1844,7 @@ class WebSocketTradingEngine:
                         "[ENTRY SKIP] %s instrument spec unavailable in live mode "
                         "(%s); cannot verify min-notional, skipping tick", self.symbol, e,
                     )
+                    self._reject(f"spec_unavailable_live: {e}")
                     return
                 logger.warning(f"Failed to fetch instrument spec for pre-entry validation: {e}")
 
@@ -1794,6 +1852,7 @@ class WebSocketTradingEngine:
         # legal order (e.g. no mapper AND tiny risk_budget) → skip.
         if quantity <= 0:
             logger.warning("[ENTRY] computed quantity <= 0 (stop_distance=%s); skipping", stop_distance)
+            self._reject(f"qty_zero stop_distance={stop_distance}")
             return
 
         # Margin Engine Validation
@@ -1802,6 +1861,7 @@ class WebSocketTradingEngine:
         margin_ok, margin_msg = self.margin_engine.check_margin_utilization(used_margin, margin_balance)
         if not margin_ok:
             logger.warning(f"[ENTRY BLOCKED] Margin Utilization: {margin_msg}")
+            self._reject(f"margin_utilization: {margin_msg}")
             return
 
         leverage_val = self.wallet.get_leverage(self.symbol) if getattr(self.wallet, "live_execution", False) else (self.cfg.leverage if self.cfg else 2)
@@ -1821,6 +1881,7 @@ class WebSocketTradingEngine:
         )
         if not liq_ok:
             logger.warning(f"[ENTRY BLOCKED] Liquidation Distance: {liq_msg}")
+            self._reject(f"liquidation_distance: {liq_msg}")
             return
 
         # Leverage Engine Validation
@@ -1832,6 +1893,7 @@ class WebSocketTradingEngine:
         )
         if not lev_ok:
             logger.warning(f"[ENTRY BLOCKED] Leverage Tier: {lev_msg}")
+            self._reject(f"leverage_tier: {lev_msg}")
             return
 
         # (Venue min-notional / min-quantity is enforced earlier via
@@ -1868,6 +1930,7 @@ class WebSocketTradingEngine:
                 fee_gate_ok = False
 
         if not fee_gate_ok:
+            self._reject("fee_gate expected_profit < fees×ratio")
             return
 
         # ── Adaptive entry order style ────────────────────────────────────────
