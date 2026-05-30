@@ -82,9 +82,14 @@ class CoinDCXUserStream:
 
         self.sio = None
         self._thread: Optional[threading.Thread] = None
+        self._ping_thread: Optional[threading.Thread] = None
         self._running = False
         self._connected = False
         self._reconnect_attempts = 0
+        # CoinDCX expects an app-level ping ~every 25s (docs); without it the
+        # server may silently drop an idle socket and the bot goes blind to
+        # fills/SL-hits/liquidations until reconnect.
+        self.ping_interval_s = 25.0
         from collections import OrderedDict
         # FIFO-bounded dedup: evict the OLDEST key, never an arbitrary (possibly
         # recent) one — a set.pop() could drop a just-seen fill and re-process it.
@@ -121,7 +126,21 @@ class CoinDCXUserStream:
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, name="coindcx-user-stream", daemon=True)
         self._thread.start()
+        self._ping_thread = threading.Thread(target=self._ping_loop, name="coindcx-user-stream-ping", daemon=True)
+        self._ping_thread.start()
         return True
+
+    def _ping_loop(self) -> None:
+        """Emit an app-level ping every ``ping_interval_s`` while connected, so an
+        idle socket isn't silently dropped (docs: ping ~every 25s)."""
+        while self._running:
+            time.sleep(self.ping_interval_s)
+            if not (self._running and self._connected and self.sio is not None):
+                continue
+            try:
+                self.sio.emit("ping", {"data": "ping"})
+            except Exception as e:
+                logger.debug("CoinDCX stream ping failed: %s", e)
 
     def stop(self) -> None:
         self._running = False

@@ -106,3 +106,52 @@ def test_balance_update_parses_list_correctly():
     assert len(balances) == 1
     assert balances[0]["currency_short_name"] == "USDT"
     assert float(balances[0]["balance"]) == 1.0221449
+
+
+# ── live-safety hardening (ping keepalive + position-update routing) ──
+
+def test_ping_loop_emits_when_connected():
+    import time as _t
+    s = _stream()
+    s.ping_interval_s = 0.01
+    s._running = True
+    s._connected = True
+    sent = []
+    class _Sio:
+        def emit(self, ev, data=None):
+            sent.append(ev)
+    s.sio = _Sio()
+    import threading
+    th = threading.Thread(target=s._ping_loop, daemon=True)
+    th.start()
+    _t.sleep(0.05)
+    s._running = False
+    th.join(timeout=1)
+    assert "ping" in sent
+
+
+def test_ping_loop_silent_when_disconnected():
+    import time as _t, threading
+    s = _stream()
+    s.ping_interval_s = 0.01
+    s._running = True
+    s._connected = False   # not connected → no ping
+    sent = []
+    class _Sio:
+        def emit(self, ev, data=None):
+            sent.append(ev)
+    s.sio = _Sio()
+    th = threading.Thread(target=s._ping_loop, daemon=True)
+    th.start()
+    _t.sleep(0.05)
+    s._running = False
+    th.join(timeout=1)
+    assert sent == []
+
+
+def test_on_position_callback_invoked():
+    got = {}
+    s = _stream()
+    s.on_position = lambda d: got.update(d)
+    s._on_position_update({"pair": "B-SOL_USDT", "active_pos": 0.0})
+    assert got.get("pair") == "B-SOL_USDT"

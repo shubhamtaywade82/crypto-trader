@@ -686,6 +686,22 @@ class EnhancedFuturesWallet:
             external_fill=external,
         )
 
+    def _venue_position_qty(self, symbol: str) -> Optional[Decimal]:
+        """Absolute open quantity the VENUE reports for *symbol*, or None if the
+        read fails. Used by the close flip-guard to never sell more than the
+        venue holds (CoinDCX nets one-way positions; no reduce-only flag)."""
+        eng = getattr(self, "execution_engine", None)
+        if eng is None or not hasattr(eng, "get_positions"):
+            return None
+        try:
+            for p in eng.get_positions():
+                if p.get("symbol") == symbol:
+                    return abs(Decimal(str(p.get("quantity", 0) or 0)))
+            return Decimal("0")  # not in the venue's open-position list → flat
+        except Exception as e:
+            logger.warning("[CLOSE GUARD] venue qty read failed for %s: %s", symbol, e)
+            return None
+
     def _venue_fill(self, symbol: str, order_side: "PositionSide", quantity: Decimal, reduce_only: bool, intent: str) -> dict:
         """Place a market order on the live venue and return the realized fill.
 
@@ -1302,7 +1318,29 @@ class EnhancedFuturesWallet:
 
             if external_fill is None and self.live_execution and self.execution_engine is not None:
                 exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
-                external_fill = self._venue_fill(symbol, exit_side, pos.remaining_quantity, reduce_only=True, intent="exit")
+                # FLIP GUARD: CoinDCX has no reduce-only flag — an opposite-side
+                # order that exceeds the venue's actual position NETS through zero
+                # and opens an opposite position. Clamp the exit qty to what the
+                # venue actually holds; if the venue is already flat (SL/TP/liq
+                # fired), skip the venue order and just book the internal close.
+                exit_qty = pos.remaining_quantity
+                venue_qty = self._venue_position_qty(symbol)
+                if venue_qty is not None:
+                    if venue_qty <= Decimal("0"):
+                        logger.warning(
+                            "[CLOSE GUARD] %s venue already flat (internal=%.8f) — "
+                            "booking internal close, no venue order", symbol, float(exit_qty))
+                        external_fill = None  # fall through to mark-price booking
+                    else:
+                        if venue_qty < exit_qty:
+                            logger.warning(
+                                "[CLOSE GUARD] %s clamping exit qty %.8f→%.8f to venue "
+                                "position (prevents flip)", symbol, float(exit_qty), float(venue_qty))
+                            exit_qty = venue_qty
+                        external_fill = self._venue_fill(symbol, exit_side, exit_qty, reduce_only=True, intent="exit")
+                else:
+                    # Venue qty unknown (read failed) — proceed with internal qty.
+                    external_fill = self._venue_fill(symbol, exit_side, exit_qty, reduce_only=True, intent="exit")
 
             if external_fill is not None:
                 execution_price = self._to_decimal(external_fill["price"])

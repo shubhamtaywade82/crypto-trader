@@ -258,6 +258,7 @@ class LiveTradingSystem:
             on_fill=self._on_stream_fill,
             on_reconnect=self._safe_reconcile,
             on_balance=self._on_stream_balance,
+            on_position=self._on_stream_position,
         )
         started = self.user_stream.start()
         logger.info("CoinDCX user stream: %s", "started" if started else "unavailable (REST fallback)")
@@ -282,6 +283,31 @@ class LiveTradingSystem:
                 sym, pos.side, fill.get("fill_price", 0), fill.get("fill_quantity", 0),
                 order_id=oid, reduce_only=True,
             )
+
+    def _on_stream_position(self, pos_update: dict):
+        """Apply a real-time df-position-update by reconciling the affected symbol.
+
+        Turns a venue-side position change (SL/TP/liquidation/partial) into an
+        immediate REST reconcile instead of waiting for the 60s tick — closing
+        the blind window. Reconcile is idempotent, so this is safe to call often.
+        Only fires when the venue state actually differs from what we hold.
+        """
+        try:
+            pair = pos_update.get("pair") or pos_update.get("symbol") or ""
+            from .exchanges.instrument_mapper import coindcx_to_internal
+            sym = coindcx_to_internal(pair) if pair else self.cfg.symbol
+            venue_qty = abs(float(pos_update.get("active_pos", 0) or 0))
+            internal = self.wallet.get_open_position(sym)
+            internal_qty = float(internal.remaining_quantity) if internal else 0.0
+            # Reconcile when the venue/internal open-state or qty diverges.
+            if (venue_qty == 0.0) != (internal_qty == 0.0) or \
+               (internal_qty > 0 and abs(venue_qty - internal_qty) / internal_qty > 1e-4):
+                logger.info("[STREAM] position change %s venue=%.6f internal=%.6f → reconcile",
+                            sym, venue_qty, internal_qty)
+                if self.reconciler is not None:
+                    self.reconciler.reconcile(sym)
+        except Exception as e:
+            logger.error("[STREAM] on_position handler failed: %s", e)
 
     def _on_stream_balance(self, balance_update: dict):
         """Handle real-time balance updates from CoinDCX user stream."""
