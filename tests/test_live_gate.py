@@ -16,7 +16,8 @@ def test_config_live_requires_credentials():
 
 
 def test_config_rejects_leverage_above_cap():
-    cfg = TradingConfig(mode=TradingMode.PAPER, max_leverage=10)
+    # cap raised to 20x (5-20 dynamic band); use a value ABOVE 20 to test rejection.
+    cfg = TradingConfig(mode=TradingMode.PAPER, max_leverage=25)
     assert any("MAX_LEVERAGE" in e for e in cfg.validate())
 
 

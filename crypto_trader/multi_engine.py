@@ -72,6 +72,7 @@ def parse_args():
     parser.add_argument("--log-rest", action="store_true", help="Log REST API responses")
     parser.add_argument("--log-ws", action="store_true", help="Log WebSocket messages")
     parser.add_argument("--log-llm", action="store_true", help="Log LLM prompts and raw responses")
+    parser.add_argument("--tick", type=int, default=300, help="Signal tick interval in seconds (default: 300)")
     return parser.parse_args()
 
 def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
@@ -145,9 +146,9 @@ def run_preflight_checks(
         cfg = load_config()
     return run_venue_preflight(symbols, wallet, execution_engine, risk, bus, cfg)
 
-def run_engine(engine: WebSocketTradingEngine):
+def run_engine(engine: WebSocketTradingEngine, tick: int = 300):
     try:
-        engine.run_loop()
+        engine.run_loop(signal_interval_seconds=tick)
     except Exception as e:
         logger.error(f"Engine loop crashed for {engine.symbol}: {e}")
     finally:
@@ -359,7 +360,7 @@ def main():
 
     try:
         for engine in engines:
-            t = threading.Thread(target=run_engine, args=(engine,), daemon=True)
+            t = threading.Thread(target=run_engine, args=(engine, args.tick), daemon=True)
             threads.append(t)
             t.start()
             

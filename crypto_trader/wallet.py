@@ -605,6 +605,49 @@ class EnhancedFuturesWallet:
         """Set leverage for a specific symbol."""
         self.symbol_leverages[symbol] = leverage
 
+    def update_symbol_leverage(self, symbol: str, leverage: int) -> bool:
+        """Update leverage for a symbol and sync to the venue when changed.
+
+        Returns ``True`` when the leverage was actually updated (different from
+        the current value).  Emits a ``LEVERAGE_ADJUSTED`` event and, in live
+        mode, pushes the new value to the exchange via ``set_leverage()``.
+        """
+        current = self.get_leverage(symbol)
+        if current == leverage:
+            return False
+
+        self.symbol_leverages[symbol] = leverage
+
+        if self.live_execution and self.execution_engine and hasattr(self.execution_engine, "set_leverage"):
+            try:
+                ok = self.execution_engine.set_leverage(symbol, leverage)
+                if ok:
+                    logger.info(
+                        "[LEVERAGE] Updated %s leverage: %d -> %d (venue synced)",
+                        symbol, current, leverage,
+                    )
+                else:
+                    logger.warning(
+                        "[LEVERAGE] Venue rejected leverage update for %s: %d",
+                        symbol, leverage,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[LEVERAGE] Failed to sync leverage to venue for %s: %s",
+                    symbol, e,
+                )
+        else:
+            logger.info(
+                "[LEVERAGE] Updated %s leverage: %d -> %d",
+                symbol, current, leverage,
+            )
+
+        self._emit_event(
+            "LEVERAGE_ADJUSTED",
+            {"symbol": symbol, "old_leverage": current, "new_leverage": leverage},
+        )
+        return True
+
     def sync_leverage_from_venue(self, symbol: str):
         """Syncs the wallet's leverage settings for the symbol from the execution engine."""
         if not (self.live_execution and self.execution_engine) or symbol == "GLOBAL":
