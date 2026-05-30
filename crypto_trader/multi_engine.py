@@ -14,6 +14,7 @@ from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
 from crypto_trader.risk import RiskManager
+from crypto_trader.smc_alert_processor import SMCAlertProcessor
 from crypto_trader import safe_mode
 
 # Env variables are loaded by crypto_trader.__init__ (_load_dotenv):
@@ -318,7 +319,12 @@ def main():
         tg_service.start()
         logger.info("Telegram notification service started")
     else:
+        tg_service = None
         logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing. Notifications disabled.")
+
+    # Start SMC → LLM → Telegram alert pipeline
+    smc_processor = SMCAlertProcessor(event_bus=bus, telegram_service=tg_service)
+    smc_processor.start()
 
     # Divide total balance equally among symbols to prevent overallocation
     per_symbol_balance = total_balance / len(symbols)

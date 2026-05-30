@@ -33,6 +33,7 @@ from .playbooks import PlaybookA, PlaybookB, PlaybookAres, PlaybookVolExhaust, P
 from .strategies.supertrend2 import PlaybookSupertrend2
 from .strategies.mean_reversion import PlaybookMeanReversion
 from .strategies.smc_pipeline import PlaybookSMC
+from .strategies.regime_switch import PlaybookRegimeSwitch
 from .strategies.mr_state import MRStateManager
 from .strategies.router import StrategyRouter, RouterResult, build_legacy_router
 from .reconciliation import ExchangeStateReconciler
@@ -306,6 +307,34 @@ class WebSocketTradingEngine:
                 self.playbook_smc.min_score, self.playbook_smc.swing_window, self.symbol,
             )
 
+        # Regime Switch playbook (wraps ST2 with regime gating)
+        self.playbook_regime_switch: Optional[PlaybookRegimeSwitch] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "regime_switch":
+            self.playbook_regime_switch = PlaybookRegimeSwitch(
+                entry_timeframe=getattr(cfg, "st2_timeframe", "1h"),
+                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
+                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
+                factor=getattr(cfg, "st2_factor", 3.0),
+                atr_period=getattr(cfg, "st2_atr_period", 10),
+                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 1.5),
+                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
+                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
+                tp2_pct=getattr(cfg, "st2_tp2_pct", 3.0),
+                tp_mode=getattr(cfg, "st2_tp_mode", "split"),
+                min_confidence=getattr(cfg, "st2_min_confidence", 60.0),
+                allowed_regimes=getattr(cfg, "rs_allowed_regimes", None),
+            )
+            logger.info(
+                "[RS] Regime Switch mode active: entry_tf=%s htf=%s factor=%.1f "
+                "mode=%s sl=%s symbol=%s",
+                self.playbook_regime_switch.entry_timeframe,
+                self.playbook_regime_switch.htf_timeframe,
+                self.playbook_regime_switch.factor,
+                self.playbook_regime_switch.entry_mode,
+                self.playbook_regime_switch.sl_mode,
+                self.symbol,
+            )
+
         # Regime / Session engine
         _rc_kwargs = {}
         if cfg:
@@ -340,6 +369,10 @@ class WebSocketTradingEngine:
         # M-8: tracks how many signal ticks have fired with LLM enabled but no
         # advice available yet (cold-start window).  Reset once advice arrives.
         self._llm_cold_start_ticks = 0
+
+        # SMC alert state: tracks the last published structure fingerprint so we
+        # only emit SMCAlertEvent when something NEW appears (not on every tick).
+        self._last_smc_state: Optional[dict] = None
 
         # WebSocket position manager (high-frequency exits)
         self.ws_pm = WebSocketPositionManager(
@@ -714,6 +747,8 @@ class WebSocketTradingEngine:
         regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx = result
 
         structure, structure_ltf = self._compute_market_structure(data)
+        htf_trend = str(regime_ctx.extended.value) if regime_ctx else str(regime)
+        self._scan_and_emit_smc_alerts(structure_ltf or structure, data.get("mark_price", 0.0), htf_trend)
         self._start_llm_async(data, regime, regime_score, regime_ctx, session_ctx, rvol)
 
         # M-8: LLM cold-start warning — alert the operator when LLM is enabled
@@ -988,6 +1023,124 @@ class WebSocketTradingEngine:
 
         return structure, structure_ltf
 
+    def _scan_and_emit_smc_alerts(self, structure: dict, mark_price: float, htf_trend: str):
+        """Compare current 15m SMC structure with the previous tick and publish
+        :class:`~crypto_trader.events.SMCAlertEvent` for newly-appearing structures.
+        """
+        if structure is None:
+            return
+
+        from .events import SMCAlertEvent
+
+        # Build a lightweight fingerprint of current structures
+        def _fingerprint(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, list):
+                return tuple(sorted(
+                    (o.get("type", ""), round(float(o.get("price", o.get("top", o.get("high", 0)))), 4))
+                    for o in obj
+                ))
+            if isinstance(obj, dict):
+                return (obj.get("type", ""), obj.get("event", ""), round(float(obj.get("price", obj.get("swing_price", 0))), 4))
+            return None
+
+        current = {
+            "sweep": _fingerprint(structure.get("recent_sweep")),
+            "bos": _fingerprint(structure.get("recent_bos")),
+            "choch": _fingerprint(structure.get("recent_choch")),
+            "obs": _fingerprint(structure.get("unmitigated_order_blocks", [])),
+            "fvgs": _fingerprint(structure.get("unmitigated_fvgs", [])),
+            "pa": _fingerprint(structure.get("price_action_signals", [])),
+        }
+
+        prev = self._last_smc_state
+        self._last_smc_state = current
+
+        if prev is None:
+            return  # First tick — no baseline, skip alerting
+
+        # Detect new structures
+        alerts = []
+
+        # Sweep
+        if current["sweep"] and current["sweep"] != prev.get("sweep"):
+            s = structure["recent_sweep"]
+            alerts.append(SMCAlertEvent(
+                symbol=self.symbol,
+                alert_type="sweep",
+                direction=s.get("type", "").lower(),
+                price=float(s.get("swept_price", mark_price)),
+                details=f"Liquidity sweep of swing {s.get('swing_price')} → wick to {s.get('swept_price')} ({s.get('candles_ago')}c ago)",
+                htf_trend=htf_trend,
+                mark_price=mark_price,
+            ))
+
+        # BOS / CHoCH
+        for key, label in (("bos", "bos"), ("choch", "choch")):
+            if current[key] and current[key] != prev.get(key):
+                b = structure.get(f"recent_{key}")
+                if b:
+                    alerts.append(SMCAlertEvent(
+                        symbol=self.symbol,
+                        alert_type=label,
+                        direction=b.get("type", "").lower(),
+                        price=float(b.get("break_price", mark_price)),
+                        details=f"{b.get('event', label.upper())} @ {b.get('break_price')} ({b.get('candles_ago')}c ago)",
+                        htf_trend=htf_trend,
+                        mark_price=mark_price,
+                    ))
+
+        # New OBs
+        if current["obs"] and current["obs"] != prev.get("obs"):
+            obs = structure.get("unmitigated_order_blocks", [])
+            new_obs = [o for o in obs if _fingerprint(o) not in (prev.get("obs") or [])]
+            for o in new_obs[:1]:  # alert only the newest OB
+                alerts.append(SMCAlertEvent(
+                    symbol=self.symbol,
+                    alert_type="ob",
+                    direction=o.get("type", "").lower(),
+                    price=float(o.get("low", mark_price)),
+                    details=f"Unmitigated OB {o.get('low')}-{o.get('high')} (candle {o.get('index')})",
+                    htf_trend=htf_trend,
+                    mark_price=mark_price,
+                ))
+
+        # New FVGs
+        if current["fvgs"] and current["fvgs"] != prev.get("fvgs"):
+            fvgs = structure.get("unmitigated_fvgs", [])
+            new_fvgs = [g for g in fvgs if _fingerprint(g) not in (prev.get("fvgs") or [])]
+            for g in new_fvgs[:1]:  # alert only the newest FVG
+                alerts.append(SMCAlertEvent(
+                    symbol=self.symbol,
+                    alert_type="fvg",
+                    direction=g.get("type", "").lower(),
+                    price=float(g.get("bottom", mark_price)),
+                    details=f"Unmitigated FVG {g.get('bottom')}-{g.get('top')} (candle {g.get('index')})",
+                    htf_trend=htf_trend,
+                    mark_price=mark_price,
+                ))
+
+        # Price Action
+        if current["pa"] and current["pa"] != prev.get("pa"):
+            pa_sigs = structure.get("price_action_signals", [])
+            new_pa = [p for p in pa_sigs if _fingerprint(p) not in (prev.get("pa") or [])]
+            for p in new_pa[:1]:
+                alerts.append(SMCAlertEvent(
+                    symbol=self.symbol,
+                    alert_type=p.get("pattern", "pa").lower(),
+                    direction=p.get("type", "").lower(),
+                    price=float(p.get("price", mark_price)),
+                    details=f"{p.get('pattern')} @ {p.get('price')}",
+                    htf_trend=htf_trend,
+                    mark_price=mark_price,
+                ))
+
+        for alert in alerts:
+            if self.event_bus:
+                self.event_bus.publish(alert)
+                logger.info("[SMC-ALERT] Published %s %s for %s", alert.alert_type, alert.direction, self.symbol)
+
     def _start_llm_async(self, data: dict, regime, regime_score, regime_ctx, session_ctx, rvol):
         """Start the LLM advice thread asynchronously (step 4)."""
         if not (self.use_llm and self.advisor):
@@ -1029,20 +1182,21 @@ class WebSocketTradingEngine:
         Check whether the Supertrend2 direction has just flipped against the
         open position. If so, close it and return True.
 
-        Called every signal tick (5 min) when strategy_mode == "supertrend2".
-        The 1H Supertrend can flip at most once per hour so this granularity
-        is more than sufficient.
+        Called every signal tick (5 min) when strategy_mode == "supertrend2" or
+        "regime_switch".  The 1H Supertrend can flip at most once per hour so
+        this granularity is more than sufficient.
         """
-        if self.playbook_st2 is None:
+        pb = self.playbook_st2 or (self.playbook_regime_switch.st2 if self.playbook_regime_switch else None)
+        if pb is None:
             return False
         try:
             df_st2 = data.get("df_st2", data["df_1h"])
-            if df_st2 is None or len(df_st2) < self.playbook_st2._min_bars():
+            if df_st2 is None or len(df_st2) < pb._min_bars():
                 return False
 
             from .strategies.supertrend2 import compute_supertrend2
-            atr_len = self.playbook_st2._effective_atr_len()
-            _, direction = compute_supertrend2(df_st2, self.playbook_st2.factor, atr_len)
+            atr_len = pb._effective_atr_len()
+            _, direction = compute_supertrend2(df_st2, pb.factor, atr_len)
 
             curr_dir = int(direction.iloc[-1])
             prev_dir = int(direction.iloc[-2])
@@ -1131,6 +1285,73 @@ class WebSocketTradingEngine:
             final_score=1.0,          # ST2 signal is binary; always passes threshold
             llm_weight=0.0,
             explanation="Supertrend2 signal",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=1.0,
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=dynamic_threshold,
+            regime_ctx=regime_ctx,
+        ))
+
+    def _evaluate_entry_regime_switch(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """
+        Entry evaluation path for strategy_mode == "regime_switch".
+
+        Wraps Supertrend2 with an extended-regime gate.  Only entries that
+        occur during allowed regimes (default: TREND_EXPANSION or
+        BREAKOUT_ENVIRONMENT) are passed through to execution.
+        """
+        if self.playbook_regime_switch is None:
+            return
+
+        df_st2 = data.get("df_st2", data["df_1h"])
+        df_st2_htf = data.get("df_st2_htf", data["df_4h"]) if self.playbook_regime_switch.use_htf_filter else None
+
+        setup = self.playbook_regime_switch.evaluate(df_st2, df_st2_htf, regime_ctx=regime_ctx)
+        if not setup:
+            direction = None
+            try:
+                direction = self.playbook_regime_switch.st2.get_current_direction(df_st2)
+            except Exception:
+                pass
+            logger.info("[RS EVAL] %s no signal this tick (direction=%s) → no signal",
+                        self.symbol, direction)
+            self._reject(f"rs_no_signal direction={direction}")
+            return
+
+        logger.info("[RS SIGNAL] %s | %s", setup["side"].value, setup["reason"])
+
+        # Funding-rate extreme guard (keep for safety)
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"].value in ("LONG", "BUY") and funding_rate > _funding_extreme)
+            or (setup["side"].value in ("SHORT", "SELL") and funding_rate < -_funding_extreme)
+        ):
+            logger.info(
+                "[RS BLOCKED] Funding extreme %+.4%% (threshold %.4%%)",
+                funding_rate, _funding_extreme,
+            )
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        dynamic_threshold = self.adaptive_threshold.get_threshold()
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=1.0,
+            llm_weight=0.0,
+            explanation="RegimeSwitch signal",
             mark_price=mark_price,
             funding_rate=funding_rate,
             oi_delta=0.0,
@@ -1330,10 +1551,11 @@ class WebSocketTradingEngine:
 
         rvol = getattr(regime_ctx, "rvol", 1.0) if regime_ctx else 1.0
         liq_intensity = getattr(regime_ctx, "liquidation_intensity", 0.0) if regime_ctx else 0.0
+        oi_delta = getattr(regime_ctx, "oi_delta", 0.0) if regime_ctx else 0.0
 
         setup = self.playbook_smc.evaluate(
             df_smc, df_smc_htf,
-            oi_delta=None, oi_available=False,
+            oi_delta=oi_delta, oi_available=True,
             rvol=rvol, liquidation_intensity=liq_intensity,
         )
         if not setup:
@@ -1397,9 +1619,10 @@ class WebSocketTradingEngine:
             if _mr_mode and self._mr_check_sma_exit(data, pos):
                 return  # position closed by SMA reversion; skip further management
 
-            # ST2 mode: check for Supertrend flip exit before normal SL/TP logic
+            # ST2 / RegimeSwitch mode: check for Supertrend flip exit before normal SL/TP logic
             _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
-            if _st2_mode and self._st2_check_flip_exit(data, pos):
+            _rs_mode  = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "regime_switch"
+            if (_st2_mode or _rs_mode) and self._st2_check_flip_exit(data, pos):
                 return  # position closed by flip; skip further position management
 
             df_1h = data["df_1h"]
@@ -1490,6 +1713,14 @@ class WebSocketTradingEngine:
                     # 10-stage structure+participation filter; the composite
                     # score gate (min_score) is applied inside the strategy.
                     self._evaluate_entry_smc(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                elif self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "regime_switch":
+                    # ── Regime Switch path ────────────────────────────────────
+                    # Supertrend2 gated by extended regime (trend expansion /
+                    # breakout environment only by default).  Uses same
+                    # position-management as vanilla ST2.
+                    self._evaluate_entry_regime_switch(
                         data, mark_price, funding_rate, taker_ratio, regime_ctx
                     )
                 else:

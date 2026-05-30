@@ -45,10 +45,13 @@ class StrategyMode(str, Enum):
                       SMA by ``mr_entry_band``, exit when it reverts to SMA.
                       Works on any symbol in the WATCHLIST.  Funding-rate guard
                       and all risk/daily limits still apply.
+    REGIME_SWITCH   — Supertrend2 gated by market regime.  Only enters during
+                      TREND_EXPANSION / BREAKOUT_ENVIRONMENT; sits flat in chop.
     """
     LEGACY = "legacy"
     SUPERTREND2 = "supertrend2"
     MEAN_REVERSION = "mean_reversion"
+    REGIME_SWITCH = "regime_switch"
 
 
 @dataclass
