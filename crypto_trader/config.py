@@ -215,9 +215,8 @@ class TradingConfig:
     # ── Dynamic per-trade leverage (5x–20x band) ──
     # When enabled, each entry's leverage is scaled within [dynamic_leverage_min,
     # dynamic_leverage_max] by volatility (ATR%), account drawdown, margin ratio,
-    # and regime — down in high vol / drawdown, up in strong trends. Default OFF:
-    # the bot uses the fixed max_leverage. Enable only after paper validation.
-    use_dynamic_leverage: bool = False
+    # and regime — down in high vol / drawdown, up in strong trends.
+    use_dynamic_leverage: bool = True
     dynamic_leverage_min: int = 5
     dynamic_leverage_max: int = 20
     # Scaling-sensitivity thresholds (when leverage is pulled toward the floor).
@@ -338,7 +337,7 @@ class TradingConfig:
     max_consecutive_losses: int = field(default=_SPEC_MAX_CONSECUTIVE_LOSSES)
     max_drawdown_pct: float = 0.20
     max_daily_drawdown_pct: float = 0.03
-    cooldown_after_loss_minutes: int = 1440
+    cooldown_after_loss_minutes: int = 60
     allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
 
     # ── Strategy mode ──
@@ -413,7 +412,7 @@ class TradingConfig:
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
             max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
-            use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", False),
+            use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", True),
             dynamic_leverage_min=_get_int("DYNAMIC_LEVERAGE_MIN", 5),
             dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 20),
             dynamic_leverage_vol_atr_period=_get_int("DYNAMIC_LEVERAGE_VOL_ATR_PERIOD", 14),
@@ -502,7 +501,7 @@ class TradingConfig:
             ),
             max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", profile.max_drawdown_pct),
             max_daily_drawdown_pct=_get_float("DAILY_MAX_LOSS_PCT", 0.03),
-            cooldown_after_loss_minutes=_get_int("LOSS_COOLDOWN_MINUTES", 1440),
+            cooldown_after_loss_minutes=_get_int("LOSS_COOLDOWN_MINUTES", 60),
             allowed_regimes=profile.allowed_regimes,
             strategy_mode=_get("STRATEGY_MODE", "legacy").lower(),
             st2_atr_period=_get_int("ST2_ATR_PERIOD", 10),
