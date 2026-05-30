@@ -750,6 +750,7 @@ class EnhancedFuturesWallet:
             sl_order = self.execution_engine.place_order(
                 pos.symbol, exit_side, pos.remaining_quantity, OrderType.STOP_MARKET,
                 trigger_price=pos.sl_price, reduce_only=True,
+                leverage=pos.leverage,
             )
             if sl_order and sl_order.id:
                 placed["sl"] = sl_order.id
@@ -770,6 +771,7 @@ class EnhancedFuturesWallet:
                 tp_order = self.execution_engine.place_order(
                     pos.symbol, exit_side, pos.remaining_quantity, OrderType.TAKE_PROFIT,
                     trigger_price=tp_price, reduce_only=True,
+                    leverage=pos.leverage,
                 )
                 if tp_order and tp_order.id:
                     placed["tp"] = tp_order.id
@@ -2715,6 +2717,8 @@ class PaperExecutionEngine:
         limit_price: Optional[Decimal] = None,
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
+        client_order_id: Optional[str] = None,
+        leverage: Optional[float] = None,  # accepted for API parity; paper has no venue leverage
     ) -> Order:
         return self.wallet.place_pending_order(
             symbol=symbol,

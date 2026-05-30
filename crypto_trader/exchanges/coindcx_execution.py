@@ -125,10 +125,16 @@ class CoinDCXExecutionEngine:
         reduce_only: bool = False,
         expires_at: Optional[int] = None,
         client_order_id: Optional[str] = None,
+        leverage: Optional[float] = None,
     ) -> Order:
         safe_mode.assert_live_allowed(
             "PLACE", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol
         )
+        # CoinDCX requires an order's leverage to equal the existing position's
+        # leverage (422 otherwise). Callers placing reduce-only protective orders
+        # against a position opened at a different leverage (e.g. an adopted
+        # venue position) must pass that position's leverage here.
+        order_leverage = float(leverage) if leverage else float(self.leverage)
         spec = self.mapper.get_spec(symbol)
         qty = spec.round_qty(Decimal(str(quantity)))
         ref_price = limit_price or trigger_price
@@ -145,7 +151,7 @@ class CoinDCXExecutionEngine:
             "side": _SIDE_TO_CDCX[side],
             "order_type": _ORDER_TYPE_TO_CDCX[order_type],
             "total_quantity": float(qty),
-            "leverage": float(self.leverage),
+            "leverage": order_leverage,
             "notification": "no_notification",
             "position_margin_type": self.margin_type,
             "margin_currency_short_name": self.margin_currency,
