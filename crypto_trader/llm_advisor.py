@@ -54,7 +54,11 @@ CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "1800"))
 MAX_LLM_AGE_SECONDS = int(os.getenv("LLM_MAX_AGE", "120"))
 LLM_MAX_LATENCY_MS = int(os.getenv("LLM_MAX_LATENCY", "60000"))
 LLM_WEIGHT = float(os.getenv("LLM_WEIGHT", "0.20"))
-FINAL_SCORE_THRESHOLD = float(os.getenv("FINAL_SCORE_THRESHOLD", "0.75"))
+# Fallback only — the OPERATING threshold is cfg.final_score_threshold
+# (TradingConfig reads the same FINAL_SCORE_THRESHOLD env / profile default).
+# One shared default lives in config so this module and the engines never diverge.
+from .config import DEFAULT_FINAL_SCORE_THRESHOLD
+FINAL_SCORE_THRESHOLD = float(os.getenv("FINAL_SCORE_THRESHOLD", str(DEFAULT_FINAL_SCORE_THRESHOLD)))
 
 
 class LLMBias(Enum):

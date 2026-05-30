@@ -175,3 +175,36 @@ def test_engine_noop_when_disabled():
     # gate attribute is the off switch.
     sh = _shim(None)
     assert sh.dynamic_leverage is None
+
+
+# ── scaling thresholds are .env-configurable (not hardcoded) ──
+
+def test_dynamic_thresholds_flow_from_config(monkeypatch):
+    from crypto_trader.config import TradingConfig
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_HIGH_VOL_THRESHOLD", "0.04")
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_EXTREME_VOL_THRESHOLD", "0.09")
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_DRAWDOWN_SEVERE", "0.08")
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_MARGIN_HIGH", "0.40")
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_REGIME_BOOST", "false")
+    monkeypatch.delenv("TRADING_PROFILE", raising=False)
+    cfg = TradingConfig.from_env()
+    assert cfg.dynamic_leverage_high_vol_threshold == 0.04
+    assert cfg.dynamic_leverage_extreme_vol_threshold == 0.09
+    assert cfg.dynamic_leverage_drawdown_severe == 0.08
+    assert cfg.dynamic_leverage_margin_high == 0.40
+    assert cfg.dynamic_leverage_regime_boost is False
+    # and the manager actually reads them
+    m = DynamicLeverageManager(cfg)
+    assert m.high_vol_threshold == 0.04
+    assert m.extreme_vol_threshold == 0.09
+    assert m.dd_severe == 0.08
+    assert m.margin_high == 0.40
+    assert m.regime_boost is False
+
+
+def test_default_final_score_threshold_single_source():
+    # llm_advisor fallback now derives from the canonical config constant
+    from crypto_trader.config import DEFAULT_FINAL_SCORE_THRESHOLD
+    import crypto_trader.llm_advisor as la
+    assert la.FINAL_SCORE_THRESHOLD == DEFAULT_FINAL_SCORE_THRESHOLD or \
+        la.FINAL_SCORE_THRESHOLD == float(__import__("os").getenv("FINAL_SCORE_THRESHOLD", DEFAULT_FINAL_SCORE_THRESHOLD))

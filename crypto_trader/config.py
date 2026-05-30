@@ -118,6 +118,12 @@ _TRADING_PROFILES: dict = {
 _SPEC_RISK_PER_TRADE_PCT: float = 0.005
 _SPEC_MAX_CONSECUTIVE_LOSSES: int = 3
 
+# Canonical fallback for the final-score gate when no TradingConfig is available
+# (e.g. legacy standalone callers). The OPERATING value is always
+# cfg.final_score_threshold (from_env reads FINAL_SCORE_THRESHOLD, profile default
+# otherwise). Imported by llm_advisor + engines so there is ONE default, not two.
+DEFAULT_FINAL_SCORE_THRESHOLD: float = 0.72
+
 
 def _get(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
