@@ -158,6 +158,7 @@ class WebSocketTradingEngine:
                 cooldown_after_loss_minutes=cfg.cooldown_after_loss_minutes,
                 max_orders_per_minute=cfg.max_orders_per_minute,
                 max_margin_ratio=cfg.max_margin_ratio,
+                max_margin_utilization=cfg.max_margin_utilization,
             )
         else:
             _default_cfg = load_config()
@@ -166,6 +167,7 @@ class WebSocketTradingEngine:
                 max_consecutive_losses=_default_cfg.max_consecutive_losses,
                 max_daily_drawdown_pct=_default_cfg.max_daily_drawdown_pct,
                 cooldown_after_loss_minutes=_default_cfg.cooldown_after_loss_minutes,
+                max_margin_utilization=_default_cfg.max_margin_utilization,
             )
         _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
         _min_threshold = cfg.adaptive_min_threshold if cfg else 0.45
@@ -178,7 +180,8 @@ class WebSocketTradingEngine:
             target_trades_per_day=_target_trades,
         )
 
-        self.margin_engine = MarginEngine()
+        _margin_util = cfg.max_margin_utilization if cfg is not None else 0.40
+        self.margin_engine = MarginEngine(max_margin_utilization=_margin_util)
         self.leverage_engine = LeverageEngine()
         # Dynamic per-trade leverage (5x–20x band), gated by config. When None,
         # the engine uses the fixed configured leverage (unchanged behaviour).
@@ -502,7 +505,14 @@ class WebSocketTradingEngine:
                         if pos:
                             mark = self.ws_feed.get_ltp() or self.ws_feed.get_mid_price()
                             if not mark or mark <= 0:
-                                mark = float(pos.entry_price)
+                                # Use the last-known highest price as the best
+                                # available proxy; entry_price is stale and could
+                                # produce a wildly wrong fill for the PnL book.
+                                mark = (
+                                    float(pos.highest_price)
+                                    if pos.highest_price and float(pos.highest_price) > 0
+                                    else float(pos.entry_price)
+                                )
                             self.wallet.close_position(
                                 self.symbol, float(mark),
                                 reason="MARGIN_GUARD_FLATTEN",
@@ -543,9 +553,6 @@ class WebSocketTradingEngine:
                 # 1s Task: G3: supervise the WS threads
                 if not self._supervise_threads():
                     break
-
-                # 1s Task: Authoritative health check (margin ratio guard)
-                self._check_authoritative_health()
 
                 # 60s Task: Periodic state reconciliation
                 if now - last_recon_time >= 60:
@@ -1259,14 +1266,21 @@ class WebSocketTradingEngine:
         # Stash for dynamic-leverage ATR% (read in _apply_dynamic_leverage).
         self._last_signal_df_1h = df_1h
 
-        # 5. Risk check
-        self.risk_manager.update_peak_balance(self.wallet.margin_balance)
-        # Assuming initial balance for daily drawdown is the wallet balance minus daily PnL
-        initial_daily_balance = float(self.wallet.wallet_balance) - self.risk_manager.daily_pnl
+        # 5. Risk check — update peak AFTER the gate to avoid advancing the
+        # high-water mark before we verify daily-drawdown limits.
+        current_balance = self.wallet.margin_balance
+        # Reconstruct today's opening balance: best estimate is peak_balance when it
+        # has been set this session, otherwise fall back to margin_balance − daily_pnl.
+        if self.risk_manager.peak_balance and self.risk_manager.peak_balance > 0:
+            initial_daily_balance = float(self.risk_manager.peak_balance)
+        else:
+            initial_daily_balance = max(float(current_balance) - self.risk_manager.daily_pnl, float(current_balance))
         can_trade, risk_reason = self.risk_manager.can_trade(
-            current_balance=self.wallet.margin_balance,
+            current_balance=current_balance,
             initial_daily_balance=initial_daily_balance
         )
+        if can_trade:
+            self.risk_manager.update_peak_balance(current_balance)
         if not can_trade:
             if not getattr(self, "_halt_published", False):
                 if self.event_bus:

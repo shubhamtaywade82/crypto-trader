@@ -120,7 +120,7 @@ class _ParseHandler(Handler[_SignalCtx]):
 class _DuplicateHandler(Handler[_SignalCtx]):
     def handle(self, ctx: _SignalCtx) -> HandlerResult:
         sig = ctx.signal
-        idem_key = f"idem:{sig.strategy_id}:{sig.timestamp}"
+        idem_key = f"idem:{sig.strategy_id}:{sig.signal_id}"
         if ctx.bus.is_processed(idem_key):
             logger.info("duplicate signal %s suppressed", sig.signal_id)
             ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
@@ -186,7 +186,7 @@ class _ExecuteHandler(Handler[_SignalCtx]):
             except Exception as exc:
                 logger.error("failed to record open for signal %s: %s", sig.signal_id, exc)
 
-        idem_key = f"idem:{sig.strategy_id}:{sig.timestamp}"
+        idem_key = f"idem:{sig.strategy_id}:{sig.signal_id}"
         ctx.bus.mark_processed(idem_key, self._ttl)
         ctx.bus.ack(ctx.stream, ctx.group, ctx.msg_id)
         logger.debug("signal %s executed and acked", sig.signal_id)
@@ -413,11 +413,17 @@ class WalletSignalAdapter:
             ))
 
 
-def build_risk_gate(risk_manager) -> Callable[["Signal"], bool]:
+def build_risk_gate(risk_manager, balance_fn=None) -> Callable[["Signal"], bool]:
     """A signal-level risk gate: enforces the kill switch + daily/velocity caps
-    before execution. Does NOT record the open (that is done after execution)."""
+    before execution. Does NOT record the open (that is done after execution).
+
+    ``balance_fn`` is an optional zero-argument callable that returns the current
+    margin balance (Decimal or float).  When provided it enables the daily-drawdown
+    specification inside ``can_trade``; without it that spec is skipped.
+    """
     def gate(signal: "Signal") -> bool:
-        ok, reason = risk_manager.can_trade()
+        current_balance = balance_fn() if balance_fn is not None else None
+        ok, reason = risk_manager.can_trade(current_balance=current_balance)
         if not ok:
             logger.warning("risk gate blocked %s: %s", signal.symbol, reason)
             return False

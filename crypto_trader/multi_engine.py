@@ -187,6 +187,7 @@ def main():
         cooldown_after_loss_minutes=_early_cfg.cooldown_after_loss_minutes,
         max_orders_per_minute=_early_cfg.max_orders_per_minute,
         max_margin_ratio=_early_cfg.max_margin_ratio,
+        max_margin_utilization=_early_cfg.max_margin_utilization,
     )
     logger.info(
         "Trading profile: %s (threshold=%.2f, max_trades=%d, regimes=%s)",
@@ -371,6 +372,10 @@ def main():
     finally:
         for engine in engines:
             engine.stop()
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
         logger.info("All engines stopped.")
 
 if __name__ == "__main__":

@@ -655,22 +655,20 @@ class WebSocketPositionManager:
         # Trailing stop using LTP (more reactive to momentum)
         if pos.trailing_active:
             if pos.side == PositionSide.LONG:
-                if not hasattr(pos, '_highest_since_tp2'):
-                    pos._highest_since_tp2 = pos.entry_price
-                highest = Decimal(str(pos._highest_since_tp2))
-                pos._highest_since_tp2 = max(highest, price_trail)
-                trail_price = pos._highest_since_tp2 * Decimal("0.995")  # 0.5% trail
+                if pos.trail_high_water is None:
+                    pos.trail_high_water = pos.entry_price
+                pos.trail_high_water = max(pos.trail_high_water, price_trail)
+                trail_price = pos.trail_high_water * Decimal("0.995")  # 0.5% trail
                 if price_trail < trail_price:
-                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos._highest_since_tp2:.2f})")
+                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos.trail_high_water:.2f})")
                     return
             else:
-                if not hasattr(pos, '_lowest_since_tp2'):
-                    pos._lowest_since_tp2 = pos.entry_price
-                lowest = Decimal(str(pos._lowest_since_tp2))
-                pos._lowest_since_tp2 = min(lowest, price_trail)
-                trail_price = pos._lowest_since_tp2 * Decimal("1.005")
+                if pos.trail_low_water is None:
+                    pos.trail_low_water = pos.entry_price
+                pos.trail_low_water = min(pos.trail_low_water, price_trail)
+                trail_price = pos.trail_low_water * Decimal("1.005")
                 if price_trail > trail_price:
-                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos._lowest_since_tp2:.2f})")
+                    self._handle_close(price_trail, f"TRAIL_STOP (0.5% from {pos.trail_low_water:.2f})")
                     return
 
     def _handle_close(self, price: Any, reason: str):

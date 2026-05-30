@@ -332,6 +332,10 @@ class EnhancedPosition:
     close_reason: Optional[str] = None
     highest_price: Optional[Decimal] = None
     peak_pnl_pct: Decimal = Decimal("0")
+    # Trailing stop watermarks — persisted so a restart doesn't reset the trail
+    # to entry price and risk a premature exit on a favourable position.
+    trail_high_water: Optional[Decimal] = None
+    trail_low_water: Optional[Decimal] = None
     # Fees and TDS tracking for accurate net-PnL reporting.
     fees_paid: Decimal = Decimal("0")
     funding_paid: Decimal = Decimal("0")
@@ -408,6 +412,8 @@ class EnhancedPosition:
             "close_reason": self.close_reason,
             "highest_price": self.highest_price,
             "peak_pnl_pct": self.peak_pnl_pct,
+            "trail_high_water": self.trail_high_water,
+            "trail_low_water": self.trail_low_water,
             "fees_paid": self.fees_paid,
             "funding_paid": self.funding_paid,
             "tds_paid": self.tds_paid,
@@ -419,7 +425,7 @@ class EnhancedPosition:
     def from_dict(cls, data: dict) -> "EnhancedPosition":
         data["side"] = PositionSide(data["side"])
         data["playbook"] = Playbook(data["playbook"])
-        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct", "fees_paid", "funding_paid", "tds_paid"]:
+        for k in ["entry_price", "original_quantity", "remaining_quantity", "notional", "margin_used", "sl_price", "unrealized_pnl", "partial_realized_pnl", "close_price", "highest_price", "peak_pnl_pct", "trail_high_water", "trail_low_water", "fees_paid", "funding_paid", "tds_paid"]:
             if k in data and data[k] is not None:
                 data[k] = Decimal(str(data[k]))
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
@@ -874,7 +880,12 @@ class EnhancedFuturesWallet:
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
                 try:
                     logger.critical("[PROTECTIVE SL] require_venue_sl=True: emergency flattening position for %s to protect capital", pos.symbol)
-                    self.close_position(pos.symbol, float(pos.entry_price), reason="REQUIRED_SL_FAILED")
+                    _emergency_price = (
+                        float(pos.highest_price)
+                        if pos.highest_price and float(pos.highest_price) > 0
+                        else float(pos.entry_price)
+                    )
+                    self.close_position(pos.symbol, _emergency_price, reason="REQUIRED_SL_FAILED")
                 except Exception as close_err:
                     logger.error("[PROTECTIVE SL] emergency close failed for %s: %s", pos.symbol, close_err)
                 raise RuntimeError(f"Required venue Stop Loss placement failed: {e}") from e
@@ -916,7 +927,12 @@ class EnhancedFuturesWallet:
                 from . import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {msg}")
                 try:
-                    self.close_position(pos.symbol, float(pos.entry_price), reason="REQUIRED_SL_FAILED")
+                    _emergency_price = (
+                        float(pos.highest_price)
+                        if pos.highest_price and float(pos.highest_price) > 0
+                        else float(pos.entry_price)
+                    )
+                    self.close_position(pos.symbol, _emergency_price, reason="REQUIRED_SL_FAILED")
                 except Exception as close_err:
                     logger.error("[PROTECTIVE SL] emergency close failed for %s: %s", pos.symbol, close_err)
                 raise RuntimeError(f"Required venue Stop Loss placement failed: {msg}")
@@ -944,7 +960,12 @@ class EnhancedFuturesWallet:
                 from . import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
                 try:
-                    self.close_position(pos.symbol, float(pos.entry_price), reason="REQUIRED_SL_FAILED")
+                    _emergency_price = (
+                        float(pos.highest_price)
+                        if pos.highest_price and float(pos.highest_price) > 0
+                        else float(pos.entry_price)
+                    )
+                    self.close_position(pos.symbol, _emergency_price, reason="REQUIRED_SL_FAILED")
                 except Exception as close_err:
                     logger.error("[PROTECTIVE SL] emergency close failed for %s: %s", pos.symbol, close_err)
                 raise RuntimeError(f"Required venue Stop Loss placement failed: {e}") from e
@@ -1002,6 +1023,31 @@ class EnhancedFuturesWallet:
         CoinDCX fill instead of the simulated price. When ``None`` (paper mode)
         the original synchronous simulation path runs unchanged.
         """
+        # Phase 1 (live only): eligibility check + qty computation inside the lock,
+        # then release it before calling _venue_fill (which may block ~16 s on poll).
+        _live_qty: Optional[Decimal] = None
+        if external_fill is None and self.live_execution and self.execution_engine is not None:
+            with self.lock:
+                can, reason = self.can_open(symbol)
+                if not can:
+                    logger.info("[OPEN BLOCKED] %s: %s", symbol, reason)
+                    return None
+                lev_pre = self.get_leverage(symbol)
+                entry_pre = self._to_decimal(setup["entry_price"])
+                if custom_quantity is not None and self._to_decimal(custom_quantity) > Decimal("0"):
+                    _live_qty = self._to_decimal(custom_quantity)
+                else:
+                    margin_pre = (
+                        self._to_decimal(custom_margin)
+                        if custom_margin is not None
+                        else self.available_balance * self._to_decimal(self.equity_utilization)
+                    )
+                    if margin_pre <= Decimal("0"):
+                        return None
+                    _live_qty = (margin_pre * lev_pre) / entry_pre
+            # Lock released — venue round-trip happens here without blocking the wallet.
+            external_fill = self._venue_fill(symbol, setup["side"], _live_qty, reduce_only=False, intent="entry")
+
         with self.lock:
             can, reason = self.can_open(symbol)
             if not can:
@@ -1009,21 +1055,30 @@ class EnhancedFuturesWallet:
                 return None
 
             lev = self.get_leverage(symbol)
-            margin = (self._to_decimal(custom_margin) if custom_margin is not None else self.available_balance * self._to_decimal(self.equity_utilization))
-            if margin <= Decimal("0"):
-                return None
-
-            entry = self._to_decimal(setup["entry_price"])
-            if custom_quantity is not None and self._to_decimal(custom_quantity) > Decimal("0"):
-                qty = self._to_decimal(custom_quantity)
+            if _live_qty is not None:
+                # Reuse the pre-computed qty so booking matches what was sent to venue.
+                qty = _live_qty
+                entry = self._to_decimal(setup["entry_price"])
                 notional = qty * entry
                 margin = notional / lev
                 if margin > self.available_balance:
-                    logger.info(f"[OPEN BLOCKED] {symbol}: risk-sized margin exceeds available balance")
+                    logger.warning("[OPEN BLOCKED] %s: balance drained between pre-check and booking", symbol)
                     return None
             else:
-                notional = margin * lev
-                qty = notional / entry
+                margin = (self._to_decimal(custom_margin) if custom_margin is not None else self.available_balance * self._to_decimal(self.equity_utilization))
+                if margin <= Decimal("0"):
+                    return None
+                entry = self._to_decimal(setup["entry_price"])
+                if custom_quantity is not None and self._to_decimal(custom_quantity) > Decimal("0"):
+                    qty = self._to_decimal(custom_quantity)
+                    notional = qty * entry
+                    margin = notional / lev
+                    if margin > self.available_balance:
+                        logger.info(f"[OPEN BLOCKED] {symbol}: risk-sized margin exceeds available balance")
+                        return None
+                else:
+                    notional = margin * lev
+                    qty = notional / entry
 
             side = setup["side"]
             playbook = setup["playbook"]
@@ -1035,9 +1090,6 @@ class EnhancedFuturesWallet:
                 tp_levels = [{"price": self._to_decimal(setup["tp_price"]), "pct": 1.0, "hit": False, "label": "TP"}]
 
             entry_style = str(setup.get("entry_order_style", "market")).lower()
-
-            if external_fill is None and self.live_execution and self.execution_engine is not None:
-                external_fill = self._venue_fill(symbol, side, qty, reduce_only=False, intent="entry")
 
             order = self._create_order(symbol=symbol, side=side, quantity=qty)
             if external_fill is not None:
@@ -1222,21 +1274,33 @@ class EnhancedFuturesWallet:
 
         ``external_fill`` (live mode) supplies the venue exit price via ``{"price": ...}``.
         """
+        # Phase 1 (live only): cancel protective orders + compute exit qty inside
+        # the lock, then release before calling _venue_fill.
+        _had_protective = False
+        if external_fill is None and self.live_execution and self.execution_engine is not None:
+            with self.lock:
+                pos_pre = self.get_open_position(symbol)
+                if not pos_pre:
+                    return Decimal("0")
+                _had_protective = bool(pos_pre.protective_orders)
+                self._cancel_protective_orders(pos_pre)
+                _pre_qty = pos_pre.remaining_quantity * self._to_decimal(pct)
+                _exit_side = PositionSide.SHORT if pos_pre.side == PositionSide.LONG else PositionSide.LONG
+            if _pre_qty > Decimal("0"):
+                external_fill = self._venue_fill(symbol, _exit_side, _pre_qty, reduce_only=True, intent="exit-partial")
+
         with self.lock:
             mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
                 return Decimal("0")
 
-            # F1: the resting venue stop is sized to the full position; drop it
-            # before partially netting so it can't over-sell, then re-place below.
-            had_protective = bool(pos.protective_orders)
-            self._cancel_protective_orders(pos)
+            # For paper mode (or when external_fill was pre-supplied) cancel here.
+            if not (self.live_execution and self.execution_engine is not None):
+                _had_protective = bool(pos.protective_orders)
+                self._cancel_protective_orders(pos)
 
             qty_to_close = pos.remaining_quantity * self._to_decimal(pct)
-            if external_fill is None and self.live_execution and self.execution_engine is not None and qty_to_close > Decimal("0"):
-                exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
-                external_fill = self._venue_fill(symbol, exit_side, qty_to_close, reduce_only=True, intent="exit-partial")
 
             if external_fill is not None:
                 execution_price = self._to_decimal(external_fill["price"])
@@ -1288,7 +1352,7 @@ class EnhancedFuturesWallet:
             # brief cancel→replace window. If a venue SL is mandatory but the
             # re-place yields no stop (even without an exception), HALT — a live
             # position must never be left without its required protective stop.
-            if had_protective:
+            if _had_protective:
                 self._place_protective_orders(pos)
                 if (self.live_execution and self.execution_engine is not None
                         and self.venue_sl_enabled and self.require_venue_sl
@@ -1306,41 +1370,46 @@ class EnhancedFuturesWallet:
         ``external_fill`` (live mode) supplies the venue exit price via
         ``{"price": ...}``; when ``None`` the simulated exit price is used.
         """
+        # Phase 1 (live only): cancel protective orders + determine exit qty inside
+        # the lock, then release before the blocking _venue_fill call.
+        if external_fill is None and self.live_execution and self.execution_engine is not None:
+            with self.lock:
+                pos_pre = self.get_open_position(symbol)
+                if not pos_pre:
+                    return None
+                # F1: drop protective orders before placing the exit fill.
+                self._cancel_protective_orders(pos_pre)
+                exit_side_pre = PositionSide.SHORT if pos_pre.side == PositionSide.LONG else PositionSide.LONG
+                exit_qty_pre = pos_pre.remaining_quantity
+                venue_qty = self._venue_position_qty(symbol)
+
+            # Lock released — venue calls below are safe.
+            if venue_qty is not None:
+                if venue_qty <= Decimal("0"):
+                    logger.warning(
+                        "[CLOSE GUARD] %s venue already flat (internal=%.8f) — "
+                        "booking internal close, no venue order", symbol, float(exit_qty_pre))
+                    # external_fill stays None → mark-price booking in phase 2.
+                else:
+                    if venue_qty < exit_qty_pre:
+                        logger.warning(
+                            "[CLOSE GUARD] %s clamping exit qty %.8f→%.8f to venue "
+                            "position (prevents flip)", symbol, float(exit_qty_pre), float(venue_qty))
+                        exit_qty_pre = venue_qty
+                    external_fill = self._venue_fill(symbol, exit_side_pre, exit_qty_pre, reduce_only=True, intent="exit")
+            else:
+                external_fill = self._venue_fill(symbol, exit_side_pre, exit_qty_pre, reduce_only=True, intent="exit")
+
         with self.lock:
             mark_price = self._to_decimal(mark_price)
             pos = self.get_open_position(symbol)
             if not pos:
                 return None
 
-            # F1: drop any resting venue protective orders before the exit fill so
-            # they can't fire against a flat position after we net out.
-            self._cancel_protective_orders(pos)
-
-            if external_fill is None and self.live_execution and self.execution_engine is not None:
-                exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
-                # FLIP GUARD: CoinDCX has no reduce-only flag — an opposite-side
-                # order that exceeds the venue's actual position NETS through zero
-                # and opens an opposite position. Clamp the exit qty to what the
-                # venue actually holds; if the venue is already flat (SL/TP/liq
-                # fired), skip the venue order and just book the internal close.
-                exit_qty = pos.remaining_quantity
-                venue_qty = self._venue_position_qty(symbol)
-                if venue_qty is not None:
-                    if venue_qty <= Decimal("0"):
-                        logger.warning(
-                            "[CLOSE GUARD] %s venue already flat (internal=%.8f) — "
-                            "booking internal close, no venue order", symbol, float(exit_qty))
-                        external_fill = None  # fall through to mark-price booking
-                    else:
-                        if venue_qty < exit_qty:
-                            logger.warning(
-                                "[CLOSE GUARD] %s clamping exit qty %.8f→%.8f to venue "
-                                "position (prevents flip)", symbol, float(exit_qty), float(venue_qty))
-                            exit_qty = venue_qty
-                        external_fill = self._venue_fill(symbol, exit_side, exit_qty, reduce_only=True, intent="exit")
-                else:
-                    # Venue qty unknown (read failed) — proceed with internal qty.
-                    external_fill = self._venue_fill(symbol, exit_side, exit_qty, reduce_only=True, intent="exit")
+            # For paper mode (or pre-supplied external_fill), cancel protective
+            # orders here as in the original single-phase path.
+            if not (self.live_execution and self.execution_engine is not None):
+                self._cancel_protective_orders(pos)
 
             if external_fill is not None:
                 execution_price = self._to_decimal(external_fill["price"])
@@ -1933,6 +2002,12 @@ class EnhancedFuturesWallet:
                 existing.notional = existing.remaining_quantity * existing.entry_price
                 existing.margin_used = existing.notional / existing.leverage
                 existing.mode = pdata.get("mode", existing.mode)
+                current[symbol] = existing
+            elif existing and existing.status == "CLOSED":
+                # The position was just closed in this same event-processing round;
+                # do NOT re-create it from reducer state — the POSITION_CLOSED event
+                # hasn't yet been flushed out of open_positions on the reducer (that
+                # happens on the NEXT emit cycle).  Preserve the CLOSED record.
                 current[symbol] = existing
             else:
                 side = PositionSide(pdata.get("side", "LONG"))

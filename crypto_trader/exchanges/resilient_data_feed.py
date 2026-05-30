@@ -171,6 +171,14 @@ class ResilientDataFeed:
             if self.active != "fallback":
                 logger.info("Data feed -> fallback (%s)", type(self.fallback).__name__)
                 self.active = "fallback"
+                try:
+                    from ..events import FeedStaleEvent, bus as _bus
+                    _bus.publish(FeedStaleEvent(
+                        feed=type(self.primary).__name__,
+                        reason=f"{method} failed: {e}",
+                    ))
+                except Exception:
+                    pass
             return result
 
     def get_klines(self, symbol, interval, limit=150, **kw):

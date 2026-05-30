@@ -42,7 +42,14 @@ def _env_true_default(name: str, default: bool) -> bool:
 
 def order_execution_enabled() -> bool:
     """False when PLACE_ORDER is explicitly disabled (read-only live mode)."""
-    return _env_true_default(PLACE_ORDER_ENV, True)
+    enabled = _env_true_default(PLACE_ORDER_ENV, True)
+    if not enabled:
+        logger.warning(
+            "READ-ONLY live mode: %s=false — all order mutations are blocked. "
+            "Set %s=true (or unset) to allow real order execution.",
+            PLACE_ORDER_ENV, PLACE_ORDER_ENV,
+        )
+    return enabled
 
 
 def _has_halt_file() -> bool:

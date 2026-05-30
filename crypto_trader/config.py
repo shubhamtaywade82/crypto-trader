@@ -331,6 +331,9 @@ class TradingConfig:
     adaptive_target_trades_per_day: float = 2.0   # decay starts after 24/target idle hours
     adaptive_decay_per_hour: float = 0.01         # threshold drop rate per idle hour
     risk_per_trade_pct: float = field(default=_SPEC_RISK_PER_TRADE_PCT)
+    # Fraction of account balance that may be locked as margin across ALL positions.
+    # Shared by both MarginEngine instances (engine_ws + risk_manager) so they agree.
+    max_margin_utilization: float = 0.40
     funding_extreme_threshold: float = 0.0005
     max_consecutive_losses: int = field(default=_SPEC_MAX_CONSECUTIVE_LOSSES)
     max_drawdown_pct: float = 0.20
