@@ -26,6 +26,7 @@ import pandas as pd
 
 from ..journal import TradeOutcomeRecord
 from ..strategies.mean_reversion import PlaybookMeanReversion
+from ..strategies.supertrend2 import PlaybookSupertrend2
 from ..wallet import PositionSide
 
 logger = logging.getLogger("crypto_trader.backtest")
