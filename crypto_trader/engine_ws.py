@@ -207,6 +207,8 @@ class WebSocketTradingEngine:
                 self.reconciler.reconcile_symbol(self.symbol)
             except Exception as e:
                 logger.error("[ENGINE] Startup reconciliation failed for %s: %s", self.symbol, e)
+        from .market_state import OpenInterestTracker
+        self.oi_tracker = OpenInterestTracker()
 
         # Strategy
         self.regime_analyzer = MarketRegimeAnalyzer()
@@ -214,7 +216,7 @@ class WebSocketTradingEngine:
         self.playbook_b = PlaybookB()
         self.playbook_ares = PlaybookAres()
         self.playbook_volx = PlaybookVolExhaust()
-        self.playbook_sweep = PlaybookSweepMSS()
+        self.playbook_sweep = PlaybookSweepMSS(min_score=0.70)
         self._playbook_registry: dict = {
             pb.name: pb for pb in [
                 self.playbook_a, self.playbook_b, self.playbook_ares,
@@ -907,9 +909,13 @@ class WebSocketTradingEngine:
         # RVOL on the 1H frame (most relevant for intraday entries)
         rvol = calculate_rvol(df_1h, window=20)
 
-        # OI delta: would require storing historical OI to compute a proper delta.
-        # Using 0.0 for now — the raw oi value is still passed to the LLM prompt.
+        # Update Open Interest and get metrics
         oi_delta = 0.0
+        oi_data = data.get("oi_data")
+        if isinstance(oi_data, dict) and "open_interest" in oi_data:
+            oi_val = oi_data["open_interest"]
+            oi_metrics = self.oi_tracker.update(oi_val)
+            oi_delta = oi_metrics.oi_delta_15m
 
         # Liquidation intensity: normalise recent liquidation volume to 0–1
         liquidation_intensity = 0.0
@@ -1510,9 +1516,10 @@ class WebSocketTradingEngine:
                     latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
                     self._evaluate_entry(
                         df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                        funding_rate, 0.0, taker_ratio, structure=structure,
+                        funding_rate, regime_ctx.oi_delta if regime_ctx else 0.0, taker_ratio, structure=structure,
                         adx_1h=latest_adx, regime_ctx=regime_ctx,
                         session_ctx=session_ctx, structure_ltf=structure_ltf,
+                        rvol=rvol,
                     )
 
             except Exception as e:
@@ -1579,7 +1586,7 @@ class WebSocketTradingEngine:
     def _evaluate_entry(self, df_1h, df_4h, df_15m, regime, regime_score, mark_price,
                         funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None,
                         regime_ctx: Optional[RegimeContext] = None,
-                        session_ctx=None, structure_ltf=None):
+                        session_ctx=None, structure_ltf=None, rvol: float = 1.0):
         """Evaluate entry signals and execute via WebSocket LTP.
 
         Score-based best-of selection is delegated to :class:`StrategyRouter`.
@@ -1594,7 +1601,10 @@ class WebSocketTradingEngine:
             "playbook_a":     lambda: self.playbook_a.evaluate(df_1h, regime, structure=structure),
             "playbook_b":     lambda: self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure),
             "playbook_sweep": lambda: self.playbook_sweep.evaluate(
-                df_1h, df_15m, structure, structure_ltf, regime=regime),
+                df_1h, df_15m, structure, structure_ltf, regime=regime,
+                oi_delta=oi_delta, rvol=rvol,
+                active_liquidation_cascade=(regime_ctx.extended.value == "LIQUIDATION_EVENT" if regime_ctx else False)
+            ),
         }
 
         result: Optional[RouterResult] = self._get_strategy_router().select(
