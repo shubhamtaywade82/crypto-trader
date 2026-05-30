@@ -3,19 +3,73 @@ crypto_trader.journal — Trade Journal & Performance Analytics
 ===============================================================
 Append-only JSONL journal for every trade decision.
 Enables post-hoc analysis of LLM contribution, regime performance, etc.
+
+Also provides TradeOutcomeRecord + TradeOutcomeJournal for capturing the
+complete features-at-entry + outcome-at-exit record for every closed trade.
 """
 
+import dataclasses
 import json
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Iterator, Optional, Dict, List, Union
 
 logger = logging.getLogger("crypto_trader.journal")
 
 DATA_DIR = Path.home() / ".crypto_trader" / "journal"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# NOTE: no mkdir here — directory is created lazily in _DailyJsonlJournal.__init__
+
+_OUTCOME_DATA_DIR = Path.home() / ".crypto_trader" / "outcomes"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _DailyJsonlJournal — shared base: daily rotation, append, generic read
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _DailyJsonlJournal:
+    """
+    Base class providing daily-rotated JSONL file management.
+
+    Subclasses call ``super().__init__(resolved_path)`` passing an already-
+    resolved ``Path`` so that each subclass controls its own default.
+    """
+
+    def __init__(self, data_dir: Union[str, Path]):
+        self._data_dir = Path(data_dir)
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._current_file: Optional[Path] = None
+        self._current_date: Optional[str] = None
+
+    def _get_file(self) -> Path:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_date:
+            self._current_date = today
+            self._current_file = self._data_dir / f"{today}.jsonl"
+        return self._current_file  # type: ignore[return-value]
+
+    def _append_line(self, payload: dict) -> None:
+        """Serialize *payload* as a single JSONL line and append to today's file."""
+        path = self._get_file()
+        with open(path, "a") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+
+    def _iter_raw_lines(self) -> Iterator[dict]:
+        """
+        Yield every successfully-parsed JSON object from all stored JSONL files,
+        in chronological order (oldest file first, line order within file).
+        """
+        for path in sorted(self._data_dir.glob("*.jsonl")):
+            with open(path, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning("[JOURNAL] Skipping malformed line in %s", path)
 
 
 @dataclass
@@ -46,25 +100,17 @@ class TradeJournalEntry:
     tds_paid: Optional[float] = None
 
 
-class TradeJournal:
+class TradeJournal(_DailyJsonlJournal):
     """Append-only journal with daily file rotation."""
 
-    def __init__(self):
-        self._current_file = None
-        self._current_date = None
-
-    def _get_file(self) -> Path:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self._current_date:
-            self._current_date = today
-            self._current_file = DATA_DIR / f"{today}.jsonl"
-        return self._current_file
+    # _default_data_dir is resolved lazily in __init__ so that patching the
+    # module-level DATA_DIR constant in tests still takes effect.
+    def __init__(self, data_dir: Optional[Union[str, Path]] = None):
+        super().__init__(data_dir if data_dir is not None else DATA_DIR)
 
     def log(self, entry: TradeJournalEntry):
         """Append entry to today's journal file."""
-        path = self._get_file()
-        with open(path, "a") as f:
-            f.write(json.dumps(asdict(entry), default=str) + "\n")
+        self._append_line(asdict(entry))
         logger.debug(f"[JOURNAL] Logged trade {entry.trade_id}")
 
     def log_open(
@@ -129,14 +175,12 @@ class TradeJournal:
             "slippage": slippage,
             "tds_paid": tds,
         }
-        path = self._get_file()
-        with open(path, "a") as f:
-            f.write(json.dumps(close_record, default=str) + "\n")
+        self._append_line(close_record)
 
     def get_recent(self, days: int = 7) -> List[Dict]:
         """Read recent journal entries."""
         entries = []
-        for f in sorted(DATA_DIR.glob("*.jsonl"))[-days:]:
+        for f in sorted(self._data_dir.glob("*.jsonl"))[-days:]:
             with open(f, "r") as fh:
                 for line in fh:
                     if line.strip():
@@ -198,3 +242,109 @@ class TradeJournal:
             "without_llm_win_rate": win_rate(without_llm),
             "llm_value_add": round(avg_pnl(with_llm) - avg_pnl(without_llm), 4),
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TradeOutcomeRecord — one complete record per closed trade
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RECORD_TYPE = "trade_outcome"
+
+
+@dataclass
+class TradeOutcomeRecord:
+    # ── identity ──────────────────────────────────────────────
+    trade_id: str
+    symbol: str
+    side: str                          # "long" | "short"
+    opened_at: int                     # ms epoch
+    closed_at: int                     # ms epoch
+
+    # ── outcome at exit (required) ────────────────────────────
+    entry_price: float
+    exit_price: float
+    quantity: float
+    realized_pnl: float
+    holding_time_s: float
+    exit_reason: str
+
+    # ── features at entry (optional) ─────────────────────────
+    regime: Optional[str] = None
+    regime_score: Optional[float] = None
+    funding_rate: Optional[float] = None
+    vol_regime: Optional[str] = None
+    oi_delta: Optional[float] = None
+    session: Optional[str] = None
+    entry_reason: Optional[str] = None       # a.k.a. setup_type
+    llm_action: Optional[str] = None
+    llm_confidence: Optional[float] = None
+    llm_rationale: Optional[str] = None
+
+    # ── params used at entry (optional) ──────────────────────
+    entry_band: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
+    risk_per_trade_pct: Optional[float] = None
+    leverage: Optional[int] = None
+
+    # ── extra outcome fields (optional) ──────────────────────
+    pnl_r: Optional[float] = None            # realized_pnl / initial_risk_amount
+    mfe: Optional[float] = None              # max favourable excursion
+    mae: Optional[float] = None              # max adverse excursion
+    slippage_bps: Optional[float] = None
+
+
+# Pre-compute known fields once so load_all() stays forward-compatible.
+# If a persisted line contains a key not in this set (e.g. written by a newer
+# version), it will be silently ignored rather than raising TypeError.
+_OUTCOME_FIELDS: frozenset = frozenset(
+    f.name for f in dataclasses.fields(TradeOutcomeRecord)
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TradeOutcomeJournal — append-only JSONL sink for TradeOutcomeRecord
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TradeOutcomeJournal(_DailyJsonlJournal):
+    """
+    Append-only JSONL journal for closed-trade outcome records.
+
+    One file per day (same rotation scheme as TradeJournal).
+    Each line is a JSON object with ``record_type = "trade_outcome"``.
+
+    Parameters
+    ----------
+    data_dir:
+        Directory to store JSONL files.  Defaults to
+        ``~/.crypto_trader/outcomes``.  Override in tests via ``tmp_path``.
+    """
+
+    # _default_data_dir is resolved lazily in __init__ so that patching the
+    # module-level _OUTCOME_DATA_DIR constant in tests still takes effect.
+    def __init__(self, data_dir: Optional[Union[str, Path]] = None):
+        super().__init__(data_dir if data_dir is not None else _OUTCOME_DATA_DIR)
+
+    # ── write ─────────────────────────────────────────────────
+
+    def record(self, outcome: TradeOutcomeRecord) -> None:
+        """Append a completed TradeOutcomeRecord to today's file."""
+        payload = asdict(outcome)
+        payload["record_type"] = _RECORD_TYPE
+        self._append_line(payload)
+        logger.debug("[OUTCOME] Recorded trade %s", outcome.trade_id)
+
+    # ── read ──────────────────────────────────────────────────
+
+    def load_all(self) -> Iterator[TradeOutcomeRecord]:
+        """
+        Yield every TradeOutcomeRecord from all stored files in
+        chronological order (oldest file first, line order within file).
+        """
+        for payload in self._iter_raw_lines():
+            if payload.get("record_type") != _RECORD_TYPE:
+                continue  # skip non-outcome lines (e.g. mixed files)
+            payload.pop("record_type", None)
+            # Filter to known fields so unknown keys (e.g. added by a newer
+            # version) don't raise TypeError on older code.
+            filtered = {k: v for k, v in payload.items() if k in _OUTCOME_FIELDS}
+            yield TradeOutcomeRecord(**filtered)

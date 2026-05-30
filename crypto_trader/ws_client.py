@@ -678,7 +678,9 @@ class WebSocketPositionManager:
         # Ensure price is converted to float for event and wallet if needed
         f_price = float(price)
         closed_pos = self.wallet.close_position(self.symbol, f_price, reason)
-        if closed_pos and self.event_bus:
+        # If the wallet has event_bus, it already published TradeClosedEvent.
+        # Otherwise, if ws_client has event_bus, publish as fallback.
+        if closed_pos and self.event_bus and not getattr(self.wallet, "event_bus", None):
             from .events import TradeClosedEvent
             # Calculate metrics
             pnl_pct = (float(closed_pos.total_realized_pnl) / float(closed_pos.margin_used) * 100) if float(closed_pos.margin_used) > 0 else 0
@@ -693,4 +695,5 @@ class WebSocketPositionManager:
                 reason=reason,
                 duration_minutes=duration,
                 tds=float(getattr(closed_pos, "tds_paid", 0) or 0),
+                wallet_balance=float(self.wallet.wallet_balance),
             ))

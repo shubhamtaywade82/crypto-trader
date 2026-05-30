@@ -41,8 +41,9 @@ from .regime import (
 )
 from .session import get_session_context, TradingSession
 from .llm_advisor import OllamaAdvisor, FINAL_SCORE_THRESHOLD, build_advisor
-from .journal import TradeJournal
+from .journal import TradeJournal, TradeOutcomeJournal, TradeOutcomeRecord
 from .structure import MarketStructureAnalyzer
+from .config import load_config
 
 logger = logging.getLogger("crypto_trader.engine_ws")
 
@@ -150,11 +151,21 @@ class WebSocketTradingEngine:
         if cfg:
             self.risk_manager = RiskManager(
                 max_daily_trades=cfg.max_daily_trades,
+                max_consecutive_losses=cfg.max_consecutive_losses,
+                max_drawdown_pct=cfg.max_drawdown_pct,
+                max_daily_drawdown_pct=cfg.max_daily_drawdown_pct,
+                cooldown_after_loss_minutes=cfg.cooldown_after_loss_minutes,
                 max_orders_per_minute=cfg.max_orders_per_minute,
-                max_margin_ratio=cfg.max_margin_ratio
+                max_margin_ratio=cfg.max_margin_ratio,
             )
         else:
-            self.risk_manager = RiskManager()
+            _default_cfg = load_config()
+            self.risk_manager = RiskManager(
+                max_daily_trades=_default_cfg.max_daily_trades,
+                max_consecutive_losses=_default_cfg.max_consecutive_losses,
+                max_daily_drawdown_pct=_default_cfg.max_daily_drawdown_pct,
+                cooldown_after_loss_minutes=_default_cfg.cooldown_after_loss_minutes,
+            )
         _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
         _min_threshold = cfg.adaptive_min_threshold if cfg else 0.45
         _decay_rate = cfg.adaptive_decay_per_hour if cfg else 0.01
@@ -269,6 +280,12 @@ class WebSocketTradingEngine:
 
         # Journal
         self.journal = TradeJournal()
+        # Closed-trade outcome substrate (features-at-entry + outcome-at-exit).
+        # Open-side context is cached here at log_open, keyed by symbol (one
+        # engine = one symbol = at most one open position), then joined with the
+        # TradeClosedEvent in _on_trade_closed to emit one TradeOutcomeRecord.
+        self.outcome_journal = TradeOutcomeJournal()
+        self._open_features: dict = {}
 
         # LLM
         self.advisor = None
@@ -300,9 +317,98 @@ class WebSocketTradingEngine:
             self.event_bus.subscribe(TradeClosedEvent, self._on_trade_closed)
 
     def _on_trade_closed(self, event):
-        """Update risk manager when a trade is closed."""
-        if event.symbol == self.symbol:
-            self.risk_manager.record_close(event.realized_pnl)
+        """Update risk manager when a trade is closed.
+
+        This runs as an event-bus subscriber. Telemetry/risk-bookkeeping must
+        NEVER crash the trade-close path: if the bus does not isolate subscriber
+        exceptions, an unexpected throw here would propagate back into the
+        publisher (wallet.close_position). So the entire body is wrapped in a
+        swallow-and-log guard.
+        """
+        try:
+            if event.symbol != self.symbol:
+                return
+            # Pass the post-close wallet balance so the daily-loss HALT in
+            # record_close() actually runs (it reconstructs the day's opening
+            # balance as wallet_balance - daily_pnl, matching the pre-trade gate's
+            # initial_daily_balance at line ~1157). A balance-read failure must
+            # NOT skip risk bookkeeping — fall back to None so record_close still
+            # runs (gate-only, no post-close halt).
+            try:
+                post_close_balance = float(self.wallet.wallet_balance)
+            except (TypeError, ValueError, AttributeError):
+                post_close_balance = None
+            self.risk_manager.record_close(event.realized_pnl, current_balance=post_close_balance)
+            self._persist_trade_outcome(event)
+        except Exception as e:
+            logger.error("[ENGINE] _on_trade_closed failed for %s: %s", self.symbol, e)
+
+    def _persist_trade_outcome(self, event):
+        """Join cached open-side context with the close event and persist:
+        (1) a log_close record so the JSONL open/close join + analyze_llm_contribution
+            works, and (2) a unified TradeOutcomeRecord for metrics/calibration.
+        Best-effort: never let analytics persistence break the trading loop."""
+        try:
+            open_ctx = self._open_features.pop(self.symbol, {})
+            trade_id = open_ctx.get("trade_id", f"{self.symbol}-{int(event.timestamp)}")
+
+            self.journal.log_close(
+                trade_id=trade_id,
+                exit_price=event.exit_price,
+                realized_pnl=event.realized_pnl,
+                exit_reason=event.reason,
+                slippage=event.slippage,
+                tds=event.tds,
+            )
+
+            closed_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+            opened_at = open_ctx.get("opened_at", closed_at - int(event.duration_minutes * 60_000))
+
+            # pnl_r = realized_pnl / initial_risk_amount, where
+            # initial_risk = |entry_price - stop_loss| * quantity. Only computable
+            # when the open-side stop and entry/qty were captured; else leave None.
+            entry_price = open_ctx.get("entry_price", 0.0)
+            quantity = open_ctx.get("quantity", 0.0)
+            stop_loss_price = open_ctx.get("stop_loss_price")
+            pnl_r = None
+            if stop_loss_price is not None and quantity:
+                initial_risk = abs(entry_price - stop_loss_price) * quantity
+                if initial_risk > 0:
+                    pnl_r = event.realized_pnl / initial_risk
+
+            self.outcome_journal.record(TradeOutcomeRecord(
+                trade_id=trade_id,
+                symbol=self.symbol,
+                side=open_ctx.get("side", event.side),
+                opened_at=opened_at,
+                closed_at=closed_at,
+                entry_price=entry_price,
+                exit_price=event.exit_price,
+                quantity=quantity,
+                realized_pnl=event.realized_pnl,
+                holding_time_s=event.duration_minutes * 60.0,
+                exit_reason=event.reason,
+                regime=open_ctx.get("regime"),
+                regime_score=open_ctx.get("regime_score"),
+                funding_rate=open_ctx.get("funding_rate"),
+                vol_regime=open_ctx.get("vol_regime"),
+                oi_delta=open_ctx.get("oi_delta"),
+                session=open_ctx.get("session"),
+                entry_reason=open_ctx.get("entry_reason"),
+                llm_action=open_ctx.get("llm_action"),
+                llm_confidence=open_ctx.get("llm_confidence"),
+                llm_rationale=open_ctx.get("llm_rationale"),
+                entry_band=open_ctx.get("entry_band"),
+                stop_loss_pct=open_ctx.get("stop_loss_pct"),
+                risk_per_trade_pct=open_ctx.get("risk_per_trade_pct"),
+                leverage=open_ctx.get("leverage"),
+                pnl_r=pnl_r,
+                mfe=event.mfe,
+                mae=event.mae,
+                slippage_bps=event.slippage * 100.0 if event.slippage else None,
+            ))
+        except Exception as e:
+            logger.error("[OUTCOME] Failed to persist trade outcome for %s: %s", self.symbol, e)
 
     def _handle_command(self, event):
         """Handle incoming commands from EventBus (e.g., Telegram)."""
@@ -1561,7 +1667,7 @@ class WebSocketTradingEngine:
             self.journal.log_open(
                 trade_id=trade_id,
                 symbol=self.symbol,
-                regime=regime.value,
+                regime=regime.value if regime else "",
                 regime_score=regime_score,
                 setup=setup,
                 technical_score=tech_score,
@@ -1575,6 +1681,45 @@ class WebSocketTradingEngine:
                 oi_delta=oi_delta,
                 taker_ratio=taker_ratio,
             )
+
+            # Cache open-side context for the outcome record built at close time.
+            _has_advice = bool(self.advisor and advice)
+            _llm_rationale = None
+            if _has_advice:
+                _factors = getattr(advice, "key_factors", None)
+                if _factors:
+                    _llm_rationale = "; ".join(str(f) for f in _factors)
+                elif getattr(advice, "veto_reason", None):
+                    _llm_rationale = advice.veto_reason
+            # entry_band: per-strategy band where available (MR playbook), else cfg.
+            _entry_band = setup.get("entry_band")
+            if _entry_band is None and self.cfg is not None:
+                _entry_band = getattr(self.cfg, "mr_entry_band", None)
+            self._open_features[self.symbol] = {
+                "trade_id": trade_id,
+                "side": setup["side"].value,
+                "opened_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "entry_price": float(entry_price),
+                "quantity": float(book_qty),
+                # stop loss price stashed so pnl_r can be computed at close from
+                # initial_risk = |entry - stop| * quantity.
+                "stop_loss_price": float(setup["sl_price"]) if setup.get("sl_price") else None,
+                "regime": regime.value if regime else None,
+                "regime_score": regime_score,
+                # vol/extended regime descriptor (TREND_EXPANSION, LOW_VOL_CHOP, …).
+                "vol_regime": regime_ctx.extended.value if regime_ctx else None,
+                "funding_rate": funding_rate,
+                "oi_delta": oi_delta,
+                "session": regime_ctx.session_name if regime_ctx else None,
+                "entry_reason": setup.get("strategy") or setup.get("playbook"),
+                "llm_action": (advice.to_dict().get("bias") if _has_advice else None),
+                "llm_confidence": (advice.confidence if _has_advice else None),
+                "llm_rationale": _llm_rationale,
+                "entry_band": float(_entry_band) if _entry_band is not None else None,
+                "stop_loss_pct": setup.get("stop_loss_pct"),
+                "risk_per_trade_pct": getattr(self.cfg, "risk_per_trade_pct", None) if self.cfg else None,
+                "leverage": int(self.wallet.leverage),
+            }
 
             logger.info(
                 f"[EXECUTED] Trade {trade_id} | Entry={entry_price:.2f} | "
@@ -1594,12 +1739,13 @@ class WebSocketTradingEngine:
                     take_profit=tp,
                     margin=pos.margin_used,
                     notional=pos.notional,
-                    regime=regime.value,
+                    regime=regime.value if regime else "",
                     tech_score=tech_score,
                     llm_decision="ALLOW" if final_score >= dynamic_threshold else "LLM_VETOED",
                     funding=funding_rate,
                     oi_delta=oi_delta,
                     liquidation_price=float(self.wallet.liquidation_price(pos)),
+                    wallet_balance=float(self.wallet.wallet_balance),
                 ))
 
     # ── WebSocket Callbacks ──

@@ -24,6 +24,7 @@ from .structure import MarketStructureAnalyzer
 from .llm_advisor import OllamaAdvisor, build_advisor
 from .journal import TradeJournal
 from .market_state import OpenInterestTracker
+from .config import load_config
 
 logger = logging.getLogger("crypto_trader.engine")
 
@@ -70,13 +71,24 @@ class TradingEngine:
             equity_utilization=EQUITY_UTILIZATION,
             catastrophic_sl_pct=CATASTROPHIC_SL_PCT,
         )
-        self.risk_manager = RiskManager()
+        # Config-driven risk limits (was: bare RiskManager() using constructor
+        # defaults, which silently ignored the configured/spec values).
+        self.cfg = load_config()
+        self.risk_manager = RiskManager(
+            max_daily_trades=self.cfg.max_daily_trades,
+            max_consecutive_losses=self.cfg.max_consecutive_losses,
+            max_drawdown_pct=self.cfg.max_drawdown_pct,
+            max_daily_drawdown_pct=self.cfg.max_daily_drawdown_pct,
+            cooldown_after_loss_minutes=self.cfg.cooldown_after_loss_minutes,
+            max_orders_per_minute=self.cfg.max_orders_per_minute,
+            max_margin_ratio=self.cfg.max_margin_ratio,
+        )
         from .llm_advisor import FINAL_SCORE_THRESHOLD
         self.adaptive_threshold = AdaptiveThresholdManager(
-            base_threshold=FINAL_SCORE_THRESHOLD,
-            min_threshold=0.50,
-            decay_per_hour=0.01,
-            target_trades_per_day=1.0
+            base_threshold=getattr(self.cfg, "final_score_threshold", FINAL_SCORE_THRESHOLD),
+            min_threshold=getattr(self.cfg, "adaptive_min_threshold", 0.50),
+            decay_per_hour=getattr(self.cfg, "adaptive_decay_per_hour", 0.01),
+            target_trades_per_day=getattr(self.cfg, "adaptive_target_trades_per_day", 1.0),
         )
         self.regime_analyzer = MarketRegimeAnalyzer()
         self.playbook_a = PlaybookA()

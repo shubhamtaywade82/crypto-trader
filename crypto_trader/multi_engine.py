@@ -139,15 +139,16 @@ def main():
     engines = []
     threads = []
     
-    total_balance = 1000.0
-
     # Load config early so profile-driven risk parameters apply to the global risk manager
     from crypto_trader.config import load_config as _load_cfg_early
     _early_cfg = _load_cfg_early()
+    total_balance = _early_cfg.initial_balance
     global_risk = RiskManager(
         max_daily_trades=_early_cfg.max_daily_trades,
         max_consecutive_losses=_early_cfg.max_consecutive_losses,
         max_drawdown_pct=_early_cfg.max_drawdown_pct,
+        max_daily_drawdown_pct=_early_cfg.max_daily_drawdown_pct,
+        cooldown_after_loss_minutes=_early_cfg.cooldown_after_loss_minutes,
         max_orders_per_minute=_early_cfg.max_orders_per_minute,
         max_margin_ratio=_early_cfg.max_margin_ratio,
     )
@@ -173,6 +174,7 @@ def main():
             api_key=api_key,
             api_secret=api_secret,
             leverage=args.leverage,
+            margin_currency=_early_cfg.coindcx_margin_currency,
             i_understand_real_money=live_ack
         )
         logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
@@ -187,6 +189,7 @@ def main():
         initial_balance=total_balance,
         leverage=args.leverage,
         database_url=cfg.database_url,
+        event_bus=bus,
     )
     
     event_store = None
@@ -235,6 +238,21 @@ def main():
         global_wallet.event_hook = _sink
     if execution_engine is not None:
         global_wallet.attach_execution_engine(execution_engine, live=True)
+        try:
+            live_bal = execution_engine.sync_balance()
+            if live_bal is not None:
+                mc = cfg.coindcx_margin_currency.upper()
+                if mc != "USDT":
+                    conv = float(execution_engine.get_usdt_conversion()) or 1.0
+                    live_bal = live_bal / conv
+                global_wallet.wallet_balance = global_wallet._to_decimal(live_bal)
+                total_balance = live_bal
+                # Sync peak balance in RiskManager to prevent false drawdown trip (1000 -> 0)
+                global_risk.peak_balance = live_bal
+                global_risk._save_state()
+                logger.info("[LIVE BALANCE SYNC] Synchronized wallet balance with exchange: %.4f USDT", live_bal)
+        except Exception as e:
+            logger.error("[LIVE BALANCE SYNC] Failed to sync wallet balance with exchange: %s", e)
 
     # Run pre-flight checks and state reconciliation in live mode
     if live_enabled and execution_engine is not None:

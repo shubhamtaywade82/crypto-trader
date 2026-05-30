@@ -25,6 +25,7 @@ class TradeOpenedEvent(Event):
     funding: float = 0.0
     oi_delta: float = 0.0
     liquidation_price: float = 0.0
+    wallet_balance: float = 0.0
 
 @dataclass
 class TradeClosedEvent(Event):
@@ -40,6 +41,7 @@ class TradeClosedEvent(Event):
     fees: float = 0.0
     slippage: float = 0.0
     tds: float = 0.0
+    wallet_balance: float = 0.0
 
 @dataclass
 class RiskHaltEvent(Event):

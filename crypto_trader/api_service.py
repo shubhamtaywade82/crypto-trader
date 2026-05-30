@@ -363,6 +363,7 @@ def _get_venue_engine():
             return None
         _venue_engine = CoinDCXExecutionEngine(
             api_key=cfg.coindcx_api_key, api_secret=cfg.coindcx_api_secret,
+            margin_currency=cfg.coindcx_margin_currency,
             i_understand_real_money=False,
         )
     except Exception as e:

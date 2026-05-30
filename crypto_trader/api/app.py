@@ -92,6 +92,34 @@ def create_app(repo: Optional[ProjectionRepo] = None, event_source=None, cfg=Non
     def pnl(mode: Optional[str] = Query(None, pattern="^(paper|live)$")):
         return _repo().pnl(mode)
 
+    @app.get("/api/metrics", dependencies=[Depends(_require_auth)])
+    def metrics():
+        """Performance metrics over persisted closed-trade outcomes (win-rate,
+        expectancy-R, profit factor, max drawdown, per-regime …). File-backed via
+        TradeOutcomeJournal; degrades to zeroed/None metrics (HTTP 200) when no
+        records exist."""
+        from ..analytics import metrics as _metrics
+        from ..journal import TradeOutcomeJournal
+        try:
+            records = list(TradeOutcomeJournal().load_all())
+        except Exception as e:
+            logger.error("Failed to load trade outcomes for /api/metrics: %s", e)
+            records = []
+        return _metrics.compute_metrics(records)
+
+    @app.get("/api/equity", dependencies=[Depends(_require_auth)])
+    def equity():
+        """Equity curve: cumulative realized PnL over closed-trade outcomes,
+        ordered by closed_at. Returns [] when there are no records."""
+        from ..analytics import metrics as _metrics
+        from ..journal import TradeOutcomeJournal
+        try:
+            records = list(TradeOutcomeJournal().load_all())
+        except Exception as e:
+            logger.error("Failed to load trade outcomes for /api/equity: %s", e)
+            records = []
+        return _metrics.equity_curve_from_records(records)
+
     @app.get("/api/stream", dependencies=[Depends(_require_auth)])
     async def stream():
         """SSE: realtime bot events relayed from Redis pub/sub."""
@@ -127,7 +155,7 @@ def create_app(repo: Optional[ProjectionRepo] = None, event_source=None, cfg=Non
         def index_placeholder():
             return JSONResponse({
                 "message": "Dashboard API running. Build the UI with: cd ui && npm install && npm run build",
-                "endpoints": ["/api/health", "/api/positions", "/api/orders", "/api/fills", "/api/pnl", "/api/stream"],
+                "endpoints": ["/api/health", "/api/positions", "/api/orders", "/api/fills", "/api/pnl", "/api/metrics", "/api/equity", "/api/stream"],
             })
 
     return app

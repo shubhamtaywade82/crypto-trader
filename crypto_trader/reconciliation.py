@@ -36,6 +36,26 @@ class ExchangeStateReconciler:
             return True
             
         try:
+            # 0. Synchronize live balance if running in live mode
+            if getattr(self.wallet, "live_execution", False) and self.execution_engine is not None:
+                try:
+                    live_bal = self.execution_engine.sync_balance()
+                    if live_bal is not None:
+                        mc = self.execution_engine.margin_currency.upper()
+                        if mc != "USDT":
+                            conv = float(self.execution_engine.get_usdt_conversion()) or 1.0
+                            live_bal = live_bal / conv
+                        old_bal = float(self.wallet.wallet_balance)
+                        new_bal = float(live_bal)
+                        if abs(old_bal - new_bal) > 0.01:
+                            self.wallet.wallet_balance = self.wallet._to_decimal(live_bal)
+                            logger.info(
+                                "[RECONCILIATION] Synchronized wallet balance with exchange: "
+                                "%.4f USDT -> %.4f USDT", old_bal, new_bal
+                            )
+                except Exception as e:
+                    logger.error("[RECONCILIATION] Failed to sync wallet balance with exchange: %s", e)
+
             # 1. Fetch Actual State (Exchange)
             exchange_positions = self.execution_engine.get_positions()
             exchange_open_orders = self.execution_engine.get_open_orders(symbol)

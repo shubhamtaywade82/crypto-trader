@@ -385,6 +385,7 @@ class WalletSignalAdapter:
                     self.wallet.liquidation_price(pos)
                     if hasattr(self.wallet, "liquidation_price") else 0
                 ),
+                wallet_balance=float(self.wallet.wallet_balance),
             ))
 
 

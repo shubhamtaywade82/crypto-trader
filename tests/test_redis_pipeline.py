@@ -187,6 +187,7 @@ class _FakePos:
 
 class _FakeWallet:
     leverage = 2
+    wallet_balance = 1000.0
 
     def __init__(self):
         self.opened = []
