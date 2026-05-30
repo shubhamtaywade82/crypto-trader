@@ -59,7 +59,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 | `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
 | `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `start`, `test_ui`). |
 | `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382).   |
-| `docs/`              | Detailed architectural deep-dives.                       |
+| `docs/`              | Detailed architectural deep-dives, including the [SMC Futures Guide](file:///home/nemesis/project/trading-workspace/coindcx/crypto-trader/docs/smc_crypto_futures_guide_refined/smc_crypto_futures_guide_refined.md). |
 
 ---
 

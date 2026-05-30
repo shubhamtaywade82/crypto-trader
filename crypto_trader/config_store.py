@@ -41,6 +41,10 @@ SAFE_KEYS = frozenset({
     "st2_entry_mode", "st2_retracement_pct", "st2_flip_lookback",
     # mean-reversion entry band
     "mr_entry_band",
+    # SMC pipeline scoring/filter knobs (read fresh each evaluation)
+    "smc_min_score", "smc_sweep_lookback", "smc_structure_lookback",
+    "smc_oi_expansion_pct", "smc_volume_mult_target", "smc_rvol_target",
+    "smc_liq_cascade_threshold", "smc_tp_rr",
     # regime sizing / volatility gates
     "rvol_dead_threshold", "rvol_weak_threshold", "rvol_strong_threshold",
     "regime_size_multiplier_high", "regime_size_multiplier_low",
@@ -54,12 +58,16 @@ SAFE_KEYS = frozenset({
 FLAT_ONLY_KEYS = frozenset({
     "st2_sl_mode", "st2_sl_pct", "st2_sl_atr_mult", "st2_max_hold_hours",
     "mr_stop_loss_pct",
+    # SMC stop/hold definition — changing mid-position would desync the venue SL
+    "smc_sl_buffer_atr", "smc_sl_atr_mult", "smc_atr_period", "smc_max_hold_hours",
 })
 
 RESTART_KEYS = frozenset({
     "strategy_mode", "mode", "max_leverage",
     "mr_timeframe", "st2_timeframe", "st2_htf_timeframe",
     "mr_sma_period", "st2_atr_period", "st2_use_adaptive_atr",
+    # SMC topology — change kline shape / swing identity
+    "smc_entry_timeframe", "smc_htf_timeframe", "smc_swing_window",
 })
 
 _KNOWN = SAFE_KEYS | FLAT_ONLY_KEYS | RESTART_KEYS

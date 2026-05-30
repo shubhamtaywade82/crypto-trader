@@ -710,8 +710,21 @@ class PlaybookSweepMSS:
         structure_1h: Optional[Dict],
         structure_ltf: Optional[Dict],
         regime: Optional[MarketRegime] = None,
+        oi_delta: Optional[float] = None,
+        rvol: Optional[float] = None,
+        active_liquidation_cascade: bool = False,
     ) -> Optional[Dict]:
         if not structure_1h or not structure_ltf or len(df_1h) < 10:
+            return None
+
+        # Stage 9: Liquidation cascade filter
+        if active_liquidation_cascade:
+            logger.info("[SMC-PLAYBOOK] Setup rejected due to active liquidation cascade")
+            return None
+
+        # Stage 6: RVOL session filter
+        if rvol is not None and rvol < 0.8:
+            logger.info(f"[SMC-PLAYBOOK] Setup rejected due to dead session RVOL: {rvol:.2f} < 0.8")
             return None
 
         sweep = structure_1h.get("recent_sweep")
@@ -790,11 +803,71 @@ class PlaybookSweepMSS:
         if abs(tp1 - price) / risk < self.min_rr:
             return None
 
-        # Score: sweep freshness + MSS + OB/FVG confluence.
-        freshness = max(0.0, 1.0 - sweep.get("candles_ago", 0) / max(self.sweep_max_age, 1))
-        score = 0.45 + 0.20 * freshness + 0.20 * (1.0 if ob_conf else 0.0) + 0.15 * (1.0 if fvg_conf else 0.0)
-        score = min(score, 1.0)
-        if score < self.min_score:
+        # Stage 8: Volume Confirmation (ratio of displacement candle to avg)
+        vol_ratio = 1.0
+        if len(df_ltf) >= 21:
+            avg_vol = float(df_ltf["quote_volume"].iloc[-21:-1].mean())
+            if avg_vol > 0:
+                vol_ratio = float(df_ltf["quote_volume"].iloc[-1]) / avg_vol
+
+        # 10. 9-Factor Weighted Scoring Matrix
+        trend_score = 0.15
+        if regime:
+            from .regime import MarketRegime
+            if direction == PositionSide.LONG and regime in (MarketRegime.TRENDING_DOWN, MarketRegime.DISTRIBUTION):
+                trend_score = 0.05
+            elif direction == PositionSide.SHORT and regime in (MarketRegime.TRENDING_UP, MarketRegime.ACCUMULATION):
+                trend_score = 0.05
+
+        freshness_sweep = max(0.0, 1.0 - sweep.get("candles_ago", 0) / max(self.sweep_max_age, 1))
+        sweep_score = 0.15 * freshness_sweep
+
+        freshness_mss = max(0.0, 1.0 - bos.get("candles_ago", 0) / max(self.mss_max_age, 1))
+        mss_score = 0.15 * freshness_mss
+
+        ob_score = 0.12 if ob_conf else 0.0
+        fvg_score = 0.10 if fvg_conf else 0.0
+
+        oi_val_score = 0.0
+        if oi_delta is not None:
+            if oi_delta >= 3.0:
+                oi_val_score = 0.12
+            elif oi_delta > 0.0:
+                oi_val_score = 0.12 * (oi_delta / 3.0)
+        else:
+            oi_val_score = 0.08  # Default baseline if not available
+
+        vol_confirm_score = 0.0
+        if vol_ratio >= 3.0:
+            vol_confirm_score = 0.10
+        elif vol_ratio >= 1.5:
+            vol_confirm_score = 0.10 * (vol_ratio / 3.0)
+
+        rvol_score = 0.0
+        if rvol is not None:
+            if rvol >= 1.2:
+                rvol_score = 0.08
+            elif rvol >= 0.8:
+                rvol_score = 0.08 * (rvol / 1.2)
+        else:
+            rvol_score = 0.06
+
+        liq_score = 0.03 if not active_liquidation_cascade else 0.0
+
+        total_score = (
+            trend_score + sweep_score + mss_score + ob_score + fvg_score +
+            oi_val_score + vol_confirm_score + rvol_score + liq_score
+        )
+        total_score = min(total_score, 1.0)
+
+        # Minimum required score is defined by self.min_score
+        if total_score < self.min_score:
+            logger.info(
+                f"[SMC-PLAYBOOK] Setup rejected: score={total_score:.2f} < {self.min_score:.2f} "
+                f"(trend={trend_score:.2f}, sweep={sweep_score:.2f}, mss={mss_score:.2f}, "
+                f"ob={ob_score:.2f}, fvg={fvg_score:.2f}, oi={oi_val_score:.2f}, "
+                f"vol={vol_confirm_score:.2f}, rvol={rvol_score:.2f}, liq={liq_score:.2f})"
+            )
             return None
 
         return {
@@ -807,10 +880,13 @@ class PlaybookSweepMSS:
                 {"price": tp2, "pct": 0.25, "hit": False, "label": "TP2"},
             ],
             "time_stop_hours": 36,
-            "score": round(score, 3),
+            "score": round(total_score, 3),
             "entry_order_style": "maker_limit",
             "reason": (
                 f"PlaybookSweepMSS: {sweep['type']} sweep ({sweep.get('candles_ago')}c ago) "
-                f"+ MSS + {'OB' if ob_conf else ''}{'/FVG' if fvg_conf else ''} | score={score:.2f}"
+                f"+ MSS + {'OB' if ob_conf else ''}{'/FVG' if fvg_conf else ''} | "
+                f"RVOL={rvol if rvol is not None else 1.0:.2f} | "
+                f"OI_delta={oi_delta if oi_delta is not None else 0.0:.2f}% | "
+                f"score={total_score:.2f}"
             ),
         }

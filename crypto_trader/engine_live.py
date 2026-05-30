@@ -55,6 +55,7 @@ class LiveTradingSystem:
             cooldown_after_loss_minutes=self.cfg.cooldown_after_loss_minutes,
             max_orders_per_minute=self.cfg.max_orders_per_minute,
             max_margin_ratio=self.cfg.max_margin_ratio,
+            max_margin_utilization=self.cfg.max_margin_utilization,
         )
         self.event_store = None
         self.execution_engine = None
@@ -328,7 +329,8 @@ class LiveTradingSystem:
                 usdt_equiv = bal_val / conv if mc.upper() != "USDT" else bal_val
                 
                 logger.info("[STREAM] Received balance update: %.4f %s (~%.2f USDT)", bal_val, mc, usdt_equiv)
-                self.wallet.wallet_balance = Decimal(str(usdt_equiv))
+                with self.wallet.lock:
+                    self.wallet.wallet_balance = Decimal(str(usdt_equiv))
             except Exception as e:
                 logger.error("Failed to process stream balance update: %s", e)
 
@@ -371,7 +373,7 @@ class LiveTradingSystem:
             consumer="engine-inproc",
             max_deliveries=self.cfg.signal_max_deliveries,
             idempotency_ttl_seconds=self.cfg.idempotency_ttl_seconds,
-            risk_gate=build_risk_gate(self.risk),
+            risk_gate=build_risk_gate(self.risk, balance_fn=lambda: self.wallet.margin_balance),
             record_open_fn=self.risk.record_open,
         )
         consumer.setup()

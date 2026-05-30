@@ -22,7 +22,7 @@ def test_hard_cap_raised_to_20():
 
 def test_config_dynamic_leverage_defaults():
     cfg = TradingConfig()
-    assert cfg.use_dynamic_leverage is False        # off by default
+    assert cfg.use_dynamic_leverage is True          # on by default (5x–20x range)
     assert cfg.dynamic_leverage_min == 5
     assert cfg.dynamic_leverage_max == 20
 

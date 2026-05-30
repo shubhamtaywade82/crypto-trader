@@ -99,8 +99,14 @@ class PlaybookMeanReversion:
             if not key.startswith("mr_"):
                 continue
             attr = key[len("mr_"):]
-            if hasattr(self, attr):
-                setattr(self, attr, val)
+            if not hasattr(self, attr):
+                continue
+            existing = getattr(self, attr)
+            try:
+                typed_val = type(existing)(val) if existing is not None else val
+            except (TypeError, ValueError):
+                typed_val = val
+            setattr(self, attr, typed_val)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Core maths

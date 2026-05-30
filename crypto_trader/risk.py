@@ -182,6 +182,7 @@ class RiskManager:
         max_orders_per_minute: int = 6,
         max_margin_ratio: float = 0.80,
         max_portfolio_notional_leverage: float = 3.0,  # Max total exposure / equity
+        max_margin_utilization: float = 0.40,
     ):
         self.max_daily = max_daily_trades
         self.max_consecutive = max_consecutive_losses
@@ -208,7 +209,7 @@ class RiskManager:
         self.kill_switch_reason: Optional[str] = None
         
         # Internalized Engines
-        self.margin_engine = MarginEngine(max_margin_utilization=0.40) # Default util
+        self.margin_engine = MarginEngine(max_margin_utilization=max_margin_utilization)
         self.leverage_engine = LeverageEngine()
         
         self.state_file = DATA_DIR / "risk_state.json"

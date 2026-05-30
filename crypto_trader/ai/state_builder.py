@@ -28,15 +28,17 @@ class StateBuilder:
         ema200 = df_htf["close"].ewm(span=200, adjust=False).mean().iloc[-1]
         htf_trend = "bullish" if mark_price > ema200 else "bearish"
 
-        # 3. Structure string — derive from recent_bos type
+        # 3. Structure string — derive from the latest break, distinguishing a
+        #    Change of Character (reversal) from a Break of Structure (continuation).
         recent_bos = struct.get("recent_bos")
         market_structure = "RANGE"
         if recent_bos:
-            bos_type = recent_bos.get("type", "BULLISH")  # BULLISH or BEARISH
+            bos_type = recent_bos.get("type", "BULLISH")     # BULLISH or BEARISH
+            is_choch = recent_bos.get("event") == "CHOCH"
             if bos_type == "BULLISH":
-                market_structure = "BOS_UP"
+                market_structure = "CHOCH_UP" if is_choch else "BOS_UP"
             else:
-                market_structure = "BOS_DOWN"
+                market_structure = "CHOCH_DOWN" if is_choch else "BOS_DOWN"
 
         # 4. Volume anomaly
         vol_std = df_ltf["volume"].rolling(20).std().iloc[-1]

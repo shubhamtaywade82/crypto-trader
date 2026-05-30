@@ -277,8 +277,14 @@ class PlaybookSupertrend2:
             if not key.startswith("st2_"):
                 continue
             attr = key[len("st2_"):]
-            if hasattr(self, attr):
-                setattr(self, attr, val)
+            if not hasattr(self, attr):
+                continue
+            existing = getattr(self, attr)
+            try:
+                typed_val = type(existing)(val) if existing is not None else val
+            except (TypeError, ValueError):
+                typed_val = val
+            setattr(self, attr, typed_val)
 
     # ── helpers ──
 

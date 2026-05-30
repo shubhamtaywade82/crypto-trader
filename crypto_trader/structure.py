@@ -3,7 +3,9 @@ crypto_trader.structure — Smart Money Concepts (SMC) & Price Action Calculatio
 =============================================================================
 Provides deterministic, standard-library-backed quantitative analysis of:
     - Swing Highs / Swing Lows (peaks and troughs)
-    - Break of Structure (BOS) / Change of Character (CHoCH)
+    - Break of Structure (BOS, continuation) vs Change of Character
+      (CHoCH, first counter-trend break) — distinguished via a running
+      directional bias and tagged on each event's ``event`` field
     - Fair Value Gaps (FVG) and mitigation tracking
     - Order Blocks (OB) and mitigation tracking
     - Liquidity Sweeps (wick penetrations of prior swings)
@@ -45,10 +47,16 @@ class MarketStructureAnalyzer:
 
         swing_highs = []    # Dicts: {index, price, time, broken, break_index}
         swing_lows = []     # Dicts: {index, price, time, broken, break_index}
-        bos_events = []     # Dicts: {index, type, swing_index, swing_price, break_price, time}
+        bos_events = []     # Dicts: {index, type, event, swing_index, swing_price, break_price, time}
         order_blocks = []   # Dicts: {index, type, high, low, open, close, time, mitigated, mitigate_index}
         sweep_events = []   # Dicts: {index, type, swing_index, swing_price, swept_price, time}
         fvgs = []           # Dicts: {index, type, top, bottom, time, mitigated, mitigate_index}
+
+        # Running directional bias used to distinguish a Break of Structure (BOS,
+        # a continuation in the prevailing trend) from a Change of Character
+        # (CHoCH, the first counter-trend break that signals a possible reversal).
+        #   +1 = bullish bias, -1 = bearish bias, 0 = undecided (no break yet).
+        trend_bias = 0
 
         # ── 1. Chronological Scanner for Swing Points, BOS, sweeps, OBs and FVGs ──
         # ── 1. Chronological Scanner for Swing Points, BOS, sweeps, OBs and FVGs ──
@@ -115,26 +123,39 @@ class MarketStructureAnalyzer:
                             'time': self.df['open_time'].iloc[i]
                         })
 
-            # D. Check for Break of Structure (BOS) / structural breakouts (requires close beyond swing)
+            # D. Check for Break of Structure (BOS) / Change of Character (CHoCH).
+            #    A close beyond a swing breaks it. The break is classified by the
+            #    PREVAILING bias: a break that agrees with the bias is a BOS
+            #    (continuation); the first break against the bias is a CHoCH
+            #    (reversal). The bias then flips to the break direction.
             for sh in swing_highs:
                 if not sh['broken'] and close_val > sh['price'] and i > sh['index']:
                     sh['broken'] = True
                     sh['break_index'] = i
+                    event_type = 'CHOCH' if trend_bias == -1 else 'BOS'
+                    trend_bias = 1
                     bos_events.append({
                         'index': i,
                         'type': 'BULLISH',
+                        'event': event_type,
                         'swing_index': sh['index'],
                         'swing_price': sh['price'],
                         'break_price': close_val,
                         'time': self.df['open_time'].iloc[i]
                     })
-                    # Bullish Order Block: last bearish candle prior to the breakout swing point index
+                    # Bullish Order Block: the last DOWN candle before the
+                    # displacement leg that broke structure — anchored at the
+                    # break candle ``i`` (the origin of the impulse), NOT at the
+                    # stale swing-point index. Walking back from ``i`` lands on
+                    # the candle institutions sourced liquidity from.
                     ob_idx = None
-                    for k in range(sh['index'], -1, -1):
+                    for k in range(i, -1, -1):
                         if self.df['close'].iloc[k] < self.df['open'].iloc[k]:
                             ob_idx = k
                             break
-                    if ob_idx is not None:
+                    if ob_idx is not None and not any(
+                        ob['index'] == ob_idx and ob['type'] == 'BULLISH' for ob in order_blocks
+                    ):
                         order_blocks.append({
                             'index': ob_idx,
                             'formed_index': i,
@@ -152,21 +173,28 @@ class MarketStructureAnalyzer:
                 if not sl['broken'] and close_val < sl['price'] and i > sl['index']:
                     sl['broken'] = True
                     sl['break_index'] = i
+                    event_type = 'CHOCH' if trend_bias == 1 else 'BOS'
+                    trend_bias = -1
                     bos_events.append({
                         'index': i,
                         'type': 'BEARISH',
+                        'event': event_type,
                         'swing_index': sl['index'],
                         'swing_price': sl['price'],
                         'break_price': close_val,
                         'time': self.df['open_time'].iloc[i]
                     })
-                    # Bearish Order Block: last bullish candle prior to the breakout swing point index
+                    # Bearish Order Block: the last UP candle before the
+                    # displacement leg that broke structure — anchored at the
+                    # break candle ``i`` (origin of the down-impulse).
                     ob_idx = None
-                    for k in range(sl['index'], -1, -1):
+                    for k in range(i, -1, -1):
                         if self.df['close'].iloc[k] > self.df['open'].iloc[k]:
                             ob_idx = k
                             break
-                    if ob_idx is not None:
+                    if ob_idx is not None and not any(
+                        ob['index'] == ob_idx and ob['type'] == 'BEARISH' for ob in order_blocks
+                    ):
                         order_blocks.append({
                             'index': ob_idx,
                             'formed_index': i,
@@ -269,12 +297,21 @@ class MarketStructureAnalyzer:
         unmitigated_ob = [ob for ob in order_blocks if not ob['mitigated']]
         unmitigated_fvg = [f for f in fvgs if not f['mitigated']]
 
+        # recent_bos = last structural break of EITHER kind (backward-compatible
+        # name; consumers that just want "the last break" still work). The
+        # BOS/CHoCH distinction is on the ``event`` field. recent_choch isolates
+        # the latest reversal break for callers that want only that.
         recent_bos = bos_events[-1] if bos_events else None
+        recent_choch = next(
+            (e for e in reversed(bos_events) if e.get('event') == 'CHOCH'), None
+        )
         recent_sweep = sweep_events[-1] if sweep_events else None
 
         # Add candle distance context
         if recent_bos:
             recent_bos['candles_ago'] = n_candles - 1 - recent_bos['index']
+        if recent_choch:
+            recent_choch['candles_ago'] = n_candles - 1 - recent_choch['index']
         if recent_sweep:
             recent_sweep['candles_ago'] = n_candles - 1 - recent_sweep['index']
 
@@ -284,6 +321,8 @@ class MarketStructureAnalyzer:
             'active_swing_highs': active_sh[-3:],  # Last 3 active swing highs
             'active_swing_lows': active_sl[-3:],   # Last 3 active swing lows
             'recent_bos': recent_bos,
+            'recent_choch': recent_choch,
+            'trend_bias': trend_bias,              # +1 bull / -1 bear / 0 undecided
             'recent_sweep': recent_sweep,
             'unmitigated_order_blocks': unmitigated_ob[-3:],  # Last 3 unmitigated OBs
             'unmitigated_fvgs': unmitigated_fvg[-3:],          # Last 3 unmitigated FVGs
@@ -353,6 +392,8 @@ class MarketStructureAnalyzer:
             'active_swing_highs': [],
             'active_swing_lows': [],
             'recent_bos': None,
+            'recent_choch': None,
+            'trend_bias': 0,
             'recent_sweep': None,
             'unmitigated_order_blocks': [],
             'unmitigated_fvgs': [],

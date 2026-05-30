@@ -82,6 +82,7 @@ class TradingEngine:
             cooldown_after_loss_minutes=self.cfg.cooldown_after_loss_minutes,
             max_orders_per_minute=self.cfg.max_orders_per_minute,
             max_margin_ratio=self.cfg.max_margin_ratio,
+            max_margin_utilization=self.cfg.max_margin_utilization,
         )
         from .llm_advisor import FINAL_SCORE_THRESHOLD
         self.adaptive_threshold = AdaptiveThresholdManager(
@@ -165,9 +166,11 @@ class TradingEngine:
                     open_positions=open_positions,
                 )
 
-        self.risk_manager.update_peak_balance(self.wallet.margin_balance)
-        # 5. Risk check
+        # 5. Risk check — update peak AFTER the gate so a fresh session doesn't
+        # advance the high-water mark before we verify daily drawdown limits.
         can_trade, risk_reason = self.risk_manager.can_trade(current_balance=self.wallet.margin_balance)
+        if can_trade:
+            self.risk_manager.update_peak_balance(self.wallet.margin_balance)
         if not can_trade:
             logger.info(f"[RISK] {risk_reason}")
 
@@ -236,7 +239,8 @@ class TradingEngine:
                         return self.wallet.get_summary()
                     # Risk-based sizing from stop distance (ATR-ready because stop comes from setup).
                     stop_distance = abs(mark_price - setup["sl_price"])
-                    risk_budget = self.wallet.margin_balance * Decimal("0.01")
+                    risk_pct = Decimal(str(self.cfg.risk_per_trade_pct)) if self.cfg else Decimal("0.01")
+                    risk_budget = self.wallet.margin_balance * risk_pct
                     size_multiplier = min(final_score / dynamic_threshold, 1.0)
                     risk_budget *= Decimal(str(size_multiplier))
                     stop_distance_dec = Decimal(str(stop_distance))

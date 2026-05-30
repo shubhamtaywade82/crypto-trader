@@ -99,12 +99,19 @@ class CoinDCXUserStream:
 
     # ── auth ──────────────────────────────────────────────────────────────────
     def _auth_payload(self) -> dict:
-        """The ``join`` payload: HMAC-SHA256 of the channel body, plus the key."""
-        body = json.dumps({"channel": self.channel}, separators=(",", ":"))
+        """The ``join`` payload: HMAC-SHA256 of the channel+timestamp body.
+
+        Including a timestamp in the signed body prevents replay attacks: a
+        captured auth frame is useless once the timestamp window expires.
+        """
+        import time as _time
+        ts_ms = int(_time.time() * 1000)
+        body = json.dumps({"channel": self.channel, "timestamp": ts_ms}, separators=(",", ":"))
         return {
             "channelName": self.channel,
             "authSignature": self._signer._sign(body),
             "apiKey": self.api_key,
+            "timestamp": ts_ms,
         }
 
     # ── lifecycle ───────────────────────────────────────────────────────────────

@@ -19,9 +19,10 @@ Endpoint shape (verified against the live API)::
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from .coindcx_client import CoinDCXClient
 
@@ -87,16 +88,23 @@ class InstrumentSpec:
         return None
 
 
+_SPEC_CACHE_TTL_S = 3600  # refresh venue instrument specs at most once per hour
+
+
 class InstrumentMapper:
     def __init__(self, client: Optional[CoinDCXClient] = None, margin_currency: str = "USDT"):
         self.client = client or CoinDCXClient()
         self.margin_currency = margin_currency.upper()
-        self._cache: Dict[str, InstrumentSpec] = {}
+        # (spec, fetched_at) tuples keyed by internal symbol
+        self._cache: Dict[str, Tuple[InstrumentSpec, float]] = {}
 
     def get_spec(self, symbol: str, *, refresh: bool = False) -> InstrumentSpec:
         internal = coindcx_to_internal(symbol) if symbol.upper().startswith("B-") else symbol.upper()
+        now = time.monotonic()
         if not refresh and internal in self._cache:
-            return self._cache[internal]
+            spec, fetched_at = self._cache[internal]
+            if now - fetched_at < _SPEC_CACHE_TTL_S:
+                return spec
         pair = internal_to_coindcx(internal)
         raw = self.client.get_public(
             _INSTRUMENT_ENDPOINT,
@@ -133,7 +141,7 @@ class InstrumentMapper:
             taker_fee_rate=float(inst.get("taker_fee", 0.0)) / 100.0,
             status=inst.get("status", "active"),
         )
-        self._cache[internal] = spec
+        self._cache[internal] = (spec, now)
         logger.info(
             "Loaded instrument %s: tick=%s step=%s minNotional=%s maxLev=%s",
             pair, spec.price_increment, spec.quantity_increment, spec.min_notional, spec.max_leverage,

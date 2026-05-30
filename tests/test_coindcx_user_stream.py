@@ -15,11 +15,14 @@ def _stream(bus=None, on_fill=None):
 def test_auth_payload_signature_matches_reference():
     s = _stream()
     payload = s._auth_payload()
-    body = json.dumps({"channel": "coindcx"}, separators=(",", ":"))
+    # Auth body now includes timestamp to prevent replay attacks (M-10 fix).
+    ts = payload["timestamp"]
+    body = json.dumps({"channel": "coindcx", "timestamp": ts}, separators=(",", ":"))
     expected = hmac.new(b"secret123", body.encode(), hashlib.sha256).hexdigest()
     assert payload["authSignature"] == expected
     assert payload["apiKey"] == "k"
     assert payload["channelName"] == "coindcx"
+    assert isinstance(ts, int) and ts > 0
 
 
 def test_trade_event_publishes_normalized_order_filled():

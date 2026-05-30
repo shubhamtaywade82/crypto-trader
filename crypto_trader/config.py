@@ -45,10 +45,13 @@ class StrategyMode(str, Enum):
                       SMA by ``mr_entry_band``, exit when it reverts to SMA.
                       Works on any symbol in the WATCHLIST.  Funding-rate guard
                       and all risk/daily limits still apply.
+    REGIME_SWITCH   — Supertrend2 gated by market regime.  Only enters during
+                      TREND_EXPANSION / BREAKOUT_ENVIRONMENT; sits flat in chop.
     """
     LEGACY = "legacy"
     SUPERTREND2 = "supertrend2"
     MEAN_REVERSION = "mean_reversion"
+    REGIME_SWITCH = "regime_switch"
 
 
 @dataclass
@@ -76,7 +79,7 @@ _TRADING_PROFILES: dict = {
         max_daily_trades=2,
         max_consecutive_losses=1,
         max_drawdown_pct=0.08,
-        max_leverage=2,
+        max_leverage=5,
         risk_per_trade_pct=0.01,
         funding_extreme_threshold=0.0003,
         require_kill_zone=True,
@@ -90,7 +93,7 @@ _TRADING_PROFILES: dict = {
         max_daily_trades=5,
         max_consecutive_losses=2,
         max_drawdown_pct=0.15,
-        max_leverage=3,
+        max_leverage=10,
         risk_per_trade_pct=0.02,
         funding_extreme_threshold=0.0005,
         require_kill_zone=False,
@@ -215,9 +218,8 @@ class TradingConfig:
     # ── Dynamic per-trade leverage (5x–20x band) ──
     # When enabled, each entry's leverage is scaled within [dynamic_leverage_min,
     # dynamic_leverage_max] by volatility (ATR%), account drawdown, margin ratio,
-    # and regime — down in high vol / drawdown, up in strong trends. Default OFF:
-    # the bot uses the fixed max_leverage. Enable only after paper validation.
-    use_dynamic_leverage: bool = False
+    # and regime — down in high vol / drawdown, up in strong trends.
+    use_dynamic_leverage: bool = True
     dynamic_leverage_min: int = 5
     dynamic_leverage_max: int = 20
     # Scaling-sensitivity thresholds (when leverage is pulled toward the floor).
@@ -331,11 +333,14 @@ class TradingConfig:
     adaptive_target_trades_per_day: float = 2.0   # decay starts after 24/target idle hours
     adaptive_decay_per_hour: float = 0.01         # threshold drop rate per idle hour
     risk_per_trade_pct: float = field(default=_SPEC_RISK_PER_TRADE_PCT)
+    # Fraction of account balance that may be locked as margin across ALL positions.
+    # Shared by both MarginEngine instances (engine_ws + risk_manager) so they agree.
+    max_margin_utilization: float = 0.40
     funding_extreme_threshold: float = 0.0005
     max_consecutive_losses: int = field(default=_SPEC_MAX_CONSECUTIVE_LOSSES)
     max_drawdown_pct: float = 0.20
     max_daily_drawdown_pct: float = 0.03
-    cooldown_after_loss_minutes: int = 1440
+    cooldown_after_loss_minutes: int = 60
     allowed_regimes: list = field(default_factory=list)  # empty = all non-blocked regimes
 
     # ── Strategy mode ──
@@ -380,6 +385,26 @@ class TradingConfig:
     mr_entry_band: float = 0.015      # 1.5% deviation from SMA to trigger entry
     mr_stop_loss_pct: float = 0.008   # 0.8% hard stop from fill price
 
+    # ── SMC pipeline settings (active only when strategy_mode = "smc") ──
+    # Production 10-stage SMC pipeline with a 9-factor weighted 0-100 score
+    # (see docs/smc_crypto_futures_guide_refined). Only trades clearing
+    # smc_min_score with all hard gates passing are taken.
+    smc_entry_timeframe: str = "15m"  # entry/setup timeframe
+    smc_htf_timeframe: str = "4h"     # higher-timeframe bias
+    smc_swing_window: int = 3         # swing-pivot radius
+    smc_min_score: float = 70.0       # composite score threshold (guide: ≥70)
+    smc_sweep_lookback: int = 12      # max candles since liquidity sweep
+    smc_structure_lookback: int = 12  # max candles since BOS/CHoCH
+    smc_oi_expansion_pct: float = 3.0       # OI %Δ for full OI factor
+    smc_volume_mult_target: float = 3.0     # displacement vol / 20-avg for full vol factor
+    smc_rvol_target: float = 1.2            # RVOL for full RVOL factor
+    smc_liq_cascade_threshold: float = 0.5  # liquidation intensity ≥ ⇒ reject
+    smc_atr_period: int = 14
+    smc_sl_buffer_atr: float = 0.5    # ATR padding beyond sweep wick for SL
+    smc_sl_atr_mult: float = 1.5      # ATR cap on stop distance (keeps RR sane)
+    smc_tp_rr: float = 2.0            # TP risk-reward ceiling / fallback
+    smc_max_hold_hours: int = 24      # safety time-stop
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -410,7 +435,7 @@ class TradingConfig:
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
             max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
-            use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", False),
+            use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", True),
             dynamic_leverage_min=_get_int("DYNAMIC_LEVERAGE_MIN", 5),
             dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 20),
             dynamic_leverage_vol_atr_period=_get_int("DYNAMIC_LEVERAGE_VOL_ATR_PERIOD", 14),
@@ -499,7 +524,7 @@ class TradingConfig:
             ),
             max_drawdown_pct=_get_float("MAX_DRAWDOWN_PCT", profile.max_drawdown_pct),
             max_daily_drawdown_pct=_get_float("DAILY_MAX_LOSS_PCT", 0.03),
-            cooldown_after_loss_minutes=_get_int("LOSS_COOLDOWN_MINUTES", 1440),
+            cooldown_after_loss_minutes=_get_int("LOSS_COOLDOWN_MINUTES", 60),
             allowed_regimes=profile.allowed_regimes,
             strategy_mode=_get("STRATEGY_MODE", "legacy").lower(),
             st2_atr_period=_get_int("ST2_ATR_PERIOD", 10),
@@ -525,6 +550,21 @@ class TradingConfig:
             mr_sma_period=_get_int("MR_SMA_PERIOD", 20),
             mr_entry_band=_get_float("MR_ENTRY_BAND", 0.015),
             mr_stop_loss_pct=_get_float("MR_STOP_LOSS_PCT", 0.008),
+            smc_entry_timeframe=_valid_interval("SMC_ENTRY_TIMEFRAME", "15m"),
+            smc_htf_timeframe=_valid_interval("SMC_HTF_TIMEFRAME", "4h"),
+            smc_swing_window=_get_int("SMC_SWING_WINDOW", 3),
+            smc_min_score=_get_float("SMC_MIN_SCORE", 70.0),
+            smc_sweep_lookback=_get_int("SMC_SWEEP_LOOKBACK", 12),
+            smc_structure_lookback=_get_int("SMC_STRUCTURE_LOOKBACK", 12),
+            smc_oi_expansion_pct=_get_float("SMC_OI_EXPANSION_PCT", 3.0),
+            smc_volume_mult_target=_get_float("SMC_VOLUME_MULT_TARGET", 3.0),
+            smc_rvol_target=_get_float("SMC_RVOL_TARGET", 1.2),
+            smc_liq_cascade_threshold=_get_float("SMC_LIQ_CASCADE_THRESHOLD", 0.5),
+            smc_atr_period=_get_int("SMC_ATR_PERIOD", 14),
+            smc_sl_buffer_atr=_get_float("SMC_SL_BUFFER_ATR", 0.5),
+            smc_sl_atr_mult=_get_float("SMC_SL_ATR_MULT", 1.5),
+            smc_tp_rr=_get_float("SMC_TP_RR", 2.0),
+            smc_max_hold_hours=_get_int("SMC_MAX_HOLD_HOURS", 24),
         )
 
     @property
@@ -572,6 +612,7 @@ class TradingConfig:
             "data_source": self.data_source.value,
             "margin_currency": self.coindcx_margin_currency,
             "max_leverage": self.max_leverage,
+            "use_dynamic_leverage": self.use_dynamic_leverage,
             "initial_balance": self.initial_balance,
             "coindcx_api_key": mask(self.coindcx_api_key),
             "coindcx_api_secret": mask(self.coindcx_api_secret),

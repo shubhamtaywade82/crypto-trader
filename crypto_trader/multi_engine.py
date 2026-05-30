@@ -14,6 +14,7 @@ from crypto_trader.logger_config import configure_colored_logging
 from crypto_trader.events import bus
 from crypto_trader.telegram_bot import TelegramService
 from crypto_trader.risk import RiskManager
+from crypto_trader.smc_alert_processor import SMCAlertProcessor
 from crypto_trader import safe_mode
 
 # Env variables are loaded by crypto_trader.__init__ (_load_dotenv):
@@ -72,6 +73,7 @@ def parse_args():
     parser.add_argument("--log-rest", action="store_true", help="Log REST API responses")
     parser.add_argument("--log-ws", action="store_true", help="Log WebSocket messages")
     parser.add_argument("--log-llm", action="store_true", help="Log LLM prompts and raw responses")
+    parser.add_argument("--tick", type=int, default=300, help="Signal tick interval in seconds (default: 300)")
     return parser.parse_args()
 
 def load_watchlist(symbols_arg: Optional[str] = None) -> List[str]:
@@ -145,9 +147,9 @@ def run_preflight_checks(
         cfg = load_config()
     return run_venue_preflight(symbols, wallet, execution_engine, risk, bus, cfg)
 
-def run_engine(engine: WebSocketTradingEngine):
+def run_engine(engine: WebSocketTradingEngine, tick: int = 300):
     try:
-        engine.run_loop()
+        engine.run_loop(signal_interval_seconds=tick)
     except Exception as e:
         logger.error(f"Engine loop crashed for {engine.symbol}: {e}")
     finally:
@@ -187,6 +189,7 @@ def main():
         cooldown_after_loss_minutes=_early_cfg.cooldown_after_loss_minutes,
         max_orders_per_minute=_early_cfg.max_orders_per_minute,
         max_margin_ratio=_early_cfg.max_margin_ratio,
+        max_margin_utilization=_early_cfg.max_margin_utilization,
     )
     logger.info(
         "Trading profile: %s (threshold=%.2f, max_trades=%d, regimes=%s)",
@@ -316,7 +319,12 @@ def main():
         tg_service.start()
         logger.info("Telegram notification service started")
     else:
+        tg_service = None
         logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing. Notifications disabled.")
+
+    # Start SMC → LLM → Telegram alert pipeline
+    smc_processor = SMCAlertProcessor(event_bus=bus, telegram_service=tg_service)
+    smc_processor.start()
 
     # Divide total balance equally among symbols to prevent overallocation
     per_symbol_balance = total_balance / len(symbols)
@@ -358,7 +366,7 @@ def main():
 
     try:
         for engine in engines:
-            t = threading.Thread(target=run_engine, args=(engine,), daemon=True)
+            t = threading.Thread(target=run_engine, args=(engine, args.tick), daemon=True)
             threads.append(t)
             t.start()
             
@@ -371,6 +379,10 @@ def main():
     finally:
         for engine in engines:
             engine.stop()
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
         logger.info("All engines stopped.")
 
 if __name__ == "__main__":

@@ -121,6 +121,23 @@ class FeedStaleEvent(Event):
     age_ms: float = 0.0
     trading_disabled: bool = False
 
+@dataclass
+class SMCAlertEvent(Event):
+    """Published when a new SMC structure is detected on the 15m timeframe.
+
+    The SMC alert processor subscribes to these events, forwards the
+    structured context to the LLM, and broadcasts the LLM commentary to
+    Telegram.
+    """
+    symbol: str = ""
+    alert_type: str = ""       # "sweep" | "bos" | "choch" | "fvg" | "ob" | "pinbar" | "engulfing"
+    direction: str = ""        # "bullish" | "bearish"
+    price: float = 0.0
+    details: str = ""          # human-readable summary
+    timeframe: str = "15m"
+    htf_trend: str = ""        # higher-timeframe bias context
+    mark_price: float = 0.0
+
 class EventBus:
     def __init__(self):
         self._subscribers: Dict[type, List[Callable]] = {}

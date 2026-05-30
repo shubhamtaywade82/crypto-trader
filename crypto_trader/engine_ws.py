@@ -32,6 +32,8 @@ from .risk import RiskManager, AdaptiveThresholdManager, MarginEngine, LeverageE
 from .playbooks import PlaybookA, PlaybookB, PlaybookAres, PlaybookVolExhaust, PlaybookSweepMSS
 from .strategies.supertrend2 import PlaybookSupertrend2
 from .strategies.mean_reversion import PlaybookMeanReversion
+from .strategies.smc_pipeline import PlaybookSMC
+from .strategies.regime_switch import PlaybookRegimeSwitch
 from .strategies.mr_state import MRStateManager
 from .strategies.router import StrategyRouter, RouterResult, build_legacy_router
 from .reconciliation import ExchangeStateReconciler
@@ -158,6 +160,7 @@ class WebSocketTradingEngine:
                 cooldown_after_loss_minutes=cfg.cooldown_after_loss_minutes,
                 max_orders_per_minute=cfg.max_orders_per_minute,
                 max_margin_ratio=cfg.max_margin_ratio,
+                max_margin_utilization=cfg.max_margin_utilization,
             )
         else:
             _default_cfg = load_config()
@@ -166,6 +169,7 @@ class WebSocketTradingEngine:
                 max_consecutive_losses=_default_cfg.max_consecutive_losses,
                 max_daily_drawdown_pct=_default_cfg.max_daily_drawdown_pct,
                 cooldown_after_loss_minutes=_default_cfg.cooldown_after_loss_minutes,
+                max_margin_utilization=_default_cfg.max_margin_utilization,
             )
         _base_threshold = cfg.final_score_threshold if cfg else FINAL_SCORE_THRESHOLD
         _min_threshold = cfg.adaptive_min_threshold if cfg else 0.45
@@ -178,7 +182,8 @@ class WebSocketTradingEngine:
             target_trades_per_day=_target_trades,
         )
 
-        self.margin_engine = MarginEngine()
+        _margin_util = cfg.max_margin_utilization if cfg is not None else 0.40
+        self.margin_engine = MarginEngine(max_margin_utilization=_margin_util)
         self.leverage_engine = LeverageEngine()
         # Dynamic per-trade leverage (5x–20x band), gated by config. When None,
         # the engine uses the fixed configured leverage (unchanged behaviour).
@@ -203,6 +208,8 @@ class WebSocketTradingEngine:
                 self.reconciler.reconcile_symbol(self.symbol)
             except Exception as e:
                 logger.error("[ENGINE] Startup reconciliation failed for %s: %s", self.symbol, e)
+        from .market_state import OpenInterestTracker
+        self.oi_tracker = OpenInterestTracker()
 
         # Strategy
         self.regime_analyzer = MarketRegimeAnalyzer()
@@ -210,7 +217,7 @@ class WebSocketTradingEngine:
         self.playbook_b = PlaybookB()
         self.playbook_ares = PlaybookAres()
         self.playbook_volx = PlaybookVolExhaust()
-        self.playbook_sweep = PlaybookSweepMSS()
+        self.playbook_sweep = PlaybookSweepMSS(min_score=0.70)
         self._playbook_registry: dict = {
             pb.name: pb for pb in [
                 self.playbook_a, self.playbook_b, self.playbook_ares,
@@ -273,6 +280,61 @@ class WebSocketTradingEngine:
                 self.symbol,
             )
 
+        # SMC pipeline playbook (instantiated from cfg when strategy_mode=smc)
+        self.playbook_smc: Optional[PlaybookSMC] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "smc":
+            self.playbook_smc = PlaybookSMC(
+                entry_timeframe=getattr(cfg, "smc_entry_timeframe", "15m"),
+                htf_timeframe=getattr(cfg, "smc_htf_timeframe", "4h"),
+                swing_window=getattr(cfg, "smc_swing_window", 3),
+                min_score=getattr(cfg, "smc_min_score", 70.0),
+                sweep_lookback=getattr(cfg, "smc_sweep_lookback", 12),
+                structure_lookback=getattr(cfg, "smc_structure_lookback", 12),
+                oi_expansion_pct=getattr(cfg, "smc_oi_expansion_pct", 3.0),
+                volume_mult_target=getattr(cfg, "smc_volume_mult_target", 3.0),
+                rvol_target=getattr(cfg, "smc_rvol_target", 1.2),
+                liq_cascade_threshold=getattr(cfg, "smc_liq_cascade_threshold", 0.5),
+                atr_period=getattr(cfg, "smc_atr_period", 14),
+                sl_buffer_atr=getattr(cfg, "smc_sl_buffer_atr", 0.5),
+                sl_atr_mult=getattr(cfg, "smc_sl_atr_mult", 1.5),
+                tp_rr=getattr(cfg, "smc_tp_rr", 2.0),
+                max_hold_hours=getattr(cfg, "smc_max_hold_hours", 24),
+            )
+            logger.info(
+                "[SMC] SMC pipeline mode active: entry_tf=%s htf=%s min_score=%.0f "
+                "swing=%d symbol=%s",
+                self.playbook_smc.entry_timeframe, self.playbook_smc.htf_timeframe,
+                self.playbook_smc.min_score, self.playbook_smc.swing_window, self.symbol,
+            )
+
+        # Regime Switch playbook (wraps ST2 with regime gating)
+        self.playbook_regime_switch: Optional[PlaybookRegimeSwitch] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "regime_switch":
+            self.playbook_regime_switch = PlaybookRegimeSwitch(
+                entry_timeframe=getattr(cfg, "st2_timeframe", "1h"),
+                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
+                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
+                factor=getattr(cfg, "st2_factor", 3.0),
+                atr_period=getattr(cfg, "st2_atr_period", 10),
+                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 1.5),
+                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
+                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
+                tp2_pct=getattr(cfg, "st2_tp2_pct", 3.0),
+                tp_mode=getattr(cfg, "st2_tp_mode", "split"),
+                min_confidence=getattr(cfg, "st2_min_confidence", 60.0),
+                allowed_regimes=getattr(cfg, "rs_allowed_regimes", None),
+            )
+            logger.info(
+                "[RS] Regime Switch mode active: entry_tf=%s htf=%s factor=%.1f "
+                "mode=%s sl=%s symbol=%s",
+                self.playbook_regime_switch.entry_timeframe,
+                self.playbook_regime_switch.htf_timeframe,
+                self.playbook_regime_switch.factor,
+                self.playbook_regime_switch.entry_mode,
+                self.playbook_regime_switch.sl_mode,
+                self.symbol,
+            )
+
         # Regime / Session engine
         _rc_kwargs = {}
         if cfg:
@@ -304,6 +366,13 @@ class WebSocketTradingEngine:
         self.advisor = None
         self._llm_thread = None
         self.advisor = build_advisor(use_llm, llm_host=llm_host, llm_model=llm_model, llm_logged=llm_logged)
+        # M-8: tracks how many signal ticks have fired with LLM enabled but no
+        # advice available yet (cold-start window).  Reset once advice arrives.
+        self._llm_cold_start_ticks = 0
+
+        # SMC alert state: tracks the last published structure fingerprint so we
+        # only emit SMCAlertEvent when something NEW appears (not on every tick).
+        self._last_smc_state: Optional[dict] = None
 
         # WebSocket position manager (high-frequency exits)
         self.ws_pm = WebSocketPositionManager(
@@ -502,7 +571,14 @@ class WebSocketTradingEngine:
                         if pos:
                             mark = self.ws_feed.get_ltp() or self.ws_feed.get_mid_price()
                             if not mark or mark <= 0:
-                                mark = float(pos.entry_price)
+                                # Use the last-known highest price as the best
+                                # available proxy; entry_price is stale and could
+                                # produce a wildly wrong fill for the PnL book.
+                                mark = (
+                                    float(pos.highest_price)
+                                    if pos.highest_price and float(pos.highest_price) > 0
+                                    else float(pos.entry_price)
+                                )
                             self.wallet.close_position(
                                 self.symbol, float(mark),
                                 reason="MARGIN_GUARD_FLATTEN",
@@ -543,9 +619,6 @@ class WebSocketTradingEngine:
                 # 1s Task: G3: supervise the WS threads
                 if not self._supervise_threads():
                     break
-
-                # 1s Task: Authoritative health check (margin ratio guard)
-                self._check_authoritative_health()
 
                 # 60s Task: Periodic state reconciliation
                 if now - last_recon_time >= 60:
@@ -626,6 +699,8 @@ class WebSocketTradingEngine:
                         self.playbook_st2.apply_overrides({k: v})
                     if k.startswith("mr_") and self.playbook_mr is not None:
                         self.playbook_mr.apply_overrides({k: v})
+                    if k.startswith("smc_") and self.playbook_smc is not None:
+                        self.playbook_smc.apply_overrides({k: v})
                 elif cls == "flat_only":
                     self._pending_flat_overrides[k] = v
                 elif cls == "restart":
@@ -648,6 +723,8 @@ class WebSocketTradingEngine:
                     self.playbook_st2.apply_overrides({k: v})
                 if k.startswith("mr_") and self.playbook_mr is not None:
                     self.playbook_mr.apply_overrides({k: v})
+                if k.startswith("smc_") and self.playbook_smc is not None:
+                    self.playbook_smc.apply_overrides({k: v})
             self._pending_flat_overrides = {}
 
     def _signal_tick(self):
@@ -670,7 +747,25 @@ class WebSocketTradingEngine:
         regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx = result
 
         structure, structure_ltf = self._compute_market_structure(data)
+        htf_trend = str(regime_ctx.extended.value) if regime_ctx else str(regime)
+        self._scan_and_emit_smc_alerts(structure_ltf or structure, data.get("mark_price", 0.0), htf_trend)
         self._start_llm_async(data, regime, regime_score, regime_ctx, session_ctx, rvol)
+
+        # M-8: LLM cold-start warning — alert the operator when LLM is enabled
+        # but hasn't produced its first response yet.  Scores during this window
+        # are purely technical; the operator should know fusion is not active.
+        if self.use_llm and self.advisor:
+            _first_advice = self.advisor.get_last_advice()
+            if _first_advice is None:
+                self._llm_cold_start_ticks += 1
+                logger.warning(
+                    "[LLM COLD-START] %s: LLM enabled but no advice yet after %d tick(s). "
+                    "Scores are purely technical until the first LLM response arrives.",
+                    self.symbol, self._llm_cold_start_ticks,
+                )
+            else:
+                self._llm_cold_start_ticks = 0
+
         self._evaluate_and_enter(data, regime, regime_score, df_4h, rvol, adx_val, regime_ctx, session_ctx, structure, structure_ltf)
         self.wallet.print_summary()
 
@@ -792,6 +887,32 @@ class WebSocketTradingEngine:
                     logger.warning("[MR] Failed to fetch %s klines: %s — will retry in tick", mr_tf, e)
                     data["df_mr"] = None
 
+        # ── SMC pipeline configurable timeframes ─────────────────────────────
+        # Pre-fetch entry + HTF frames so _evaluate_entry_smc never makes a
+        # synchronous REST call inside the signal-tick hot path.
+        if self.playbook_smc is not None:
+            _baseline_map_smc = {"15m": df_15m, "5m": df_5m, "1h": df_1h, "4h": df_4h}
+            smc_tf = self.playbook_smc.entry_timeframe
+            smc_htf = self.playbook_smc.htf_timeframe
+            if smc_tf in _baseline_map_smc:
+                data["df_smc"] = _baseline_map_smc[smc_tf]
+            else:
+                try:
+                    data["df_smc"] = self.data_feed.get_klines(
+                        self.symbol, smc_tf, limit=self._kline_limit(smc_tf))
+                except Exception as e:
+                    logger.warning("[SMC] Failed to fetch entry TF %s: %s — falling back to 15m", smc_tf, e)
+                    data["df_smc"] = df_15m
+            if smc_htf in _baseline_map_smc:
+                data["df_smc_htf"] = _baseline_map_smc[smc_htf]
+            else:
+                try:
+                    data["df_smc_htf"] = self.data_feed.get_klines(
+                        self.symbol, smc_htf, limit=self._kline_limit(smc_htf))
+                except Exception as e:
+                    logger.warning("[SMC] Failed to fetch HTF %s: %s — falling back to 4h", smc_htf, e)
+                    data["df_smc_htf"] = df_4h
+
         return data
 
     def _compute_regime_context(self, data: dict):
@@ -823,9 +944,13 @@ class WebSocketTradingEngine:
         # RVOL on the 1H frame (most relevant for intraday entries)
         rvol = calculate_rvol(df_1h, window=20)
 
-        # OI delta: would require storing historical OI to compute a proper delta.
-        # Using 0.0 for now — the raw oi value is still passed to the LLM prompt.
+        # Update Open Interest and get metrics
         oi_delta = 0.0
+        oi_data = data.get("oi_data")
+        if isinstance(oi_data, dict) and "open_interest" in oi_data:
+            oi_val = oi_data["open_interest"]
+            oi_metrics = self.oi_tracker.update(oi_val)
+            oi_delta = oi_metrics.oi_delta_15m
 
         # Liquidation intensity: normalise recent liquidation volume to 0–1
         liquidation_intensity = 0.0
@@ -898,6 +1023,124 @@ class WebSocketTradingEngine:
 
         return structure, structure_ltf
 
+    def _scan_and_emit_smc_alerts(self, structure: dict, mark_price: float, htf_trend: str):
+        """Compare current 15m SMC structure with the previous tick and publish
+        :class:`~crypto_trader.events.SMCAlertEvent` for newly-appearing structures.
+        """
+        if structure is None:
+            return
+
+        from .events import SMCAlertEvent
+
+        # Build a lightweight fingerprint of current structures
+        def _fingerprint(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, list):
+                return tuple(sorted(
+                    (o.get("type", ""), round(float(o.get("price", o.get("top", o.get("high", 0)))), 4))
+                    for o in obj
+                ))
+            if isinstance(obj, dict):
+                return (obj.get("type", ""), obj.get("event", ""), round(float(obj.get("price", obj.get("swing_price", 0))), 4))
+            return None
+
+        current = {
+            "sweep": _fingerprint(structure.get("recent_sweep")),
+            "bos": _fingerprint(structure.get("recent_bos")),
+            "choch": _fingerprint(structure.get("recent_choch")),
+            "obs": _fingerprint(structure.get("unmitigated_order_blocks", [])),
+            "fvgs": _fingerprint(structure.get("unmitigated_fvgs", [])),
+            "pa": _fingerprint(structure.get("price_action_signals", [])),
+        }
+
+        prev = self._last_smc_state
+        self._last_smc_state = current
+
+        if prev is None:
+            return  # First tick — no baseline, skip alerting
+
+        # Detect new structures
+        alerts = []
+
+        # Sweep
+        if current["sweep"] and current["sweep"] != prev.get("sweep"):
+            s = structure["recent_sweep"]
+            alerts.append(SMCAlertEvent(
+                symbol=self.symbol,
+                alert_type="sweep",
+                direction=s.get("type", "").lower(),
+                price=float(s.get("swept_price", mark_price)),
+                details=f"Liquidity sweep of swing {s.get('swing_price')} → wick to {s.get('swept_price')} ({s.get('candles_ago')}c ago)",
+                htf_trend=htf_trend,
+                mark_price=mark_price,
+            ))
+
+        # BOS / CHoCH
+        for key, label in (("bos", "bos"), ("choch", "choch")):
+            if current[key] and current[key] != prev.get(key):
+                b = structure.get(f"recent_{key}")
+                if b:
+                    alerts.append(SMCAlertEvent(
+                        symbol=self.symbol,
+                        alert_type=label,
+                        direction=b.get("type", "").lower(),
+                        price=float(b.get("break_price", mark_price)),
+                        details=f"{b.get('event', label.upper())} @ {b.get('break_price')} ({b.get('candles_ago')}c ago)",
+                        htf_trend=htf_trend,
+                        mark_price=mark_price,
+                    ))
+
+        # New OBs
+        if current["obs"] and current["obs"] != prev.get("obs"):
+            obs = structure.get("unmitigated_order_blocks", [])
+            new_obs = [o for o in obs if _fingerprint(o) not in (prev.get("obs") or [])]
+            for o in new_obs[:1]:  # alert only the newest OB
+                alerts.append(SMCAlertEvent(
+                    symbol=self.symbol,
+                    alert_type="ob",
+                    direction=o.get("type", "").lower(),
+                    price=float(o.get("low", mark_price)),
+                    details=f"Unmitigated OB {o.get('low')}-{o.get('high')} (candle {o.get('index')})",
+                    htf_trend=htf_trend,
+                    mark_price=mark_price,
+                ))
+
+        # New FVGs
+        if current["fvgs"] and current["fvgs"] != prev.get("fvgs"):
+            fvgs = structure.get("unmitigated_fvgs", [])
+            new_fvgs = [g for g in fvgs if _fingerprint(g) not in (prev.get("fvgs") or [])]
+            for g in new_fvgs[:1]:  # alert only the newest FVG
+                alerts.append(SMCAlertEvent(
+                    symbol=self.symbol,
+                    alert_type="fvg",
+                    direction=g.get("type", "").lower(),
+                    price=float(g.get("bottom", mark_price)),
+                    details=f"Unmitigated FVG {g.get('bottom')}-{g.get('top')} (candle {g.get('index')})",
+                    htf_trend=htf_trend,
+                    mark_price=mark_price,
+                ))
+
+        # Price Action
+        if current["pa"] and current["pa"] != prev.get("pa"):
+            pa_sigs = structure.get("price_action_signals", [])
+            new_pa = [p for p in pa_sigs if _fingerprint(p) not in (prev.get("pa") or [])]
+            for p in new_pa[:1]:
+                alerts.append(SMCAlertEvent(
+                    symbol=self.symbol,
+                    alert_type=p.get("pattern", "pa").lower(),
+                    direction=p.get("type", "").lower(),
+                    price=float(p.get("price", mark_price)),
+                    details=f"{p.get('pattern')} @ {p.get('price')}",
+                    htf_trend=htf_trend,
+                    mark_price=mark_price,
+                ))
+
+        for alert in alerts:
+            if self.event_bus:
+                self.event_bus.publish(alert)
+                logger.info("[SMC-ALERT] Published %s %s for %s", alert.alert_type, alert.direction, self.symbol)
+
     def _start_llm_async(self, data: dict, regime, regime_score, regime_ctx, session_ctx, rvol):
         """Start the LLM advice thread asynchronously (step 4)."""
         if not (self.use_llm and self.advisor):
@@ -939,20 +1182,21 @@ class WebSocketTradingEngine:
         Check whether the Supertrend2 direction has just flipped against the
         open position. If so, close it and return True.
 
-        Called every signal tick (5 min) when strategy_mode == "supertrend2".
-        The 1H Supertrend can flip at most once per hour so this granularity
-        is more than sufficient.
+        Called every signal tick (5 min) when strategy_mode == "supertrend2" or
+        "regime_switch".  The 1H Supertrend can flip at most once per hour so
+        this granularity is more than sufficient.
         """
-        if self.playbook_st2 is None:
+        pb = self.playbook_st2 or (self.playbook_regime_switch.st2 if self.playbook_regime_switch else None)
+        if pb is None:
             return False
         try:
             df_st2 = data.get("df_st2", data["df_1h"])
-            if df_st2 is None or len(df_st2) < self.playbook_st2._min_bars():
+            if df_st2 is None or len(df_st2) < pb._min_bars():
                 return False
 
             from .strategies.supertrend2 import compute_supertrend2
-            atr_len = self.playbook_st2._effective_atr_len()
-            _, direction = compute_supertrend2(df_st2, self.playbook_st2.factor, atr_len)
+            atr_len = pb._effective_atr_len()
+            _, direction = compute_supertrend2(df_st2, pb.factor, atr_len)
 
             curr_dir = int(direction.iloc[-1])
             prev_dir = int(direction.iloc[-2])
@@ -1041,6 +1285,73 @@ class WebSocketTradingEngine:
             final_score=1.0,          # ST2 signal is binary; always passes threshold
             llm_weight=0.0,
             explanation="Supertrend2 signal",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=1.0,
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=dynamic_threshold,
+            regime_ctx=regime_ctx,
+        ))
+
+    def _evaluate_entry_regime_switch(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """
+        Entry evaluation path for strategy_mode == "regime_switch".
+
+        Wraps Supertrend2 with an extended-regime gate.  Only entries that
+        occur during allowed regimes (default: TREND_EXPANSION or
+        BREAKOUT_ENVIRONMENT) are passed through to execution.
+        """
+        if self.playbook_regime_switch is None:
+            return
+
+        df_st2 = data.get("df_st2", data["df_1h"])
+        df_st2_htf = data.get("df_st2_htf", data["df_4h"]) if self.playbook_regime_switch.use_htf_filter else None
+
+        setup = self.playbook_regime_switch.evaluate(df_st2, df_st2_htf, regime_ctx=regime_ctx)
+        if not setup:
+            direction = None
+            try:
+                direction = self.playbook_regime_switch.st2.get_current_direction(df_st2)
+            except Exception:
+                pass
+            logger.info("[RS EVAL] %s no signal this tick (direction=%s) → no signal",
+                        self.symbol, direction)
+            self._reject(f"rs_no_signal direction={direction}")
+            return
+
+        logger.info("[RS SIGNAL] %s | %s", setup["side"].value, setup["reason"])
+
+        # Funding-rate extreme guard (keep for safety)
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"].value in ("LONG", "BUY") and funding_rate > _funding_extreme)
+            or (setup["side"].value in ("SHORT", "SELL") and funding_rate < -_funding_extreme)
+        ):
+            logger.info(
+                "[RS BLOCKED] Funding extreme %+.4%% (threshold %.4%%)",
+                funding_rate, _funding_extreme,
+            )
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        dynamic_threshold = self.adaptive_threshold.get_threshold()
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=1.0,
+            llm_weight=0.0,
+            explanation="RegimeSwitch signal",
             mark_price=mark_price,
             funding_rate=funding_rate,
             oi_delta=0.0,
@@ -1213,6 +1524,90 @@ class WebSocketTradingEngine:
             regime_ctx=regime_ctx,
         ))
 
+    def _evaluate_entry_smc(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """Entry evaluation path for strategy_mode == "smc".
+
+        Runs the 10-stage SMC pipeline on the entry/HTF frames, fusing structure
+        with participation (RVOL, liquidation intensity from the regime context).
+        OI delta is not yet tracked engine-side, so the OI factor is dropped and
+        the remaining weights renormalised (oi_available=False) rather than
+        silently scored zero.
+        """
+        if self.playbook_smc is None:
+            return
+
+        df_smc = data.get("df_smc") or data.get("df_15m")
+        df_smc_htf = data.get("df_smc_htf") or data.get("df_4h")
+        if df_smc is None:
+            logger.warning("[SMC ENTRY] %s — no entry-TF klines available", self.symbol)
+            return
+
+        rvol = getattr(regime_ctx, "rvol", 1.0) if regime_ctx else 1.0
+        liq_intensity = getattr(regime_ctx, "liquidation_intensity", 0.0) if regime_ctx else 0.0
+        oi_delta = getattr(regime_ctx, "oi_delta", 0.0) if regime_ctx else 0.0
+
+        setup = self.playbook_smc.evaluate(
+            df_smc, df_smc_htf,
+            oi_delta=oi_delta, oi_available=True,
+            rvol=rvol, liquidation_intensity=liq_intensity,
+        )
+        if not setup:
+            ev = getattr(self.playbook_smc, "last_eval", None)
+            if ev and "confidence" in ev:
+                logger.info(
+                    "[SMC EVAL] %s %s score=%.0f < min %.0f → no signal (factors=%s)",
+                    self.symbol, ev.get("side"), ev["confidence"], ev["min_score"],
+                    ev.get("factors"),
+                )
+                reason = f"smc_score {ev['confidence']:.0f} < {ev['min_score']:.0f}"
+            elif ev:
+                logger.info("[SMC EVAL] %s gate failed at stage=%s → no signal",
+                            self.symbol, ev.get("stage"))
+                reason = f"smc_gate {ev.get('stage')}"
+            else:
+                logger.info("[SMC EVAL] %s no signal (insufficient data)", self.symbol)
+                reason = "smc_no_data"
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(symbol=self.symbol, reason=reason))
+            return
+
+        logger.info("[SMC SIGNAL] %s | %s | %s", self.symbol, setup["side"].value, setup["reason"])
+
+        # Funding-rate extreme guard (consistent with other strategies).
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
+        ):
+            logger.info("[SMC BLOCKED] %s — funding extreme %+.4f%%", self.symbol, funding_rate * 100)
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=setup["score"],
+            llm_weight=0.0,
+            explanation=f"SMC pipeline score={setup['confidence_score']:.0f}/100",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=setup["score"],
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=setup["score"],  # strategy gates internally at min_score
+            regime_ctx=regime_ctx,
+        ))
+
     # ─── Position update helpers ────────────────────────────────────────────
 
     def _update_open_position(self, data: dict, regime, session_ctx):
@@ -1224,9 +1619,10 @@ class WebSocketTradingEngine:
             if _mr_mode and self._mr_check_sma_exit(data, pos):
                 return  # position closed by SMA reversion; skip further management
 
-            # ST2 mode: check for Supertrend flip exit before normal SL/TP logic
+            # ST2 / RegimeSwitch mode: check for Supertrend flip exit before normal SL/TP logic
             _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
-            if _st2_mode and self._st2_check_flip_exit(data, pos):
+            _rs_mode  = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "regime_switch"
+            if (_st2_mode or _rs_mode) and self._st2_check_flip_exit(data, pos):
                 return  # position closed by flip; skip further position management
 
             df_1h = data["df_1h"]
@@ -1259,14 +1655,21 @@ class WebSocketTradingEngine:
         # Stash for dynamic-leverage ATR% (read in _apply_dynamic_leverage).
         self._last_signal_df_1h = df_1h
 
-        # 5. Risk check
-        self.risk_manager.update_peak_balance(self.wallet.margin_balance)
-        # Assuming initial balance for daily drawdown is the wallet balance minus daily PnL
-        initial_daily_balance = float(self.wallet.wallet_balance) - self.risk_manager.daily_pnl
+        # 5. Risk check — update peak AFTER the gate to avoid advancing the
+        # high-water mark before we verify daily-drawdown limits.
+        current_balance = self.wallet.margin_balance
+        # Reconstruct today's opening balance: best estimate is peak_balance when it
+        # has been set this session, otherwise fall back to margin_balance − daily_pnl.
+        if self.risk_manager.peak_balance and self.risk_manager.peak_balance > 0:
+            initial_daily_balance = float(self.risk_manager.peak_balance)
+        else:
+            initial_daily_balance = max(float(current_balance) - self.risk_manager.daily_pnl, float(current_balance))
         can_trade, risk_reason = self.risk_manager.can_trade(
-            current_balance=self.wallet.margin_balance,
+            current_balance=current_balance,
             initial_daily_balance=initial_daily_balance
         )
+        if can_trade:
+            self.risk_manager.update_peak_balance(current_balance)
         if not can_trade:
             if not getattr(self, "_halt_published", False):
                 if self.event_bus:
@@ -1288,6 +1691,7 @@ class WebSocketTradingEngine:
         if not self.wallet.get_open_position(self.symbol) and can_trade:
             _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
             _mr_mode  = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "mean_reversion"
+            _smc_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "smc"
 
             try:
                 if _st2_mode:
@@ -1302,6 +1706,21 @@ class WebSocketTradingEngine:
                     # SMA-band signal; funding-rate guard applied inside.
                     # Symbol-agnostic: works for all WATCHLIST symbols.
                     self._evaluate_entry_mr(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                elif _smc_mode:
+                    # ── SMC pipeline path ─────────────────────────────────────
+                    # 10-stage structure+participation filter; the composite
+                    # score gate (min_score) is applied inside the strategy.
+                    self._evaluate_entry_smc(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                elif self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "regime_switch":
+                    # ── Regime Switch path ────────────────────────────────────
+                    # Supertrend2 gated by extended regime (trend expansion /
+                    # breakout environment only by default).  Uses same
+                    # position-management as vanilla ST2.
+                    self._evaluate_entry_regime_switch(
                         data, mark_price, funding_rate, taker_ratio, regime_ctx
                     )
                 else:
@@ -1328,9 +1747,10 @@ class WebSocketTradingEngine:
                     latest_adx = df_4h["adx"].iloc[-1] if "adx" in df_4h.columns else None
                     self._evaluate_entry(
                         df_1h, df_4h, df_15m, regime, regime_score, mark_price,
-                        funding_rate, 0.0, taker_ratio, structure=structure,
+                        funding_rate, regime_ctx.oi_delta if regime_ctx else 0.0, taker_ratio, structure=structure,
                         adx_1h=latest_adx, regime_ctx=regime_ctx,
                         session_ctx=session_ctx, structure_ltf=structure_ltf,
+                        rvol=rvol,
                     )
 
             except Exception as e:
@@ -1397,7 +1817,7 @@ class WebSocketTradingEngine:
     def _evaluate_entry(self, df_1h, df_4h, df_15m, regime, regime_score, mark_price,
                         funding_rate, oi_delta, taker_ratio, structure=None, adx_1h=None,
                         regime_ctx: Optional[RegimeContext] = None,
-                        session_ctx=None, structure_ltf=None):
+                        session_ctx=None, structure_ltf=None, rvol: float = 1.0):
         """Evaluate entry signals and execute via WebSocket LTP.
 
         Score-based best-of selection is delegated to :class:`StrategyRouter`.
@@ -1412,7 +1832,10 @@ class WebSocketTradingEngine:
             "playbook_a":     lambda: self.playbook_a.evaluate(df_1h, regime, structure=structure),
             "playbook_b":     lambda: self.playbook_b.evaluate(df_1h, df_4h, regime, structure=structure),
             "playbook_sweep": lambda: self.playbook_sweep.evaluate(
-                df_1h, df_15m, structure, structure_ltf, regime=regime),
+                df_1h, df_15m, structure, structure_ltf, regime=regime,
+                oi_delta=oi_delta, rvol=rvol,
+                active_liquidation_cascade=(regime_ctx.extended.value == "LIQUIDATION_EVENT" if regime_ctx else False)
+            ),
         }
 
         result: Optional[RouterResult] = self._get_strategy_router().select(

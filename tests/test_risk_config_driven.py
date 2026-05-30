@@ -203,7 +203,7 @@ class TestTradingConfigRiskFields:
     def test_config_has_cooldown_after_loss_minutes(self):
         cfg = TradingConfig()
         assert hasattr(cfg, "cooldown_after_loss_minutes")
-        assert cfg.cooldown_after_loss_minutes == 1440
+        assert cfg.cooldown_after_loss_minutes == 60
 
     def test_config_has_max_consecutive_losses(self):
         cfg = TradingConfig()
