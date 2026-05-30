@@ -1,3 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: 'Inter';
+  src: url('https://fonts.gstatic.com/s/inter/v18/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuLyfAZ9hiA.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2') format('woff2');
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   /* Premium Dark Theme Color System */
   --bg-main: #06080e;
@@ -5,7 +25,7 @@
   --bg-header: #10141e;
   --bg-subtle: #161b26;
   --bg-terminal: #030407;
-  
+
   --border-main: #1b2230;
   --border-subtle: #131924;
   --border-active: #3b82f6;
@@ -16,15 +36,14 @@
   --text-bright: #ffffff;
 
   /* Standard Trading Colors */
-  --color-up: #00e676;      /* Vibrant Green */
-  --color-down: #ff3d00;    /* Vibrant Red */
+  --color-up: #00e676;
+  --color-down: #ff3d00;
   --bg-up-subtle: rgba(0, 230, 118, 0.08);
   --bg-down-subtle: rgba(255, 61, 0, 0.08);
 
   --color-warn: #ffab00;
   --bg-warn-subtle: rgba(255, 171, 0, 0.08);
 
-  /* Fonts */
   --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 
@@ -36,6 +55,36 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* shadcn theme variables */
+  --background: 0 0% 100%;
+  --foreground: 222.2 84% 4.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 222.2 84% 4.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222.2 84% 4.9%;
+  --primary: 222.2 47.4% 11.2%;
+  --primary-foreground: 210 40% 98%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 222.2 47.4% 11.2%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 215.4 16.3% 46.9%;
+  --accent: 210 40% 96.1%;
+  --accent-foreground: 222.2 47.4% 11.2%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 214.3 31.8% 91.4%;
+  --input: 214.3 31.8% 91.4%;
+  --ring: 222.2 84% 4.9%;
+  --radius: 0.5rem;
+  --sidebar-background: 0 0% 98%;
+  --sidebar-foreground: 240 5.3% 26.1%;
+  --sidebar-primary: 240 5.9% 10%;
+  --sidebar-primary-foreground: 0 0% 98%;
+  --sidebar-accent: 240 4.8% 95.9%;
+  --sidebar-accent-foreground: 240 5.9% 10%;
+  --sidebar-border: 220 13% 91%;
+  --sidebar-ring: 217.2 91.2% 59.8%;
 }
 
 *, *::before, *::after {
@@ -84,4 +133,73 @@ h1, h2, h3, h4, h5, h6 {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
+}
+
+/* Animations */
+@keyframes txt-flash-green {
+  0% { background-color: rgba(0, 230, 118, 0.3); }
+  100% { background-color: transparent; }
+}
+
+@keyframes txt-flash-red {
+  0% { background-color: rgba(255, 61, 0, 0.3); }
+  100% { background-color: transparent; }
+}
+
+@keyframes row-flash-green {
+  0% { background-color: rgba(0, 230, 118, 0.2); }
+  100% { background-color: transparent; }
+}
+
+@keyframes row-flash-red {
+  0% { background-color: rgba(255, 61, 0, 0.2); }
+  100% { background-color: transparent; }
+}
+
+@keyframes pulse-green {
+  0% { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0.5); }
+  70% { box-shadow: 0 0 0 5px rgba(0, 230, 118, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0); }
+}
+
+@keyframes pulse-blue {
+  0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.5); }
+  70% { box-shadow: 0 0 0 5px rgba(59, 130, 246, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+}
+
+@keyframes pulse-orange {
+  0% { box-shadow: 0 0 0 0 rgba(255, 171, 0, 0.5); }
+  70% { box-shadow: 0 0 0 5px rgba(255, 171, 0, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 171, 0, 0); }
+}
+
+@keyframes toast-slide-in {
+  from { transform: translateY(100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.flash-up {
+  animation: txt-flash-green 1s ease-out;
+}
+
+.flash-down {
+  animation: txt-flash-red 1s ease-out;
+}
+
+.flash-row-green {
+  animation: row-flash-green 1.2s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+}
+
+.flash-row-red {
+  animation: row-flash-red 1.2s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
 }
