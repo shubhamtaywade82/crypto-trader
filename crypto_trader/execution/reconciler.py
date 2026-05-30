@@ -37,6 +37,7 @@ class Reconciler:
         bus: Optional[EventBus] = None,
         qty_tolerance: Decimal = _QTY_TOLERANCE,
         strict_cancel: bool = False,
+        adopt_venue: bool = False,
     ):
         self.wallet = wallet
         self.engine = execution_engine
@@ -46,6 +47,9 @@ class Reconciler:
         self.qty_tolerance = qty_tolerance
         # G5: on unresolved desync, cancel ALL venue orders to protect capital.
         self.strict_cancel = strict_cancel
+        # Recovery: adopt a venue position the internal wallet lacks instead of
+        # halting (synthesize internal state + place a stop). Default OFF.
+        self.adopt_venue = adopt_venue
         # True after a reconcile where the venue snapshot could not be fetched.
         self.snapshot_failed = False
 
@@ -126,13 +130,48 @@ class Reconciler:
     def _find_missing_positions(self, internal: dict, venue: dict) -> List[ReconciliationMismatchEvent]:
         out: List[ReconciliationMismatchEvent] = []
         for sym, vpos in venue.items():
-            if sym not in internal and Decimal(str(vpos["quantity"])) > 0:
+            if sym in internal or Decimal(str(vpos["quantity"])) <= 0:
+                continue
+            # Recovery path: adopt the venue position into the wallet (synthesize
+            # internal state + place a protective stop) so it's managed rather
+            # than halting. repaired=True keeps the kill switch from tripping.
+            if self.adopt_venue:
+                adopted = self._adopt(sym, vpos)
+                out.append(ReconciliationMismatchEvent(
+                    symbol=sym, kind="missing_position",
+                    internal="0", exchange=str(vpos["quantity"]),
+                    repaired=bool(adopted),
+                    detail="venue position adopted into wallet" if adopted
+                           else "venue position adoption failed",
+                ))
+            else:
                 out.append(ReconciliationMismatchEvent(
                     symbol=sym, kind="missing_position",
                     internal="0", exchange=str(vpos["quantity"]),
                     detail="venue position missing internally",
                 ))
         return out
+
+    def _adopt(self, sym: str, vpos: dict) -> bool:
+        """Adopt a single venue position into the wallet. Returns success."""
+        if not hasattr(self.wallet, "adopt_venue_position"):
+            logger.error("[RECON] wallet has no adopt_venue_position; cannot adopt %s", sym)
+            return False
+        try:
+            from ..wallet import PositionSide
+            raw_side = str(vpos.get("side", "LONG")).upper()
+            side = PositionSide.LONG if raw_side in ("LONG", "BUY") else PositionSide.SHORT
+            pos = self.wallet.adopt_venue_position(
+                symbol=sym,
+                side=side,
+                quantity=float(vpos["quantity"]),
+                entry_price=float(vpos.get("entry_price") or vpos.get("avg_price") or 0),
+                leverage=int(vpos["leverage"]) if vpos.get("leverage") else None,
+            )
+            return pos is not None
+        except Exception as e:
+            logger.error("[RECON] adoption of %s failed: %s", sym, e)
+            return False
 
     # ── protective-order reconciliation (F1) ──────────────────────────────────
     def _reconcile_protective_orders(self, snap: AccountSnapshot, venue: dict) -> List[ReconciliationMismatchEvent]:

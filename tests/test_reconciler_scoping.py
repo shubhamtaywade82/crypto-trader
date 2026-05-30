@@ -16,15 +16,16 @@ from crypto_trader.execution.reconciler import Reconciler
 from crypto_trader.execution.account_sync import AccountSnapshot
 
 
-def _reconciler(internal_open: dict):
+def _reconciler(internal_open: dict, wallet=None, adopt_venue=False):
     """Build a Reconciler with _internal_positions stubbed to internal_open."""
     r = Reconciler.__new__(Reconciler)
-    r.wallet = SimpleNamespace(positions={})
+    r.wallet = wallet if wallet is not None else SimpleNamespace(positions={})
     r.account_sync = SimpleNamespace(engine=SimpleNamespace())
     r.risk = None
     r.bus = None
     r.qty_tolerance = Decimal("0.05")
     r.strict_cancel = False
+    r.adopt_venue = adopt_venue
     r._internal_positions = lambda: internal_open
     return r
 
@@ -70,3 +71,49 @@ def test_none_symbol_compares_whole_account():
     snap = _snap({"SOLUSDT": {"symbol": "SOLUSDT", "quantity": 3.02, "side": "LONG"}})
     mismatches = r._compare(snap, symbol=None)
     assert any(m.kind == "missing_position" for m in mismatches)
+
+
+# ── adoption (RECONCILE_ADOPT_VENUE) ─────────────────────────────────────────
+
+def test_missing_position_halts_when_adopt_disabled():
+    """Default: missing_position is unrepaired → would trip the kill switch."""
+    r = _reconciler(internal_open={}, adopt_venue=False)
+    snap = _snap({"SOLUSDT": {"symbol": "SOLUSDT", "quantity": 3.02,
+                              "side": "LONG", "entry_price": 82.2}})
+    out = r._compare(snap, symbol="SOLUSDT")
+    mp = [m for m in out if m.kind == "missing_position"]
+    assert mp and mp[0].repaired is False
+
+
+def test_missing_position_adopted_when_flag_on():
+    """adopt_venue=True: the venue position is adopted and the mismatch is
+    marked repaired (no kill switch)."""
+    adopted = {}
+
+    def fake_adopt(symbol, side, quantity, entry_price, leverage=None):
+        adopted.update(symbol=symbol, side=side, quantity=quantity,
+                       entry_price=entry_price)
+        return object()  # non-None = success
+
+    wallet = SimpleNamespace(positions={}, adopt_venue_position=fake_adopt)
+    r = _reconciler(internal_open={}, wallet=wallet, adopt_venue=True)
+    snap = _snap({"SOLUSDT": {"symbol": "SOLUSDT", "quantity": 3.02,
+                              "side": "LONG", "entry_price": 82.2}})
+    out = r._compare(snap, symbol="SOLUSDT")
+    mp = [m for m in out if m.kind == "missing_position"]
+    assert mp and mp[0].repaired is True
+    assert adopted["symbol"] == "SOLUSDT"
+    assert adopted["quantity"] == 3.02
+    assert adopted["entry_price"] == 82.2
+
+
+def test_adoption_failure_stays_unrepaired():
+    """If the wallet's adoption returns None, the mismatch stays unrepaired
+    (still halts) — adoption must not silently swallow a real desync."""
+    wallet = SimpleNamespace(positions={}, adopt_venue_position=lambda **k: None)
+    r = _reconciler(internal_open={}, wallet=wallet, adopt_venue=True)
+    snap = _snap({"SOLUSDT": {"symbol": "SOLUSDT", "quantity": 3.02,
+                              "side": "LONG", "entry_price": 82.2}})
+    out = r._compare(snap, symbol="SOLUSDT")
+    mp = [m for m in out if m.kind == "missing_position"]
+    assert mp and mp[0].repaired is False

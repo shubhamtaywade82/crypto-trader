@@ -950,6 +950,93 @@ class EnhancedFuturesWallet:
             self._save_state()
             return pos
 
+    def adopt_venue_position(
+        self,
+        symbol: str,
+        side: "PositionSide",
+        quantity: float,
+        entry_price: float,
+        *,
+        leverage: Optional[int] = None,
+        sl_pct: float = 0.02,
+        mark_price: Optional[float] = None,
+    ) -> Optional["EnhancedPosition"]:
+        """Adopt a live venue position the internal wallet doesn't know about.
+
+        Synthesizes an internal OPEN position from the venue's qty/side/entry,
+        emits a POSITION_ADOPTED event (so it persists + projects), and rests a
+        protective stop. Used by reconciliation recovery when the venue is the
+        source of truth (e.g. a position opened in a prior run / different store).
+
+        Returns the adopted position, or None if one already exists for *symbol*.
+        """
+        with self.lock:
+            if self.get_open_position(symbol) is not None:
+                logger.warning("[ADOPT] %s already has an internal position; skipping", symbol)
+                return None
+
+            qty = self._to_decimal(quantity)
+            entry = self._to_decimal(entry_price)
+            if qty <= Decimal("0") or entry <= Decimal("0"):
+                logger.error("[ADOPT] %s invalid qty/entry (%s/%s); refusing", symbol, qty, entry)
+                return None
+
+            lev = int(leverage or self.leverage)
+            notional = qty * entry
+            margin = notional / lev
+            # Protective stop on the adverse side of entry.
+            if side == PositionSide.LONG:
+                sl_price = entry * (Decimal("1") - self._to_decimal(sl_pct))
+            else:
+                sl_price = entry * (Decimal("1") + self._to_decimal(sl_pct))
+
+            pos = EnhancedPosition(
+                symbol=symbol,
+                side=side,
+                playbook=Playbook.INTRADAY,
+                entry_price=entry,
+                original_quantity=qty,
+                remaining_quantity=qty,
+                notional=notional,
+                margin_used=margin,
+                leverage=lev,
+                open_time=self._now_ms(),
+                sl_price=sl_price,
+                tp_levels=[],
+            )
+            if mark_price is not None and self._to_decimal(mark_price) > Decimal("0"):
+                pos.update_pnl(self._to_decimal(mark_price))
+            self.positions[symbol] = pos
+            self._sync_unrealized_total()
+
+            logger.critical(
+                "[ADOPT] %s %s qty=%.6f @ %.6f lev=%dx SL=%.6f — adopted from venue",
+                symbol, side.value, float(qty), float(entry), lev, float(sl_price),
+            )
+            self._emit_event(
+                "POSITION_ADOPTED",
+                {
+                    "symbol": symbol,
+                    "side": side.value,
+                    "entry_price": entry,
+                    "quantity": qty,
+                    "margin": margin,
+                    "execution_price": entry,
+                    "fee": Decimal("0"),  # adoption books no entry fee (already paid on venue)
+                    "playbook": Playbook.INTRADAY.value,
+                    "sl_price": sl_price,
+                    "leverage": lev,
+                    "open_time": pos.open_time,
+                    "tp_levels": [],
+                    "adopted": True,
+                },
+            )
+            # Rest a protective SL on the venue (live only) so the adopted
+            # position is never left naked.
+            self._place_protective_orders(pos)
+            self._save_state()
+            return pos
+
     def partial_close(self, symbol: str, mark_price: float, pct: float, reason: str, tp_label: Optional[str] = None, external_fill: Optional[dict] = None) -> Decimal:
         """Close a percentage of the position. Returns realized PnL from this slice.
 

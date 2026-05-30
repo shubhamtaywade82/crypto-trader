@@ -203,7 +203,8 @@ class LiveTradingSystem:
         try:
             from .execution.reconciler import Reconciler
             self.reconciler = Reconciler(self.wallet, self.execution_engine, self.risk,
-                                         bus=self.bus, strict_cancel=self.cfg.reconcile_strict_cancel)
+                                         bus=self.bus, strict_cancel=self.cfg.reconcile_strict_cancel,
+                                         adopt_venue=getattr(self.cfg, "reconcile_adopt_venue", False))
             mismatches = self.reconciler.reconcile(self.cfg.symbol)
             unresolved = [m for m in mismatches if not m.repaired]
             # Block startup if truth is unverifiable (transient) OR there is a
@@ -518,7 +519,8 @@ def run_venue_preflight(
         try:
             from .execution.reconciler import Reconciler
             reconciler = Reconciler(wallet, execution_engine, risk, bus=bus,
-                                    strict_cancel=getattr(cfg, "reconcile_strict_cancel", False))
+                                    strict_cancel=getattr(cfg, "reconcile_strict_cancel", False),
+                                    adopt_venue=getattr(cfg, "reconcile_adopt_venue", False))
             mismatches = reconciler.reconcile(sym)
             unresolved = [m for m in mismatches if not m.repaired]
             if reconciler.snapshot_failed:

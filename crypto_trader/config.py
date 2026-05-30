@@ -271,6 +271,10 @@ class TradingConfig:
     max_daily_trades: int = 2
     # G5: on an unresolved venue desync, cancel ALL venue orders to protect capital.
     reconcile_strict_cancel: bool = False
+    # Recovery: when the venue holds a position the internal wallet lacks
+    # (missing_position), ADOPT it (synthesize internal state + place a stop)
+    # instead of halting. Default OFF — opt in deliberately for a known recovery.
+    reconcile_adopt_venue: bool = False
 
     # ── Market Regime / Session Engine ──
     # Restrict new entries to institutional kill zones only (London Open, NY Open, etc.).
@@ -422,6 +426,7 @@ class TradingConfig:
             max_margin_ratio=_get_float("MAX_MARGIN_RATIO", 0.80),
             thread_supervisor_enabled=_get_bool("THREAD_SUPERVISOR_ENABLED", True),
             reconcile_strict_cancel=_get_bool("RECONCILE_STRICT_CANCEL", False),
+            reconcile_adopt_venue=_get_bool("RECONCILE_ADOPT_VENUE", False),
             require_kill_zone=_get_bool("REQUIRE_KILL_ZONE", profile.require_kill_zone),
             rvol_dead_threshold=_get_float("RVOL_DEAD_THRESHOLD", 0.6),
             rvol_weak_threshold=_get_float("RVOL_WEAK_THRESHOLD", 0.9),
