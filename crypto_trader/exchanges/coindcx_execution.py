@@ -396,7 +396,7 @@ class CoinDCXExecutionEngine:
                 if r_pair == pair:
                     # Sync margin_type to engine if present
                     if raw.get("margin_type"):
-                        self.margin_type = str(raw["margin_type"]).upper()
+                        self.margin_type = str(raw["margin_type"]).lower()
                     if raw.get("leverage") is not None:
                         return int(float(raw["leverage"]))
         except Exception as e:
@@ -459,8 +459,8 @@ class CoinDCXExecutionEngine:
             avg_fill_price=Decimal(str(data.get("avg_price", data.get("price", "0")) or "0")),
         )
 
-    def _resolve_market_fill(self, order: Order, symbol: str, *, attempts: int = 5,
-                             delay_s: float = 0.4) -> Order:
+    def _resolve_market_fill(self, order: Order, symbol: str, *, attempts: int = 20,
+                             delay_s: float = 0.8) -> Order:
         """Resolve a market order's real avg fill price + filled qty.
 
         The create response rarely carries the settled price, so poll recent

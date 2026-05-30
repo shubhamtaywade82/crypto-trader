@@ -148,6 +148,28 @@ class Reconciler:
                 iq = Decimal(str(ipos["quantity"]))
                 vq = Decimal(str(venue[sym]["quantity"]))
                 if iq > 0 and abs(iq - vq) / iq > self.qty_tolerance:
+                    if self.adopt_venue:
+                        pos = self.wallet.positions.get(sym)
+                        if pos:
+                            pos.remaining_quantity = vq
+                            pos.original_quantity = vq
+                            if hasattr(self.wallet, "_runtime_reducer_state"):
+                                rstate = self.wallet._runtime_reducer_state
+                                if hasattr(rstate, "open_positions") and sym in rstate.open_positions:
+                                    rstate.open_positions[sym]["quantity"] = vq
+                                    entry = rstate.open_positions[sym].get("entry_price", pos.entry_price)
+                                    lev = rstate.open_positions[sym].get("leverage", pos.leverage)
+                                    rstate.open_positions[sym]["margin"] = (vq * entry) / lev
+                            if hasattr(self.wallet, "_save_state"):
+                                self.wallet._save_state()
+                            logger.info("[RECON] Auto-aligned quantity drift for %s: local %s -> venue %s", sym, iq, vq)
+                            out.append(ReconciliationMismatchEvent(
+                                symbol=sym, kind="position_qty",
+                                internal=str(iq), exchange=str(vq),
+                                repaired=True,
+                                detail="quantity drift auto-aligned to venue",
+                            ))
+                            continue
                     out.append(ReconciliationMismatchEvent(
                         symbol=sym, kind="position_qty",
                         internal=str(iq), exchange=str(vq),

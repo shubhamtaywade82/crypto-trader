@@ -105,10 +105,27 @@ class ExchangeStateReconciler:
                     self.risk_manager.trigger_kill_switch(msg)
                     return False
                 else:
-                    msg = f"Position size desync: exchange={ex_qty} local={local_qty} {symbol}. Halting for safety."
-                    logger.critical(f"[RECONCILIATION] {msg}")
-                    self.risk_manager.trigger_kill_switch(msg)
-                    return False
+                    if getattr(self.wallet, "live_execution", False):
+                        logger.info(
+                            "[RECONCILIATION] Auto-aligned position size desync for %s: local %s -> venue %s",
+                            symbol, local_qty, ex_qty
+                        )
+                        local_pos.remaining_quantity = ex_qty
+                        local_pos.original_quantity = ex_qty
+                        if hasattr(self.wallet, "_runtime_reducer_state"):
+                            rstate = self.wallet._runtime_reducer_state
+                            if hasattr(rstate, "open_positions") and symbol in rstate.open_positions:
+                                rstate.open_positions[symbol]["quantity"] = ex_qty
+                                entry = rstate.open_positions[symbol].get("entry_price", local_pos.entry_price)
+                                lev = rstate.open_positions[symbol].get("leverage", local_pos.leverage)
+                                rstate.open_positions[symbol]["margin"] = (ex_qty * entry) / lev
+                        if hasattr(self.wallet, "_save_state"):
+                            self.wallet._save_state()
+                    else:
+                        msg = f"Position size desync: exchange={ex_qty} local={local_qty} {symbol}. Halting for safety."
+                        logger.critical(f"[RECONCILIATION] {msg}")
+                        self.risk_manager.trigger_kill_switch(msg)
+                        return False
                     
             # 4. Orphaned Order Cleanup
             # If we are flat, we shouldn't have any stop/TP orders dangling on the exchange.

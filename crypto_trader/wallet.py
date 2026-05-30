@@ -367,6 +367,10 @@ class EnhancedPosition:
 
 
     @property
+    def quantity(self) -> Decimal:
+        return self.remaining_quantity
+
+    @property
     def total_realized_pnl(self) -> float:
         return self.partial_realized_pnl + (self.unrealized_pnl if self.status == "CLOSED" else 0)
 
@@ -592,7 +596,7 @@ class EnhancedFuturesWallet:
 
     def sync_leverage_from_venue(self, symbol: str):
         """Syncs the wallet's leverage settings for the symbol from the execution engine."""
-        if not (self.live_execution and self.execution_engine):
+        if not (self.live_execution and self.execution_engine) or symbol == "GLOBAL":
             return
         
         # Try to get leverage from the execution engine
