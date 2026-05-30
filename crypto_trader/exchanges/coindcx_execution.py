@@ -41,6 +41,7 @@ EP_EDIT_ORDER = "exchange/v1/derivatives/futures/orders/edit"
 EP_LIST_ORDERS = "exchange/v1/derivatives/futures/orders"
 EP_POSITIONS = "exchange/v1/derivatives/futures/positions"
 EP_POSITION_EXIT = "exchange/v1/derivatives/futures/positions/exit"
+EP_CREATE_TPSL = "exchange/v1/derivatives/futures/positions/create_tpsl"
 EP_UPDATE_LEVERAGE = "exchange/v1/derivatives/futures/positions/update_leverage"
 EP_WALLETS = "exchange/v1/derivatives/futures/wallets"                      # GET signed
 EP_CROSS_MARGIN = "exchange/v1/derivatives/futures/positions/cross_margin_details"  # GET signed
@@ -197,6 +198,45 @@ class CoinDCXExecutionEngine:
         except CoinDCXError as e:
             logger.warning("Exit failed for position %s: %s", position_id, e)
             return False
+
+    def create_position_tpsl(
+        self,
+        position_id: str,
+        *,
+        stop_loss_price: Optional[Decimal] = None,
+        take_profit_price: Optional[Decimal] = None,
+    ) -> dict:
+        """Attach a full-position stop-loss / take-profit to an existing position
+        via CoinDCX's positions/create_tpsl endpoint.
+
+        This is the CORRECT way to rest a protective stop on CoinDCX futures: it
+        is attached to the position (stage ``tpsl_exit``) and consumes NO new
+        margin — unlike placing a separate opposite-side order, which the venue
+        treats as a fresh margin-locking order (→ "insufficient funds" when the
+        wallet's free balance is 0 because it's all locked as position margin).
+
+        Only ``stop_market`` / ``take_profit_market`` are supported by the venue.
+        Returns the raw response dict (may contain per-leg ``success``/``error``).
+        """
+        safe_mode.assert_live_allowed(
+            "TPSL", venue=self.VENUE, constructor_ack=self._ack, symbol=position_id
+        )
+        body: Dict[str, object] = {"id": position_id}
+        if stop_loss_price is not None:
+            body["stop_loss"] = {
+                "stop_price": str(stop_loss_price),
+                "order_type": "stop_market",
+            }
+        if take_profit_price is not None:
+            body["take_profit"] = {
+                "stop_price": str(take_profit_price),
+                "order_type": "take_profit_market",
+            }
+        if "stop_loss" not in body and "take_profit" not in body:
+            raise ValueError("create_position_tpsl requires at least one of SL/TP")
+        # retry_safe=False: a duplicate create on timeout could double-apply; the
+        # endpoint is idempotent-ish (updates existing TP/SL) but don't gamble.
+        return self.client.post_signed(EP_CREATE_TPSL, body, retry_safe=False)
 
     def sync_positions(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}

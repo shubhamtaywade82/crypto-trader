@@ -70,3 +70,74 @@ def test_protective_tp_also_uses_position_leverage():
     tp_call = next(c for c in w.execution_engine.calls
                    if c["order_type"] == OrderType.TAKE_PROFIT)
     assert tp_call["leverage"] == 10
+
+
+# ── position-attached TP/SL (create_tpsl) — preferred CoinDCX path ───────────
+
+class _TpslEngine:
+    """Engine exposing create_position_tpsl (real CoinDCX path). No separate
+    margin-locking orders — attaches SL/TP to the position by id."""
+    def __init__(self, position_id="pos-1"):
+        self.leverage = 2
+        self._pid = position_id
+        self.tpsl_calls = []
+        self.place_order_calls = []
+
+    def get_positions(self):
+        return [{"symbol": "SOLUSDT", "position_id": self._pid,
+                 "quantity": 3.02, "side": "LONG", "leverage": 10}]
+
+    def create_position_tpsl(self, position_id, *, stop_loss_price=None, take_profit_price=None):
+        self.tpsl_calls.append({
+            "position_id": position_id,
+            "sl": stop_loss_price, "tp": take_profit_price,
+        })
+        return {"stop_loss": {"id": "sl-1", "status": "untriggered"}}
+
+    def place_order(self, *a, **k):
+        self.place_order_calls.append((a, k))
+        return SimpleNamespace(id="should-not-be-used")
+
+
+def _wallet_tpsl(engine):
+    w = EnhancedFuturesWallet(symbol="SOLUSDT", state_namespace="test_tpsl")
+    w.execution_engine = engine
+    w.live_execution = True
+    w.venue_sl_enabled = True
+    w.venue_tp_enabled = False
+    w.require_venue_sl = False
+    return w
+
+
+def test_uses_create_tpsl_when_available_not_separate_order():
+    eng = _TpslEngine()
+    w = _wallet_tpsl(eng)
+    placed = w._place_protective_orders(_pos(leverage=10))
+    # create_tpsl used; NO separate margin-locking order placed
+    assert len(eng.tpsl_calls) == 1
+    assert eng.place_order_calls == []
+    assert placed.get("sl") == "sl-1"
+    call = eng.tpsl_calls[0]
+    assert call["position_id"] == "pos-1"
+    assert call["sl"] == Decimal("80.5")
+
+
+def test_create_tpsl_halts_when_position_id_missing_and_required():
+    eng = _TpslEngine()
+    eng.get_positions = lambda: []  # no venue position id resolvable
+    w = _wallet_tpsl(eng)
+    w.require_venue_sl = True
+    import crypto_trader.safe_mode as sm
+    sm.clear_halt()
+    with pytest.raises(RuntimeError):
+        w._place_protective_orders(_pos(leverage=10))
+    sm.clear_halt()
+
+
+def test_create_tpsl_missing_id_non_required_returns_empty():
+    eng = _TpslEngine()
+    eng.get_positions = lambda: []
+    w = _wallet_tpsl(eng)
+    w.require_venue_sl = False
+    placed = w._place_protective_orders(_pos(leverage=10))
+    assert placed == {}  # software SL backup covers it; no halt

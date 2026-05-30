@@ -744,6 +744,17 @@ class EnhancedFuturesWallet:
         """
         if not (self.live_execution and self.execution_engine is not None and self.venue_sl_enabled):
             return {}
+
+        # Preferred path: attach the stop (and TP) to the POSITION via CoinDCX's
+        # create_tpsl endpoint. A position-attached full-position TP/SL consumes
+        # NO new margin, unlike a separate opposite-side order which the venue
+        # treats as a fresh margin-locking order → "insufficient funds" when the
+        # wallet's free balance is fully locked as position margin.
+        if hasattr(self.execution_engine, "create_position_tpsl"):
+            return self._place_position_tpsl(pos)
+
+        # Legacy fallback: separate opposite-side reduce-only orders (paper /
+        # engines without the position-attached TP/SL endpoint).
         exit_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
         placed: dict = {}
         try:
@@ -777,6 +788,65 @@ class EnhancedFuturesWallet:
                     placed["tp"] = tp_order.id
             except Exception as e:
                 logger.warning("[PROTECTIVE TP] venue TP placement failed for %s: %s", pos.symbol, e)
+        if placed:
+            pos.protective_orders.update(placed)
+            self._emit_event("PROTECTIVE_ORDERS_PLACED", {"symbol": pos.symbol, **placed})
+        return placed
+
+    def _venue_position_id(self, symbol: str) -> Optional[str]:
+        """Look up the venue's position id for *symbol* (needed for create_tpsl)."""
+        try:
+            for p in self.execution_engine.get_positions():
+                if p.get("symbol") == symbol and p.get("position_id"):
+                    return str(p["position_id"])
+        except Exception as e:
+            logger.warning("[PROTECTIVE SL] could not fetch venue position id for %s: %s", symbol, e)
+        return None
+
+    def _place_position_tpsl(self, pos: EnhancedPosition) -> dict:
+        """Attach a full-position SL (and optional TP) via create_tpsl."""
+        placed: dict = {}
+        pid = self._venue_position_id(pos.symbol)
+        if pid is None:
+            msg = "venue position id not found (cannot attach SL via create_tpsl)"
+            logger.critical("[PROTECTIVE SL] %s for %s", msg, pos.symbol)
+            if self.require_venue_sl:
+                from . import safe_mode
+                safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {msg}")
+                try:
+                    self.close_position(pos.symbol, float(pos.entry_price), reason="REQUIRED_SL_FAILED")
+                except Exception as close_err:
+                    logger.error("[PROTECTIVE SL] emergency close failed for %s: %s", pos.symbol, close_err)
+                raise RuntimeError(f"Required venue Stop Loss placement failed: {msg}")
+            return {}
+
+        tp_price = None
+        if self.venue_tp_enabled and pos.tp_levels:
+            tp_price = self._to_decimal(pos.tp_levels[-1]["price"])
+        try:
+            resp = self.execution_engine.create_position_tpsl(
+                pid, stop_loss_price=self._to_decimal(pos.sl_price), take_profit_price=tp_price,
+            )
+            # The endpoint returns per-leg dicts; a leg may carry success/error.
+            sl_leg = resp.get("stop_loss") if isinstance(resp, dict) else None
+            tp_leg = resp.get("take_profit") if isinstance(resp, dict) else None
+            sl_ok = not (isinstance(sl_leg, dict) and sl_leg.get("success") is False)
+            if not sl_ok:
+                raise RuntimeError(f"SL leg rejected: {sl_leg.get('error')}")
+            placed["sl"] = (sl_leg.get("id") if isinstance(sl_leg, dict) else None) or f"tpsl:{pid}"
+            if tp_price is not None and isinstance(tp_leg, dict) and tp_leg.get("success") is not False:
+                placed["tp"] = tp_leg.get("id") or f"tpsl:{pid}"
+        except Exception as e:
+            logger.critical("[PROTECTIVE SL] create_tpsl failed for %s: %s", pos.symbol, e)
+            if self.require_venue_sl:
+                from . import safe_mode
+                safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
+                try:
+                    self.close_position(pos.symbol, float(pos.entry_price), reason="REQUIRED_SL_FAILED")
+                except Exception as close_err:
+                    logger.error("[PROTECTIVE SL] emergency close failed for %s: %s", pos.symbol, close_err)
+                raise RuntimeError(f"Required venue Stop Loss placement failed: {e}") from e
+            return placed
         if placed:
             pos.protective_orders.update(placed)
             self._emit_event("PROTECTIVE_ORDERS_PLACED", {"symbol": pos.symbol, **placed})
