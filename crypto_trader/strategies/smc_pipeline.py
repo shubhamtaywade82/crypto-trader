@@ -358,6 +358,17 @@ class PlaybookSMC:
         tp = self._take_profit(struct, is_long, entry_px, sl)
         size_mult = self._size_multiplier(confidence)
 
+        # Retrace zone (for a limit-entry execution path): the in-direction
+        # unmitigated FVG is the primary entry zone, OB the fallback. ``limit_entry``
+        # is the 50% FVG fill the guide enters at. Exposed for the backtest's
+        # retrace mode and any future live limit-order wiring (market path ignores).
+        in_fvgs = [g for g in struct.get("unmitigated_fvgs", []) if g.get("type") == want_type]
+        in_obs = [o for o in struct.get("unmitigated_order_blocks", []) if o.get("type") == want_type]
+        fvg_zone = (float(in_fvgs[-1]["bottom"]), float(in_fvgs[-1]["top"])) if in_fvgs else None
+        ob_zone = (float(in_obs[-1]["low"]), float(in_obs[-1]["high"])) if in_obs else None
+        zone = fvg_zone or ob_zone
+        limit_entry = 0.5 * (zone[0] + zone[1]) if zone else None
+
         setup: Dict = {
             "side": side,
             "entry_price": entry_px,
@@ -368,6 +379,12 @@ class PlaybookSMC:
             "size_multiplier": size_mult,
             "factors": {k: round(v, 3) for k, v in f.items()},
             "time_stop_hours": self.max_hold_hours,
+            # retrace-entry context (ignored by the live market-entry path)
+            "fvg_zone": fvg_zone,
+            "ob_zone": ob_zone,
+            "limit_entry": limit_entry,
+            "sweep_price": swept,
+            "atr": atr,
             "name": self.name,
             "strategy": "smc",
             "playbook": Playbook.INTRADAY,

@@ -95,6 +95,10 @@ def main(argv=None) -> int:
     p.add_argument("--taker-fee", type=float, default=0.00059)
     p.add_argument("--leverage", type=int, default=1)
     p.add_argument("--max-hold-bars", type=int, default=0)
+    p.add_argument("--entry-mode", default="signal", choices=["signal", "retrace"],
+                   help="signal = market at displacement close; retrace = limit at 50%% FVG fill")
+    p.add_argument("--retrace-timeout", type=int, default=8,
+                   help="bars to wait for a limit fill in retrace mode")
     p.add_argument("--split", type=float, default=0.0,
                    help="train fraction for an out-of-sample test fold (e.g. 0.7)")
     a = p.parse_args(argv)
@@ -103,6 +107,8 @@ def main(argv=None) -> int:
     df_pri = fetch_klines(a.symbol, a.timeframe, a.bars)
     print(f"Got {len(df_pri)} primary candles: {df_pri['open_time'].iloc[0]} → {df_pri['open_time'].iloc[-1]}")
 
+    print(f"entry_mode={a.entry_mode} min_score={a.min_score} tp_rr={a.tp_rr} "
+          f"sl_atr_mult={a.sl_atr_mult} leverage={a.leverage}x taker_fee={a.taker_fee}")
     htf_bars = max(int(a.bars * _TF_MS.get(a.timeframe, 900_000) / _TF_MS.get(a.htf_timeframe, 14_400_000)), 500)
     print(f"Fetching {htf_bars} {a.htf_timeframe} HTF candles…")
     df_htf = fetch_klines(a.symbol, a.htf_timeframe, htf_bars)
@@ -116,6 +122,7 @@ def main(argv=None) -> int:
         atr_period=a.atr_period, sl_atr_mult=a.sl_atr_mult, tp_rr=a.tp_rr,
         max_hold_hours=a.max_hold_hours, taker_fee=a.taker_fee,
         leverage=a.leverage, max_hold_bars=a.max_hold_bars,
+        entry_mode=a.entry_mode, retrace_timeout=a.retrace_timeout,
     )
 
     if a.split and 0 < a.split < 1:

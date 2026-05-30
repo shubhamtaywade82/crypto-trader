@@ -97,9 +97,21 @@ def run_backtest_smc(
     taker_fee: float = 0.00059,
     leverage: int = 1,
     max_hold_bars: int = 0,
+    entry_mode: str = "signal",     # "signal" = market at signal close; "retrace" = limit at FVG/OB
+    retrace_timeout: int = 8,       # bars to wait for a limit fill (retrace mode)
 ) -> BacktestResult:
     """Replay the SMC pipeline over OHLCV ``df_primary`` (ascending) with HTF
-    bias from ``df_htf``. Returns a BacktestResult of TradeOutcomeRecords."""
+    bias from ``df_htf``. Returns a BacktestResult of TradeOutcomeRecords.
+
+    entry_mode:
+      * "signal"  — enter at the signal candle's CLOSE (top of displacement).
+      * "retrace" — place a LIMIT at the 50% FVG fill (guide Phase 3); enter only
+                    if price retraces into it within ``retrace_timeout`` bars, with
+                    the stop anchored just beyond the sweep wick (structural
+                    invalidation) and a fixed ``tp_rr``-R target. Models the entry
+                    timing the guide actually prescribes — and which the live
+                    market-execution path can't currently do.
+    """
 
     pb = PlaybookSMC(
         entry_timeframe=timeframe, htf_timeframe=htf_timeframe,
@@ -159,15 +171,53 @@ def run_backtest_smc(
         res.signals += 1
 
         side = setup["side"]
-        entry_px = float(setup["entry_price"])
-        sl_px = float(setup["sl_price"])
-        tp_px = float(setup.get("tp_price", 0)) or None
-        entry_idx = i
+        is_long = side == PositionSide.LONG
+
+        # ── Resolve entry (idx, price, SL, TP) per entry_mode ───────────────────
+        if entry_mode == "retrace":
+            limit = setup.get("limit_entry")
+            if limit is None:
+                i += 1
+                continue  # no FVG/OB zone to rest a limit on
+            swept = float(setup["sweep_price"])
+            atr_v = float(setup["atr"])
+            limit = float(limit)
+            if is_long:
+                sl_px = swept - sl_buffer_atr * atr_v
+                if sl_px >= limit:
+                    sl_px = limit - 0.5 * atr_v
+            else:
+                sl_px = swept + sl_buffer_atr * atr_v
+                if sl_px <= limit:
+                    sl_px = limit + 0.5 * atr_v
+            risk = abs(limit - sl_px)
+            tp_px = (limit + tp_rr * risk) if is_long else (limit - tp_rr * risk)
+
+            # Wait for a tap into the limit within the timeout window.
+            fill_idx = None
+            jj = i + 1
+            stop = min(n, i + 1 + retrace_timeout)
+            while jj < stop:
+                if is_long and lows[jj] <= limit:
+                    fill_idx = jj; break
+                if (not is_long) and highs[jj] >= limit:
+                    fill_idx = jj; break
+                jj += 1
+            if fill_idx is None:
+                i += 1
+                continue  # limit never filled → cancel, look for the next setup
+            entry_idx = fill_idx
+            entry_px = limit
+        else:
+            entry_idx = i
+            entry_px = float(setup["entry_price"])
+            sl_px = float(setup["sl_price"])
+            tp_px = float(setup.get("tp_price", 0)) or None
 
         exit_idx = exit_px = exit_reason = None
         liquidated = False
 
-        j = i + 1
+        j = entry_idx + 1
         while j < n:
             hi, lo, cl = highs[j], lows[j], closes[j]
 
