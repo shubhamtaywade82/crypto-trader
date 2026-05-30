@@ -273,10 +273,11 @@ class _TierClient:
         }}
 
 
-def test_spec_max_leverage_from_dynamic_tiers_not_legacy_field():
+def test_spec_max_leverage_from_dynamic_tiers_clamped_to_system_cap():
     spec = InstrumentMapper(_TierClient()).get_spec("SOLUSDT")
-    # top tier is 100x — NOT the 5x max_leverage_long 'ignore this' field
-    assert spec.max_leverage == 100
+    # tier table allows up to 100x, clamped to system cap 20x — and crucially
+    # NOT the bogus 5x max_leverage_long 'ignore this' field.
+    assert spec.max_leverage == 20
     assert spec.max_leverage != 5
 
 
@@ -289,4 +290,16 @@ def test_spec_falls_back_to_legacy_when_no_tier_table():
                 "maker_fee": 0.0236, "taker_fee": 0.059, "status": "active",
             }}
     spec = InstrumentMapper(_NoTier()).get_spec("BTCUSDT")
-    assert spec.max_leverage == 7  # fell back to max_leverage_long
+    assert spec.max_leverage == 7  # fell back to max_leverage_long (< system cap)
+
+
+def test_spec_legacy_above_cap_is_clamped():
+    class _BigLegacy:
+        def get_public(self, endpoint, params=None):
+            return {"instrument": {
+                "pair": params["pair"], "price_increment": 0.01, "quantity_increment": 0.01,
+                "min_quantity": 0.01, "min_notional": 6.0, "max_leverage_long": 50.0,
+                "maker_fee": 0.0236, "taker_fee": 0.059, "status": "active",
+            }}
+    spec = InstrumentMapper(_BigLegacy()).get_spec("BTCUSDT")
+    assert spec.max_leverage == 20  # clamped to system cap

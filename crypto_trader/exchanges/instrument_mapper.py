@@ -29,6 +29,12 @@ logger = logging.getLogger("crypto_trader.exchanges.instrument_mapper")
 
 _INSTRUMENT_ENDPOINT = "exchange/v1/derivatives/futures/data/instrument"
 
+# System-wide sane leverage ceiling. The venue's dynamic tier table can list up
+# to 100x for tiny positions, but we never operate above this — keep in sync with
+# risk.LeverageEngine.hard_max_leverage. Per-symbol specs are clamped to it so a
+# venue's top tier never becomes the bot's default/operating leverage.
+_MAX_USABLE_LEVERAGE = 20
+
 
 def internal_to_coindcx(symbol: str) -> str:
     """``SOLUSDT`` -> ``B-SOL_USDT``. Idempotent for already-CoinDCX symbols."""
@@ -101,11 +107,12 @@ class InstrumentMapper:
             raise ValueError(f"No instrument data for {pair}: {raw}")
         # CoinDCX docs: max_leverage_long/short are "Ignore this". The real
         # leverage cap is dynamic_position_leverage_details — a {leverage: max
-        # notional} tier table. The usable max is the highest tier whose notional
-        # ceiling is non-trivial; venue enforces the per-position-size gating at
-        # order time, so we take the top tier as the instrument ceiling and let
-        # our own band / hard cap (20x) be the real limiter. Fall back to
-        # max_leverage_long only if the tier table is absent.
+        # notional} tier table. The venue's TOP tier (e.g. 100x) only applies to
+        # microscopic positions and is NOT a sane operating cap, so we clamp the
+        # derived ceiling to the bot's system hard cap (matches
+        # LeverageEngine.hard_max_leverage). Fall back to max_leverage_long when
+        # the tier table is absent. The venue still enforces per-position-size
+        # gating at order time.
         dyn = inst.get("dynamic_position_leverage_details") or {}
         tier_max = 0
         try:
@@ -113,7 +120,7 @@ class InstrumentMapper:
         except (TypeError, ValueError):
             tier_max = 0
         legacy_max = int(float(inst.get("max_leverage_long", 1) or 1))
-        max_leverage = tier_max or legacy_max or 1
+        max_leverage = min(tier_max or legacy_max or 1, _MAX_USABLE_LEVERAGE)
         spec = InstrumentSpec(
             internal_symbol=internal,
             pair=pair,
