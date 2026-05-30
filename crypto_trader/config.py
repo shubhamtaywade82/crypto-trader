@@ -206,6 +206,15 @@ class TradingConfig:
     max_cross_venue_basis: float = 0.005    # reject entry when |basis| exceeds this
     entry_basis_buffer: float = 0.0005      # nudge entry trigger toward the fill venue
 
+    # ── Dynamic per-trade leverage (5x–20x band) ──
+    # When enabled, each entry's leverage is scaled within [dynamic_leverage_min,
+    # dynamic_leverage_max] by volatility (ATR%), account drawdown, margin ratio,
+    # and regime — down in high vol / drawdown, up in strong trends. Default OFF:
+    # the bot uses the fixed max_leverage. Enable only after paper validation.
+    use_dynamic_leverage: bool = False
+    dynamic_leverage_min: int = 5
+    dynamic_leverage_max: int = 20
+
     # ── Paper execution-degradation model (F4) ──
     # Make paper fills realistic vs thin CoinDCX liquidity.
     paper_cdcx_spread_coeff: float = 0.0015  # per-side fill penalty in paper mode
@@ -385,6 +394,9 @@ class TradingConfig:
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
             max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
+            use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", False),
+            dynamic_leverage_min=_get_int("DYNAMIC_LEVERAGE_MIN", 5),
+            dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 20),
             initial_balance=_get_float("INITIAL_BALANCE", 1000.0),
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),

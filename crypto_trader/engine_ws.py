@@ -180,6 +180,12 @@ class WebSocketTradingEngine:
 
         self.margin_engine = MarginEngine()
         self.leverage_engine = LeverageEngine()
+        # Dynamic per-trade leverage (5x–20x band), gated by config. When None,
+        # the engine uses the fixed configured leverage (unchanged behaviour).
+        self.dynamic_leverage = None
+        if cfg is not None and getattr(cfg, "use_dynamic_leverage", False):
+            from .margin_engine import DynamicLeverageManager
+            self.dynamic_leverage = DynamicLeverageManager(cfg)
         self.mr_state = MRStateManager(self.symbol)
 
         self.reconciler = ExchangeStateReconciler(
@@ -1224,6 +1230,8 @@ class WebSocketTradingEngine:
         taker_ratio = data["taker_ratio"]
         df_1h = data["df_1h"]
         df_15m = data["df_15m"]
+        # Stash for dynamic-leverage ATR% (read in _apply_dynamic_leverage).
+        self._last_signal_df_1h = df_1h
 
         # 5. Risk check
         self.risk_manager.update_peak_balance(self.wallet.margin_balance)
@@ -1476,6 +1484,82 @@ class WebSocketTradingEngine:
             return False, basis
         return True, basis
 
+    def _apply_dynamic_leverage(self, setup, entry_price, regime_ctx) -> bool:
+        """Compute and apply per-trade leverage in the [5x,20x] band.
+
+        Scales by volatility (ATR%), account drawdown, margin ratio, and regime.
+        Sets the per-symbol leverage (no shared-wallet race) and, in live mode,
+        the venue leverage before the order. Returns False to skip the entry
+        (volatility halt: compute() returned 0). Best-effort: on any error it
+        falls back to the fixed leverage and proceeds."""
+        try:
+            from .regime import compute_atr
+            base_lev = self.cfg.max_leverage if self.cfg else 5
+
+            # ATR% from the primary timeframe close (stashed each signal tick).
+            atr_pct = 0.0
+            try:
+                df_1h = getattr(self, "_last_signal_df_1h", None)
+                if df_1h is not None and len(df_1h) > 15 and float(entry_price) > 0:
+                    atr_pct = float(compute_atr(df_1h, 14).iloc[-1]) / float(entry_price)
+            except Exception:
+                atr_pct = 0.0
+
+            # Account drawdown from session peak.
+            drawdown = 0.0
+            try:
+                peak = float(getattr(self.risk_manager, "peak_balance", 0) or 0)
+                cur = float(self.wallet.margin_balance)
+                if peak > 0 and cur < peak:
+                    drawdown = (peak - cur) / peak
+            except Exception:
+                drawdown = 0.0
+
+            # Margin utilization.
+            margin_ratio = 0.0
+            try:
+                bal = float(self.wallet.margin_balance)
+                used = sum(float(p.margin_used) for p in self.wallet.positions.values()
+                           if p.status == "OPEN")
+                if bal > 0:
+                    margin_ratio = used / bal
+            except Exception:
+                margin_ratio = 0.0
+
+            venue_max = None
+            exec_eng = getattr(self.wallet, "execution_engine", None)
+            if exec_eng is not None and hasattr(exec_eng, "mapper"):
+                try:
+                    venue_max = int(exec_eng.mapper.get_spec(self.symbol).max_leverage)
+                except Exception:
+                    venue_max = None
+
+            regime_str = regime_ctx.extended.value if regime_ctx is not None else None
+            lev = self.dynamic_leverage.compute(
+                self.symbol, base_leverage=base_lev, venue_max_leverage=venue_max,
+                atr_pct=atr_pct, drawdown=drawdown, margin_ratio=margin_ratio,
+                regime=regime_str,
+            )
+            if lev <= 0:
+                logger.warning("[DYNAMIC-LEVERAGE] %s computed 0 (volatility halt) — skipping entry",
+                               self.symbol)
+                return False
+
+            # Apply: venue first (live), then per-symbol wallet so margin math agrees.
+            if self.cfg and self.cfg.is_live and exec_eng is not None and hasattr(exec_eng, "set_leverage"):
+                try:
+                    exec_eng.set_leverage(self.symbol, lev)
+                except Exception as e:
+                    logger.warning("[DYNAMIC-LEVERAGE] venue set_leverage failed for %s: %s", self.symbol, e)
+            if hasattr(self.wallet, "set_symbol_leverage"):
+                self.wallet.set_symbol_leverage(self.symbol, lev)
+            logger.info("[DYNAMIC-LEVERAGE] %s → %dx (atr%%=%.2f dd=%.2f mr=%.2f regime=%s)",
+                        self.symbol, lev, atr_pct * 100, drawdown * 100, margin_ratio * 100, regime_str)
+            return True
+        except Exception as e:
+            logger.warning("[DYNAMIC-LEVERAGE] %s compute failed (%s) — using fixed leverage", self.symbol, e)
+            return True
+
     def _execute_entry(self, ctx_or_setup, final_score=None, llm_weight=None,
                       explanation=None, mark_price=None, funding_rate=None,
                       oi_delta=None, taker_ratio=None, tech_score=None,
@@ -1591,6 +1675,13 @@ class WebSocketTradingEngine:
         if tp is None:
             _levels = setup.get("tp_levels", [])
             tp = _levels[0]["price"] if _levels else entry_price
+
+        # Dynamic per-trade leverage (5x–20x band) — decided BEFORE sizing so the
+        # margin/affordability math below uses the chosen leverage. Returns False
+        # to skip the entry (volatility halt). No-op when the feature is off.
+        if getattr(self, "dynamic_leverage", None) is not None:
+            if not self._apply_dynamic_leverage(setup, entry_price, regime_ctx):
+                return
 
         # Risk-based sizing from stop distance (2% risk per trade, scaled by this
         # engine's share of a shared wallet to avoid multi-symbol over-allocation).

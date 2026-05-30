@@ -516,14 +516,19 @@ def run_venue_preflight(
         # Leverage cap
         try:
             spec = execution_engine.mapper.get_spec(sym)
-            lev_ok = cfg.max_leverage <= spec.max_leverage
-            if not lev_ok:
-                logger.critical(
-                    "[PREFLIGHT] %s leverage cap FAIL: configured %sx > venue max %sx",
-                    sym, cfg.max_leverage, spec.max_leverage,
+            if cfg.max_leverage <= spec.max_leverage:
+                logger.info("[PREFLIGHT] %s leverage_cap OK: %sx <= %sx",
+                            sym, cfg.max_leverage, spec.max_leverage)
+            else:
+                # Per-symbol venue cap below the configured ceiling is NOT fatal:
+                # this symbol's leverage is clamped to its venue max at order time
+                # (set_leverage / dynamic-leverage venue_max). Heterogeneous venue
+                # caps across the watchlist must not abort the whole engine.
+                logger.warning(
+                    "[PREFLIGHT] %s leverage clamped: configured %sx > venue max %sx "
+                    "→ this symbol will trade at %sx",
+                    sym, cfg.max_leverage, spec.max_leverage, spec.max_leverage,
                 )
-                return False
-            logger.info("[PREFLIGHT] %s leverage_cap OK: %sx <= %sx", sym, cfg.max_leverage, spec.max_leverage)
         except Exception as e:
             logger.critical("[PREFLIGHT] %s failed to fetch instrument spec: %s", sym, e)
             return False

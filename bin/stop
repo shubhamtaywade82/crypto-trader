@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stop the trading bot + dashboard API (any launch method).
+set -e
+echo "Stopping trading bot + API..."
+pkill -f "python3 -m crypto_trader.multi_engine" && echo "  bot stopped" || echo "  bot not running"
+pkill -f "python3 -m crypto_trader.api_service" && echo "  api stopped" || echo "  api not running"
