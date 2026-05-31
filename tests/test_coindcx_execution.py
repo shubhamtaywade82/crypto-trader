@@ -105,8 +105,6 @@ class _FakeClient:
 @pytest.fixture
 def gate_open(monkeypatch):
     """Open the safe_mode live gate for the duration of a test."""
-    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
-    monkeypatch.setenv("LIVE_TRADING_ACK", safe_mode.ACK_PHRASE)
     monkeypatch.setenv("PLACE_ORDER", "true")  # not read-only for these tests
     existed = safe_mode.HALT_FILE.exists()
     if existed:
@@ -151,9 +149,8 @@ def test_exit_uses_opposite_side_no_reduce_only(gate_open):
 
 
 def test_place_order_blocked_without_gate(monkeypatch):
-    # Gate closed (no env, no ack) -> safe_mode must block the order.
-    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
-    monkeypatch.delenv("LIVE_TRADING_ACK", raising=False)
+    # Gate closed (PLACE_ORDER=false) -> safe_mode must block the order.
+    monkeypatch.setenv("PLACE_ORDER", "false")
     fake = _FakeClient()
     eng = _engine(fake, ack=False)
     with pytest.raises(safe_mode.LiveTradingBlocked):

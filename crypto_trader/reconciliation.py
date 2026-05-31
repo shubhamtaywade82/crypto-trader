@@ -178,6 +178,15 @@ class ExchangeStateReconciler:
                             f"{local_pos.sl_price} (order {placed['sl']})."
                         )
                     else:
+                        # Read-only mode (PLACE_ORDER=false) is not a failure — the
+                        # position simply can't be protected while orders are blocked.
+                        from crypto_trader import safe_mode
+                        if not safe_mode.order_execution_enabled():
+                            logger.warning(
+                                f"[RECONCILIATION] Missing venue stop-loss for {symbol} "
+                                f"— cannot recreate because PLACE_ORDER=false (read-only mode)."
+                            )
+                            return True
                         msg = f"Missing venue stop-loss for open {symbol} position; recreation failed."
                         logger.critical(f"[RECONCILIATION] {msg}")
                         self.risk_manager.trigger_kill_switch(msg)
