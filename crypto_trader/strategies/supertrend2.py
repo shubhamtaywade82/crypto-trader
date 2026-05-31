@@ -377,6 +377,14 @@ class PlaybookSupertrend2:
 
         elif self.entry_mode == "retracement":
             side = self._retracement_signal(df_1h, curr_dir, curr_close)
+            
+        elif self.entry_mode == "continuous":
+            # Enter immediately in the direction of the intact trend.
+            # The engine already prevents double-entries when a position is open.
+            if curr_dir == -1:
+                side = PositionSide.LONG
+            elif curr_dir == 1:
+                side = PositionSide.SHORT
 
         if side is None:
             return None
