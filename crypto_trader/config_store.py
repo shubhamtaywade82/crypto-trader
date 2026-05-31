@@ -45,6 +45,10 @@ SAFE_KEYS = frozenset({
     "smc_min_score", "smc_sweep_lookback", "smc_structure_lookback",
     "smc_oi_expansion_pct", "smc_volume_mult_target", "smc_rvol_target",
     "smc_liq_cascade_threshold", "smc_tp_rr",
+    # Liquidity-sweep entry/target knobs (read fresh each evaluation)
+    "lsw_sweep_lookback", "lsw_tp_r", "lsw_min_stop_frac", "lsw_use_htf_filter",
+    # MTF-alignment entry/target knobs
+    "mta_tp_r", "mta_break_lookback", "mta_min_macro_frames",
     # regime sizing / volatility gates
     "rvol_dead_threshold", "rvol_weak_threshold", "rvol_strong_threshold",
     "regime_size_multiplier_high", "regime_size_multiplier_low",
@@ -60,6 +64,10 @@ FLAT_ONLY_KEYS = frozenset({
     "mr_stop_loss_pct",
     # SMC stop/hold definition — changing mid-position would desync the venue SL
     "smc_sl_buffer_atr", "smc_sl_atr_mult", "smc_atr_period", "smc_max_hold_hours",
+    # Liquidity-sweep stop/hold definition (flat-only)
+    "lsw_sl_buffer_atr", "lsw_atr_period", "lsw_max_hold_hours",
+    # MTF-alignment stop/hold definition (flat-only)
+    "mta_swing_lookback", "mta_min_stop_frac", "mta_atr_period", "mta_max_hold_hours",
 })
 
 RESTART_KEYS = frozenset({
@@ -68,6 +76,10 @@ RESTART_KEYS = frozenset({
     "mr_sma_period", "st2_atr_period", "st2_use_adaptive_atr",
     # SMC topology — change kline shape / swing identity
     "smc_entry_timeframe", "smc_htf_timeframe", "smc_swing_window",
+    # Liquidity-sweep topology + symbol scoping
+    "lsw_timeframe", "lsw_htf_timeframe", "lsw_swing_window", "strategy_symbols",
+    # MTF-alignment topology (changes kline shape / EMA identity)
+    "mta_entry_timeframe", "mta_macro_tfs", "mta_ema_len",
 })
 
 _KNOWN = SAFE_KEYS | FLAT_ONLY_KEYS | RESTART_KEYS

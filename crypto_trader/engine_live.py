@@ -136,7 +136,7 @@ class LiveTradingSystem:
             gate_open = safe_mode.is_live_enabled()
             gate_detail = "open" if gate_open else (
                 f"need {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', "
-                f"no HALT file"
+                f"{safe_mode.PLACE_ORDER_ENV}=true (or unset), no HALT file"
             )
             checks.append(Check("safe_mode_gate", gate_open, gate_detail))
         else:
@@ -499,7 +499,7 @@ def run_venue_preflight(
     """Shared preflight gate used by both LiveTradingSystem and multi_engine.
 
     Checks (in order):
-    1. Safe-mode gate (LIVE_TRADING_ENABLED + ACK + no HALT file)
+    1. Safe-mode gate (PLACE_ORDER=true + no HALT file)
     2. CoinDCX auth + available margin balance
     3. Per-symbol: venue leverage cap vs ``cfg.max_leverage``
     4. Per-symbol: boot reconciliation

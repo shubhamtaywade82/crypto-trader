@@ -34,6 +34,8 @@ from .strategies.supertrend2 import PlaybookSupertrend2
 from .strategies.mean_reversion import PlaybookMeanReversion
 from .strategies.smc_pipeline import PlaybookSMC
 from .strategies.regime_switch import PlaybookRegimeSwitch
+from .strategies.liquidity_sweep import PlaybookLiquiditySweep
+from .strategies.mtf_alignment import PlaybookMTFAlignment
 from .strategies.mr_state import MRStateManager
 from .strategies.router import StrategyRouter, RouterResult, build_legacy_router
 from .reconciliation import ExchangeStateReconciler
@@ -109,6 +111,24 @@ class WebSocketTradingEngine:
         self.use_llm = use_llm
         self.event_bus = event_bus
         self.cfg = cfg
+
+        # ── Automatic per-symbol champion routing (offline-selected) ──
+        # Before any playbook is built, swap this engine's cfg to the champion
+        # strategy + params for THIS symbol. Uses dataclasses.replace so each
+        # engine gets its own cfg (the shared cfg passed in is never mutated).
+        # Symbols with no champion are flagged no-trade.
+        self._base_cfg = cfg            # original shared cfg; never mutated
+        self._champion_no_trade = False
+        self._champion_sig = None       # (strategy_mode, sorted params) of the applied champion
+        self._champions_mtime = -1.0    # mtime of the champions file last seen
+        self._pending_champion = "__unset__"  # deferred champion awaiting a flat symbol
+        if cfg is not None and getattr(cfg, "use_strategy_champions", False):
+            try:
+                from .selection.champions import champion_for
+                self._apply_champion(champion_for(self.symbol))
+                cfg = self.cfg          # downstream init reads the champion-resolved cfg
+            except Exception as e:
+                logger.warning("[CHAMPION] routing failed for %s: %s — using base cfg", self.symbol, e)
         # Optional delta-neutral funding-arb manager (Strategy C). Runs alongside
         # the directional signal tick; None unless wired by the launcher.
         self.funding_arb = funding_arb
@@ -225,115 +245,7 @@ class WebSocketTradingEngine:
             ]
         }
 
-        # Supertrend2 playbook (instantiated from cfg when strategy_mode=supertrend2)
-        self.playbook_st2: Optional[PlaybookSupertrend2] = None
-        if cfg and getattr(cfg, "strategy_mode", "legacy") == "supertrend2":
-            self.playbook_st2 = PlaybookSupertrend2(
-                atr_period=getattr(cfg, "st2_atr_period", 10),
-                factor=getattr(cfg, "st2_factor", 3.0),
-                use_adaptive_atr=getattr(cfg, "st2_use_adaptive_atr", True),
-                timeframe=getattr(cfg, "st2_timeframe", "1h"),
-                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
-                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
-                retracement_pct=getattr(cfg, "st2_retracement_pct", 1.0),
-                flip_lookback=getattr(cfg, "st2_flip_lookback", 5),
-                use_htf_filter=getattr(cfg, "st2_use_htf_filter", True),
-                use_vol_filter=getattr(cfg, "st2_use_vol_filter", False),
-                vol_multiplier=getattr(cfg, "st2_vol_multiplier", 1.2),
-                use_adx_filter=getattr(cfg, "st2_use_adx_filter", False),
-                adx_threshold=getattr(cfg, "st2_adx_threshold", 20),
-                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
-                use_tp=getattr(cfg, "st2_use_tp", True),
-                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
-                sl_pct=getattr(cfg, "st2_sl_pct", 1.5),
-                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 2.5),
-                max_hold_hours=getattr(cfg, "st2_max_hold_hours", 168),
-            )
-            logger.info(
-                "[ST2] Supertrend2 mode active: factor=%.1f atr=%d adaptive=%s "
-                "primary_tf=%s htf_tf=%s entry_mode=%s htf_filter=%s",
-                self.playbook_st2.factor,
-                self.playbook_st2.atr_period,
-                self.playbook_st2.use_adaptive_atr,
-                self.playbook_st2.timeframe,
-                self.playbook_st2.htf_timeframe,
-                self.playbook_st2.entry_mode,
-                self.playbook_st2.use_htf_filter,
-            )
-
-        # Mean Reversion playbook (instantiated from cfg when strategy_mode=mean_reversion)
-        self.playbook_mr: Optional[PlaybookMeanReversion] = None
-        if cfg and getattr(cfg, "strategy_mode", "legacy") == "mean_reversion":
-            self.playbook_mr = PlaybookMeanReversion(
-                sma_period=getattr(cfg, "mr_sma_period", 20),
-                entry_band=getattr(cfg, "mr_entry_band", 0.015),
-                stop_loss_pct=getattr(cfg, "mr_stop_loss_pct", 0.008),
-                timeframe=getattr(cfg, "mr_timeframe", "15m"),
-            )
-            logger.info(
-                "[MR] Mean Reversion mode active: SMA%d entry_band=%.3f%% sl_pct=%.3f%% "
-                "timeframe=%s symbol=%s",
-                self.playbook_mr.sma_period,
-                self.playbook_mr.entry_band * 100,
-                self.playbook_mr.stop_loss_pct * 100,
-                self.playbook_mr.timeframe,
-                self.symbol,
-            )
-
-        # SMC pipeline playbook (instantiated from cfg when strategy_mode=smc)
-        self.playbook_smc: Optional[PlaybookSMC] = None
-        if cfg and getattr(cfg, "strategy_mode", "legacy") == "smc":
-            self.playbook_smc = PlaybookSMC(
-                entry_timeframe=getattr(cfg, "smc_entry_timeframe", "15m"),
-                htf_timeframe=getattr(cfg, "smc_htf_timeframe", "4h"),
-                swing_window=getattr(cfg, "smc_swing_window", 3),
-                min_score=getattr(cfg, "smc_min_score", 70.0),
-                sweep_lookback=getattr(cfg, "smc_sweep_lookback", 12),
-                structure_lookback=getattr(cfg, "smc_structure_lookback", 12),
-                oi_expansion_pct=getattr(cfg, "smc_oi_expansion_pct", 3.0),
-                volume_mult_target=getattr(cfg, "smc_volume_mult_target", 3.0),
-                rvol_target=getattr(cfg, "smc_rvol_target", 1.2),
-                liq_cascade_threshold=getattr(cfg, "smc_liq_cascade_threshold", 0.5),
-                atr_period=getattr(cfg, "smc_atr_period", 14),
-                sl_buffer_atr=getattr(cfg, "smc_sl_buffer_atr", 0.5),
-                sl_atr_mult=getattr(cfg, "smc_sl_atr_mult", 1.5),
-                tp_rr=getattr(cfg, "smc_tp_rr", 2.0),
-                max_hold_hours=getattr(cfg, "smc_max_hold_hours", 24),
-            )
-            logger.info(
-                "[SMC] SMC pipeline mode active: entry_tf=%s htf=%s min_score=%.0f "
-                "swing=%d symbol=%s",
-                self.playbook_smc.entry_timeframe, self.playbook_smc.htf_timeframe,
-                self.playbook_smc.min_score, self.playbook_smc.swing_window, self.symbol,
-            )
-
-        # Regime Switch playbook (wraps ST2 with regime gating)
-        self.playbook_regime_switch: Optional[PlaybookRegimeSwitch] = None
-        if cfg and getattr(cfg, "strategy_mode", "legacy") == "regime_switch":
-            self.playbook_regime_switch = PlaybookRegimeSwitch(
-                entry_timeframe=getattr(cfg, "st2_timeframe", "1h"),
-                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
-                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
-                factor=getattr(cfg, "st2_factor", 3.0),
-                atr_period=getattr(cfg, "st2_atr_period", 10),
-                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 1.5),
-                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
-                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
-                tp2_pct=getattr(cfg, "st2_tp2_pct", 3.0),
-                tp_mode=getattr(cfg, "st2_tp_mode", "split"),
-                min_confidence=getattr(cfg, "st2_min_confidence", 60.0),
-                allowed_regimes=getattr(cfg, "rs_allowed_regimes", None),
-            )
-            logger.info(
-                "[RS] Regime Switch mode active: entry_tf=%s htf=%s factor=%.1f "
-                "mode=%s sl=%s symbol=%s",
-                self.playbook_regime_switch.entry_timeframe,
-                self.playbook_regime_switch.htf_timeframe,
-                self.playbook_regime_switch.factor,
-                self.playbook_regime_switch.entry_mode,
-                self.playbook_regime_switch.sl_mode,
-                self.symbol,
-            )
+        self._init_strategy_playbooks()
 
         # Regime / Session engine
         _rc_kwargs = {}
@@ -679,6 +591,229 @@ class WebSocketTradingEngine:
         self._halted = True
         return False
 
+    def _apply_champion(self, champ) -> None:
+        """Resolve this engine's cfg from a champion entry (or None). Sets cfg via
+        dataclasses.replace off the immutable base cfg; never mutates the shared
+        cfg. Does NOT rebuild playbooks — the caller does (init or flat-refresh)."""
+        from dataclasses import replace
+        from .selection.champions import load_champions
+        base = self._base_cfg
+        if champ:
+            overrides = {"strategy_mode": champ["strategy_mode"]}
+            for k, v in (champ.get("params") or {}).items():
+                if hasattr(base, k):
+                    overrides[k] = v
+            self.cfg = replace(base, **overrides)
+            self._champion_no_trade = False
+            self._champion_sig = (champ["strategy_mode"],
+                                  tuple(sorted((champ.get("params") or {}).items())))
+            logger.info(
+                "[CHAMPION] %s → %s %s (OOS PF %s, expR %s, %s tr)",
+                self.symbol, champ["strategy_mode"], champ.get("params", {}),
+                champ.get("oos_pf"), champ.get("oos_expectancy_r"), champ.get("oos_trades"),
+            )
+        else:
+            self.cfg = base
+            # File present but this symbol has no validated edge → don't trade it.
+            self._champion_no_trade = bool(load_champions())
+            self._champion_sig = ("none", ())
+            if self._champion_no_trade:
+                logger.info("[CHAMPION] %s has no validated champion — no new entries", self.symbol)
+
+    def _refresh_champion(self) -> None:
+        """Flat-only hot-swap: when the champions file changes, re-route THIS
+        symbol to its new champion — but only while it is FLAT (defer otherwise).
+        Selection itself stays offline; this just consumes the refreshed file."""
+        base = getattr(self, "_base_cfg", None)
+        if not (base and getattr(base, "use_strategy_champions", False)):
+            return
+        from .selection.champions import CHAMPIONS_PATH, champion_for
+        try:
+            mtime = CHAMPIONS_PATH.stat().st_mtime
+        except (FileNotFoundError, OSError):
+            return
+        if mtime == self._champions_mtime and self._pending_champion == "__unset__":
+            return
+        self._champions_mtime = mtime
+        champ = champion_for(self.symbol)
+        new_sig = ((champ["strategy_mode"], tuple(sorted((champ.get("params") or {}).items())))
+                   if champ else ("none", ()))
+        if new_sig == self._champion_sig and self._pending_champion == "__unset__":
+            return
+        # Change needed — only swap when flat; never touch an open position.
+        if self.wallet.get_open_position(self.symbol) is not None:
+            self._pending_champion = champ
+            logger.info("[CHAMPION] %s change to %s DEFERRED (position open)", self.symbol, new_sig[0])
+            return
+        target = self._pending_champion if self._pending_champion != "__unset__" else champ
+        self._pending_champion = "__unset__"
+        self._apply_champion(target)
+        self._init_strategy_playbooks()
+        logger.info("[CHAMPION] %s hot-swapped to %s (flat)", self.symbol, self._champion_sig[0])
+
+    def _init_strategy_playbooks(self) -> None:
+        """(Re)build the active-strategy playbook objects from ``self.cfg``.
+
+        Called once at construction, and again by ``_refresh_champion`` when a
+        symbol is FLAT and its champion strategy changed — so a new champion is
+        hot-swapped in without a restart and without ever touching an open trade.
+        """
+        cfg = self.cfg
+        # Supertrend2 playbook (instantiated from cfg when strategy_mode=supertrend2)
+        self.playbook_st2: Optional[PlaybookSupertrend2] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "supertrend2":
+            self.playbook_st2 = PlaybookSupertrend2(
+                atr_period=getattr(cfg, "st2_atr_period", 10),
+                factor=getattr(cfg, "st2_factor", 3.0),
+                use_adaptive_atr=getattr(cfg, "st2_use_adaptive_atr", True),
+                timeframe=getattr(cfg, "st2_timeframe", "1h"),
+                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
+                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
+                retracement_pct=getattr(cfg, "st2_retracement_pct", 1.0),
+                flip_lookback=getattr(cfg, "st2_flip_lookback", 5),
+                use_htf_filter=getattr(cfg, "st2_use_htf_filter", True),
+                use_vol_filter=getattr(cfg, "st2_use_vol_filter", False),
+                vol_multiplier=getattr(cfg, "st2_vol_multiplier", 1.2),
+                use_adx_filter=getattr(cfg, "st2_use_adx_filter", False),
+                adx_threshold=getattr(cfg, "st2_adx_threshold", 20),
+                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
+                use_tp=getattr(cfg, "st2_use_tp", True),
+                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
+                sl_pct=getattr(cfg, "st2_sl_pct", 1.5),
+                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 2.5),
+                max_hold_hours=getattr(cfg, "st2_max_hold_hours", 168),
+            )
+            logger.info(
+                "[ST2] Supertrend2 mode active: factor=%.1f atr=%d adaptive=%s "
+                "primary_tf=%s htf_tf=%s entry_mode=%s htf_filter=%s",
+                self.playbook_st2.factor,
+                self.playbook_st2.atr_period,
+                self.playbook_st2.use_adaptive_atr,
+                self.playbook_st2.timeframe,
+                self.playbook_st2.htf_timeframe,
+                self.playbook_st2.entry_mode,
+                self.playbook_st2.use_htf_filter,
+            )
+
+        # Mean Reversion playbook (instantiated from cfg when strategy_mode=mean_reversion)
+        self.playbook_mr: Optional[PlaybookMeanReversion] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "mean_reversion":
+            self.playbook_mr = PlaybookMeanReversion(
+                sma_period=getattr(cfg, "mr_sma_period", 20),
+                entry_band=getattr(cfg, "mr_entry_band", 0.015),
+                stop_loss_pct=getattr(cfg, "mr_stop_loss_pct", 0.008),
+                timeframe=getattr(cfg, "mr_timeframe", "15m"),
+            )
+            logger.info(
+                "[MR] Mean Reversion mode active: SMA%d entry_band=%.3f%% sl_pct=%.3f%% "
+                "timeframe=%s symbol=%s",
+                self.playbook_mr.sma_period,
+                self.playbook_mr.entry_band * 100,
+                self.playbook_mr.stop_loss_pct * 100,
+                self.playbook_mr.timeframe,
+                self.symbol,
+            )
+
+        # SMC pipeline playbook (instantiated from cfg when strategy_mode=smc)
+        self.playbook_smc: Optional[PlaybookSMC] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "smc":
+            self.playbook_smc = PlaybookSMC(
+                entry_timeframe=getattr(cfg, "smc_entry_timeframe", "15m"),
+                htf_timeframe=getattr(cfg, "smc_htf_timeframe", "4h"),
+                swing_window=getattr(cfg, "smc_swing_window", 3),
+                min_score=getattr(cfg, "smc_min_score", 70.0),
+                sweep_lookback=getattr(cfg, "smc_sweep_lookback", 12),
+                structure_lookback=getattr(cfg, "smc_structure_lookback", 12),
+                oi_expansion_pct=getattr(cfg, "smc_oi_expansion_pct", 3.0),
+                volume_mult_target=getattr(cfg, "smc_volume_mult_target", 3.0),
+                rvol_target=getattr(cfg, "smc_rvol_target", 1.2),
+                liq_cascade_threshold=getattr(cfg, "smc_liq_cascade_threshold", 0.5),
+                atr_period=getattr(cfg, "smc_atr_period", 14),
+                sl_buffer_atr=getattr(cfg, "smc_sl_buffer_atr", 0.5),
+                sl_atr_mult=getattr(cfg, "smc_sl_atr_mult", 1.5),
+                tp_rr=getattr(cfg, "smc_tp_rr", 2.0),
+                max_hold_hours=getattr(cfg, "smc_max_hold_hours", 24),
+            )
+            logger.info(
+                "[SMC] SMC pipeline mode active: entry_tf=%s htf=%s min_score=%.0f "
+                "swing=%d symbol=%s",
+                self.playbook_smc.entry_timeframe, self.playbook_smc.htf_timeframe,
+                self.playbook_smc.min_score, self.playbook_smc.swing_window, self.symbol,
+            )
+
+        # Regime Switch playbook (wraps ST2 with regime gating)
+        self.playbook_regime_switch: Optional[PlaybookRegimeSwitch] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "regime_switch":
+            self.playbook_regime_switch = PlaybookRegimeSwitch(
+                timeframe=getattr(cfg, "st2_timeframe", "1h"),
+                htf_timeframe=getattr(cfg, "st2_htf_timeframe", "4h"),
+                entry_mode=getattr(cfg, "st2_entry_mode", "flip"),
+                factor=getattr(cfg, "st2_factor", 3.0),
+                atr_period=getattr(cfg, "st2_atr_period", 10),
+                sl_atr_mult=getattr(cfg, "st2_sl_atr_mult", 1.5),
+                sl_mode=getattr(cfg, "st2_sl_mode", "supertrend"),
+                tp1_pct=getattr(cfg, "st2_tp1_pct", 1.0),
+                allowed_regimes=getattr(cfg, "rs_allowed_regimes", None),
+            )
+            logger.info(
+                "[RS] Regime Switch mode active: entry_tf=%s htf=%s factor=%.1f "
+                "mode=%s sl=%s symbol=%s",
+                self.playbook_regime_switch.st2.timeframe,
+                self.playbook_regime_switch.st2.htf_timeframe,
+                self.playbook_regime_switch.st2.factor,
+                self.playbook_regime_switch.st2.entry_mode,
+                self.playbook_regime_switch.st2.sl_mode,
+                self.symbol,
+            )
+
+        # Liquidity-Sweep playbook (the ETH-validated net-positive edge)
+        self.playbook_lsw: Optional[PlaybookLiquiditySweep] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "liquidity_sweep":
+            # Per-symbol TP optimum (ETH @2.5R, BTC @3.0R) via LSW_TP_R_OVERRIDES,
+            # else the global lsw_tp_r.
+            _tp_r = getattr(cfg, "lsw_tp_r_overrides", {}).get(self.symbol, getattr(cfg, "lsw_tp_r", 2.5))
+            self.playbook_lsw = PlaybookLiquiditySweep(
+                timeframe=getattr(cfg, "lsw_timeframe", "15m"),
+                htf_timeframe=getattr(cfg, "lsw_htf_timeframe", "4h"),
+                swing_window=getattr(cfg, "lsw_swing_window", 3),
+                sweep_lookback=getattr(cfg, "lsw_sweep_lookback", 3),
+                tp_r=_tp_r,
+                atr_period=getattr(cfg, "lsw_atr_period", 14),
+                sl_buffer_atr=getattr(cfg, "lsw_sl_buffer_atr", 0.25),
+                min_stop_frac=getattr(cfg, "lsw_min_stop_frac", 0.002),
+                use_htf_filter=getattr(cfg, "lsw_use_htf_filter", False),
+                max_hold_hours=getattr(cfg, "lsw_max_hold_hours", 24),
+            )
+            _scope = getattr(cfg, "strategy_symbols", []) or ["(all)"]
+            logger.info(
+                "[LSW] Liquidity-Sweep mode active: tf=%s tp=%.1fR sweep_lookback=%d "
+                "scope=%s symbol=%s",
+                self.playbook_lsw.timeframe, self.playbook_lsw.tp_r,
+                self.playbook_lsw.sweep_lookback, ",".join(_scope), self.symbol,
+            )
+
+        # MTF-Alignment playbook (EMA50 1h/4h/1d align → breakout → engulfing → wide TP)
+        self.playbook_mta: Optional[PlaybookMTFAlignment] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "mtf_alignment":
+            self.playbook_mta = PlaybookMTFAlignment(
+                entry_timeframe=getattr(cfg, "mta_entry_timeframe", "5m"),
+                macro_tfs=list(getattr(cfg, "mta_macro_tfs", ["1h", "4h", "1d"])),
+                ema_len=getattr(cfg, "mta_ema_len", 50),
+                min_macro_frames=getattr(cfg, "mta_min_macro_frames", 2),
+                break_lookback=getattr(cfg, "mta_break_lookback", 5),
+                swing_lookback=getattr(cfg, "mta_swing_lookback", 6),
+                tp_r=getattr(cfg, "lsw_tp_r_overrides", {}).get(self.symbol, getattr(cfg, "mta_tp_r", 3.0)),
+                atr_period=getattr(cfg, "mta_atr_period", 14),
+                min_stop_frac=getattr(cfg, "mta_min_stop_frac", 0.0055),
+                max_hold_hours=getattr(cfg, "mta_max_hold_hours", 24),
+            )
+            _scope = getattr(cfg, "strategy_symbols", []) or ["(all)"]
+            logger.info(
+                "[MTA] MTF-Alignment mode active: entry_tf=%s macro=%s tp=%.1fR scope=%s symbol=%s",
+                self.playbook_mta.entry_timeframe, ",".join(self.playbook_mta.macro_tfs),
+                self.playbook_mta.tp_r, ",".join(_scope), self.symbol,
+            )
+
     def _apply_runtime_overrides(self) -> None:
         """Poll the ConfigStore and apply runtime parameter overrides."""
         ov = self.config_store.poll()
@@ -701,6 +836,10 @@ class WebSocketTradingEngine:
                         self.playbook_mr.apply_overrides({k: v})
                     if k.startswith("smc_") and self.playbook_smc is not None:
                         self.playbook_smc.apply_overrides({k: v})
+                    if k.startswith("lsw_") and self.playbook_lsw is not None:
+                        self.playbook_lsw.apply_overrides({k: v})
+                    if k.startswith("mta_") and self.playbook_mta is not None:
+                        self.playbook_mta.apply_overrides({k: v})
                 elif cls == "flat_only":
                     self._pending_flat_overrides[k] = v
                 elif cls == "restart":
@@ -725,6 +864,10 @@ class WebSocketTradingEngine:
                     self.playbook_mr.apply_overrides({k: v})
                 if k.startswith("smc_") and self.playbook_smc is not None:
                     self.playbook_smc.apply_overrides({k: v})
+                if k.startswith("lsw_") and self.playbook_lsw is not None:
+                    self.playbook_lsw.apply_overrides({k: v})
+                if k.startswith("mta_") and self.playbook_mta is not None:
+                    self.playbook_mta.apply_overrides({k: v})
             self._pending_flat_overrides = {}
 
     def _signal_tick(self):
@@ -734,6 +877,7 @@ class WebSocketTradingEngine:
             return
 
         self._apply_runtime_overrides()
+        self._refresh_champion()
 
         logger.info("--- Signal Tick: %s ---", self.symbol)
 
@@ -912,6 +1056,52 @@ class WebSocketTradingEngine:
                 except Exception as e:
                     logger.warning("[SMC] Failed to fetch HTF %s: %s — falling back to 4h", smc_htf, e)
                     data["df_smc_htf"] = df_4h
+
+        # ── Liquidity-Sweep configurable timeframes ──────────────────────────
+        if self.playbook_lsw is not None:
+            _baseline_map_lsw = {"15m": df_15m, "5m": df_5m, "1h": df_1h, "4h": df_4h}
+            lsw_tf = self.playbook_lsw.timeframe
+            lsw_htf = self.playbook_lsw.htf_timeframe
+            if lsw_tf in _baseline_map_lsw:
+                data["df_lsw"] = _baseline_map_lsw[lsw_tf]
+            else:
+                try:
+                    data["df_lsw"] = self.data_feed.get_klines(
+                        self.symbol, lsw_tf, limit=self._kline_limit(lsw_tf))
+                except Exception as e:
+                    logger.warning("[LSW] Failed to fetch entry TF %s: %s — falling back to 15m", lsw_tf, e)
+                    data["df_lsw"] = df_15m
+            if lsw_htf in _baseline_map_lsw:
+                data["df_lsw_htf"] = _baseline_map_lsw[lsw_htf]
+            else:
+                try:
+                    data["df_lsw_htf"] = self.data_feed.get_klines(
+                        self.symbol, lsw_htf, limit=self._kline_limit(lsw_htf))
+                except Exception as e:
+                    logger.warning("[LSW] Failed to fetch HTF %s: %s — falling back to 4h", lsw_htf, e)
+                    data["df_lsw_htf"] = df_4h
+
+        # ── MTF-Alignment frames (entry TF + macro 1h/4h/1d) ─────────────────
+        if self.playbook_mta is not None:
+            _baseline = {"15m": df_15m, "5m": df_5m, "1h": df_1h, "4h": df_4h}
+            etf = self.playbook_mta.entry_timeframe
+            data["df_mta"] = _baseline.get(etf)
+            if data["df_mta"] is None:
+                try:
+                    data["df_mta"] = self.data_feed.get_klines(self.symbol, etf, limit=self._kline_limit(etf))
+                except Exception as e:
+                    logger.warning("[MTA] entry TF %s fetch failed: %s — falling back to 5m", etf, e)
+                    data["df_mta"] = df_5m
+            macro = {}
+            for tf in self.playbook_mta.macro_tfs:
+                if tf in _baseline:
+                    macro[tf] = _baseline[tf]
+                else:
+                    try:
+                        macro[tf] = self.data_feed.get_klines(self.symbol, tf, limit=self._kline_limit(tf))
+                    except Exception as e:
+                        logger.warning("[MTA] macro TF %s fetch failed: %s — skipping frame", tf, e)
+            data["df_mta_macro"] = macro
 
         return data
 
@@ -1316,7 +1506,7 @@ class WebSocketTradingEngine:
             return
 
         df_st2 = data.get("df_st2", data["df_1h"])
-        df_st2_htf = data.get("df_st2_htf", data["df_4h"]) if self.playbook_regime_switch.use_htf_filter else None
+        df_st2_htf = data.get("df_st2_htf", data["df_4h"]) if self.playbook_regime_switch.st2.use_htf_filter else None
 
         setup = self.playbook_regime_switch.evaluate(df_st2, df_st2_htf, regime_ctx=regime_ctx)
         if not setup:
@@ -1608,6 +1798,121 @@ class WebSocketTradingEngine:
             regime_ctx=regime_ctx,
         ))
 
+    def _evaluate_entry_lsw(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """Entry evaluation path for strategy_mode == "liquidity_sweep".
+
+        Sweep-reversal entry with a fixed 2.5R take-profit (the ETH-validated,
+        net-positive OOS edge). Exits via standard wallet SL/TP/time-stop — no
+        special exit handler needed.
+        """
+        if self.playbook_lsw is None:
+            return
+        df_lsw = data.get("df_lsw") or data.get("df_15m")
+        df_lsw_htf = data.get("df_lsw_htf") or data.get("df_4h")
+        if df_lsw is None:
+            logger.warning("[LSW ENTRY] %s — no entry-TF klines available", self.symbol)
+            return
+
+        setup = self.playbook_lsw.evaluate(df_lsw, df_lsw_htf)
+        if not setup:
+            ev = getattr(self.playbook_lsw, "last_eval", None)
+            stage = (ev or {}).get("stage", "no_signal")
+            logger.info("[LSW EVAL] %s no signal (%s)", self.symbol, stage)
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(symbol=self.symbol, reason=f"lsw_{stage}"))
+            return
+
+        logger.info("[LSW SIGNAL] %s | %s | %s", self.symbol, setup["side"].value, setup["reason"])
+
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
+        ):
+            logger.info("[LSW BLOCKED] %s — funding extreme %+.4f%%", self.symbol, funding_rate * 100)
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=setup["score"],
+            llm_weight=0.0,
+            explanation=f"LiquiditySweep {setup['tp_r']}R",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=setup["score"],
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=setup["score"],
+            regime_ctx=regime_ctx,
+        ))
+
+    def _evaluate_entry_mta(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """Entry path for strategy_mode == "mtf_alignment". EMA50 1h/4h/1d align →
+        5m breakout → engulfing → wide-R TP. Exits via standard wallet SL/TP/time-stop."""
+        if self.playbook_mta is None:
+            return
+        df_mta = data.get("df_mta") or data.get("df_5m")
+        macro = data.get("df_mta_macro") or {"1h": data.get("df_1h"), "4h": data.get("df_4h")}
+        if df_mta is None:
+            logger.warning("[MTA ENTRY] %s — no entry-TF klines", self.symbol)
+            return
+
+        setup = self.playbook_mta.evaluate(df_mta, macro)
+        if not setup:
+            ev = getattr(self.playbook_mta, "last_eval", None)
+            stage = (ev or {}).get("stage", "no_signal")
+            logger.info("[MTA EVAL] %s no signal (%s)", self.symbol, stage)
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(symbol=self.symbol, reason=f"mta_{stage}"))
+            return
+
+        logger.info("[MTA SIGNAL] %s | %s | %s", self.symbol, setup["side"].value, setup["reason"])
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
+        ):
+            logger.info("[MTA BLOCKED] %s — funding extreme %+.4f%%", self.symbol, funding_rate * 100)
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=setup["score"],
+            llm_weight=0.0,
+            explanation=f"MTFAlignment {setup['tp_r']}R",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=setup["score"],
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=setup["score"],
+            regime_ctx=regime_ctx,
+        ))
+
     # ─── Position update helpers ────────────────────────────────────────────
 
     def _update_open_position(self, data: dict, regime, session_ctx):
@@ -1689,11 +1994,40 @@ class WebSocketTradingEngine:
 
         # 6. Evaluate entry if no open position
         if not self.wallet.get_open_position(self.symbol) and can_trade:
+            # Per-symbol strategy scoping: when STRATEGY_SYMBOLS is set, only the
+            # listed symbols open NEW entries. Others still manage open positions
+            # (handled above) but take no new trades — lets you run the
+            # ETH-validated edge ETH-only without removing symbols from the feed.
+            if getattr(self, "_champion_no_trade", False):
+                logger.info("[CHAMPION] %s no validated champion — skipping new entry", self.symbol)
+                self._reject(f"no_champion {self.symbol}")
+                return
+
+            _scope = getattr(self.cfg, "strategy_symbols", None) if self.cfg else None
+            if _scope and self.symbol not in _scope:
+                logger.info("[SCOPE] %s not in STRATEGY_SYMBOLS %s — no new entry", self.symbol, _scope)
+                self._reject(f"symbol_not_in_scope {self.symbol}")
+                return
+
             _st2_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "supertrend2"
             _mr_mode  = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "mean_reversion"
             _smc_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "smc"
+            _lsw_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "liquidity_sweep"
+            _mta_mode = self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "mtf_alignment"
 
             try:
+                if _lsw_mode:
+                    # ── Liquidity-Sweep path (ETH-validated 2.5R edge) ────────
+                    self._evaluate_entry_lsw(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                    return
+                if _mta_mode:
+                    # ── MTF-Alignment path (EMA50 1h/4h/1d → breakout → engulf → wide-R) ──
+                    self._evaluate_entry_mta(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                    return
                 if _st2_mode:
                     # ── Supertrend2 path ──────────────────────────────────────
                     # Bypass legacy regime routing, profile regime filter, and LLM.

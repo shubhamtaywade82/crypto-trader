@@ -197,27 +197,32 @@ def main():
         _early_cfg.max_daily_trades, _early_cfg.allowed_regimes,
     )
 
-    # Initialize CoinDCX live execution engine if live trading is enabled
-    live_enabled = os.getenv("LIVE_TRADING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-    live_ack = os.getenv("LIVE_TRADING_ACK", "") == "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"
-    
+    # Initialize execution engine based on MODE only
+    mode_is_live = _early_cfg.mode.value == "live"
+
     execution_engine = None
-    if live_enabled:
+    if mode_is_live:
         api_key = os.getenv("COINDCX_API_KEY")
         api_secret = os.getenv("COINDCX_API_SECRET")
         if not api_key or not api_secret:
-            logger.error("LIVE_TRADING_ENABLED is true, but COINDCX_API_KEY/SECRET is missing!")
+            logger.error("MODE=live requires COINDCX_API_KEY and COINDCX_API_SECRET!")
             raise ValueError("Missing CoinDCX API Key/Secret for live trading.")
-        
+
         execution_engine = CoinDCXExecutionEngine(
             api_key=api_key,
             api_secret=api_secret,
             leverage=resolved_leverage,
             margin_currency=_early_cfg.coindcx_margin_currency,
-            i_understand_real_money=live_ack
+            i_understand_real_money=True,
         )
-        logger.warning("⚠️ LIVE TRADING IS ENABLED! Real orders will be routed to CoinDCX.")
-        
+        place_order = os.getenv("PLACE_ORDER", "").strip().lower()
+        if place_order in {"0", "false", "no", "off"}:
+            logger.warning("MODE=live | PLACE_ORDER=false — read-only mode (no orders sent)")
+        else:
+            logger.warning("⚠️ MODE=live | PLACE_ORDER=true — REAL ORDERS WILL BE ROUTED TO COINDCX.")
+    else:
+        logger.info("MODE=paper — using simulated fills (no venue calls)")
+
     # ── Database Projections & Event Journal for Dashboard UI ──
     # Reuse the SAME cfg object loaded above (carries any CLI leverage override) so
     # the wallet, projections, and per-symbol engines all share one config.
@@ -304,8 +309,8 @@ def main():
         except Exception as e:
             logger.error("[LIVE BALANCE SYNC] Failed to sync wallet balance with exchange: %s", e)
 
-    # Run pre-flight checks and state reconciliation in live mode
-    if live_enabled and execution_engine is not None:
+    # Run pre-flight checks and state reconciliation in live mode only
+    if mode_is_live and execution_engine is not None:
         if not run_preflight_checks(symbols, global_wallet, execution_engine, global_risk, bus, cfg):
             logger.critical("Multi-engine startup aborted due to pre-flight self-test or reconciliation failure.")
             sys.exit(1)

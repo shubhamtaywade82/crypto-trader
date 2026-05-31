@@ -328,18 +328,15 @@ def get_gate():
     """Live-trading gate status (safe_mode): is real-money placement enabled?"""
     from pathlib import Path
     halt = (Path.home() / ".crypto_trader" / "HALT").exists()
-    enabled = os.environ.get("LIVE_TRADING_ENABLED", "").lower() in ("true", "1", "yes")
-    ack_ok = os.environ.get("LIVE_TRADING_ACK", "") == "I_UNDERSTAND_REAL_MONEY_WILL_BE_LOST"
     po_raw = os.environ.get("PLACE_ORDER", "").strip().lower()
     place_order = True if po_raw == "" else po_raw in ("true", "1", "yes", "on")
+    mode = os.environ.get("MODE", "paper")
     return {
-        "mode": os.environ.get("MODE", "paper"),
-        "live_enabled": enabled,
-        "ack_ok": ack_ok,
+        "mode": mode,
         "halt_file": halt,
         "place_order": place_order,
-        "read_only": not place_order,
-        "live_orders_allowed": enabled and ack_ok and not halt and place_order,
+        "read_only": mode == "live" and not place_order,
+        "live_orders_allowed": mode == "live" and place_order and not halt,
     }
 
 
