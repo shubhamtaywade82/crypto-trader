@@ -615,6 +615,16 @@ class OllamaAdvisor:
         except Exception as e:
             logger.warning("[LLM] AI subsystem router unavailable, using legacy client: %s", e)
 
+        # Pre-flight health check: warn immediately if local Ollama is unreachable
+        # so the operator knows why requests are falling back to cloud.
+        if not use_cloud and not self.client.is_ready():
+            logger.warning(
+                "[LLM] Local Ollama at %s is NOT reachable (/%s). "
+                "All LLM calls will fall back to cloud or timeout. "
+                "Start Ollama locally or set USE_CLOUD_LLM=true to avoid delays.",
+                host, "api/tags",
+            )
+
     def is_ready(self) -> bool:
         if self._router is not None:
             # Router is ready if local provider is healthy (cloud is optional bonus)

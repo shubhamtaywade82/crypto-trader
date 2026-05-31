@@ -486,6 +486,8 @@ class EnhancedFuturesWallet:
         software_sl_backup_bps: int = 15,
         database_url: str = "",
         event_bus: Optional[Any] = None,
+        redis_url: str = "",
+        margin_currency: str = "USDT",
     ):
         # Symbol is optional; if provided, kept for backward compatibility.
         self.symbol = symbol or "GLOBAL"
@@ -514,6 +516,11 @@ class EnhancedFuturesWallet:
         self.event_bus = event_bus
         self.halted = False
         self.max_snapshots = max_snapshots
+        self.margin_currency = margin_currency.upper()
+
+        # INR display rate cache (updated every 5 min)
+        self._inr_rate: Optional[float] = None
+        self._inr_rate_ts: float = 0.0
 
         # Live execution wiring (paper mode leaves these untouched)
         self.execution_engine = None
@@ -538,6 +545,19 @@ class EnhancedFuturesWallet:
             namespace=safe_ns,
             symbol=safe_symbol,
         )
+
+        # Redis hot-cache (optional — degrades gracefully if unavailable)
+        self._redis_cache = None
+        if redis_url:
+            try:
+                from .wallet_cache import WalletRedisCache
+                self._redis_cache = WalletRedisCache(
+                    redis_url=redis_url,
+                    mode="paper" if not getattr(self, "live_execution", False) else "live",
+                    namespace=safe_ns,
+                )
+            except Exception as exc:
+                logger.warning("[Wallet] Redis cache init failed: %s", exc)
 
         self.initial_balance: Decimal = self._to_decimal(initial_balance)
         self.wallet_balance: Decimal = self.initial_balance
@@ -1771,11 +1791,36 @@ class EnhancedFuturesWallet:
         if hours_open >= pos.time_stop_hours:
             self.close_position(symbol, mark_price, reason=f"TIME_STOP ({hours_open:.1f}h)")
 
-    def get_summary(self) -> dict:
+    def _get_inr_rate(self) -> Optional[float]:
+        """Fetch INR/USDT rate from CoinDCX public API (cached 5 min)."""
+        if self.margin_currency != "INR":
+            return None
+        now = time.time()
+        if self._inr_rate is not None and (now - self._inr_rate_ts) < 300:
+            return self._inr_rate
+        try:
+            import requests
+            resp = requests.get(
+                "https://api.coindcx.com/exchange/ticker",
+                timeout=5,
+            )
+            resp.raise_for_status()
+            for item in resp.json():
+                if item.get("market") == "USDTINR":
+                    rate = float(item.get("last_price", 0))
+                    if rate > 0:
+                        self._inr_rate = rate
+                        self._inr_rate_ts = now
+                        return rate
+        except Exception as exc:
+            logger.debug("[Wallet] INR rate fetch failed: %s", exc)
+        return self._inr_rate  # return stale if available, else None
+
+    def get_summary(self, inr_rate: Optional[float] = None) -> dict:
         with self.lock:
             open_pos = [p.to_dict() for p in self.positions.values() if p.status == "OPEN"]
             utilized = sum(p.margin_used for p in self.positions.values() if p.status == "OPEN")
-            return {
+            summary = {
                 "wallet_balance": float(round(self.wallet_balance, 4)),
                 "unrealized_pnl": float(round(self.unrealized_pnl_total, 4)),
                 "realized_pnl": float(round(self.realized_pnl_total, 4)),
@@ -1786,23 +1831,48 @@ class EnhancedFuturesWallet:
                 "open_positions": open_pos,
                 "history_count": len(self.position_history),
             }
+            if inr_rate and inr_rate > 0:
+                summary["inr_rate"] = inr_rate
+                summary["wallet_balance_inr"] = round(summary["wallet_balance"] * inr_rate, 2)
+                summary["unrealized_pnl_inr"] = round(summary["unrealized_pnl"] * inr_rate, 2)
+                summary["realized_pnl_inr"] = round(summary["realized_pnl"] * inr_rate, 2)
+                summary["margin_balance_inr"] = round(summary["margin_balance"] * inr_rate, 2)
+                summary["available_inr"] = round(summary["available"] * inr_rate, 2)
+                summary["utilized_inr"] = round(summary["utilized"] * inr_rate, 2)
+            return summary
 
-    def print_summary(self):
-        s = self.get_summary()
+    def print_summary(self, inr_rate=None):
+        if inr_rate is None and self.margin_currency == "INR":
+            inr_rate = self._get_inr_rate()
+        s = self.get_summary(inr_rate=inr_rate)
         print("\n" + "=" * 65)
         print(f"  CRYPTO TRADER v4 — WALLET SUMMARY ({self.symbol})")
         print("=" * 65)
-        print(f"  Wallet Balance    : {s['wallet_balance']:.4f} USDT")
-        print(f"  Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT")
-        print(f"  Realized PnL      : {s['realized_pnl']:.4f} USDT")
-        print(f"  Margin Balance    : {s['margin_balance']:.4f} USDT")
-        print(f"  Utilized          : {s.get('utilized', 0.0):.4f} USDT")
-        print(f"  Available         : {s['available']:.4f} USDT")
+        if "inr_rate" in s:
+            print(f"  Wallet Balance    : {s['wallet_balance']:.4f} USDT  ({s['wallet_balance_inr']:.2f} INR)")
+            print(f"  Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT  ({s['unrealized_pnl_inr']:.2f} INR)")
+            print(f"  Realized PnL      : {s['realized_pnl']:.4f} USDT  ({s['realized_pnl_inr']:.2f} INR)")
+            print(f"  Margin Balance    : {s['margin_balance']:.4f} USDT  ({s['margin_balance_inr']:.2f} INR)")
+            print(f"  Utilized          : {s.get('utilized', 0.0):.4f} USDT  ({s['utilized_inr']:.2f} INR)")
+            print(f"  Available         : {s['available']:.4f} USDT  ({s['available_inr']:.2f} INR)")
+        else:
+            print(f"  Wallet Balance    : {s['wallet_balance']:.4f} USDT")
+            print(f"  Unrealized PnL    : {s['unrealized_pnl']:.4f} USDT")
+            print(f"  Realized PnL      : {s['realized_pnl']:.4f} USDT")
+            print(f"  Margin Balance    : {s['margin_balance']:.4f} USDT")
+            print(f"  Utilized          : {s.get('utilized', 0.0):.4f} USDT")
+            print(f"  Available         : {s['available']:.4f} USDT")
         print(f"  Open Positions    : {s['open_count']}")
         for p in s["open_positions"]:
-            print(f"    → {p['symbol']} {p['side']} | Playbook={p['playbook']} | "
-                  f"Entry={p['entry_price']:.2f} | RemQty={p['remaining_quantity']:.4f} | "
-                  f"U-PnL={p['unrealized_pnl']:.4f} ({p['unrealized_pnl']/p['margin_used']*100:.2f}%)")
+            if "inr_rate" in s:
+                pnl_inr = round(float(p['unrealized_pnl']) * s['inr_rate'], 2)
+                print(f"    → {p['symbol']} {p['side']} | Playbook={p['playbook']} | "
+                      f"Entry={p['entry_price']:.2f} | RemQty={p['remaining_quantity']:.4f} | "
+                      f"U-PnL={p['unrealized_pnl']:.4f} ({p['unrealized_pnl']/p['margin_used']*100:.2f}%)  ({pnl_inr:.2f} INR)")
+            else:
+                print(f"    → {p['symbol']} {p['side']} | Playbook={p['playbook']} | "
+                      f"Entry={p['entry_price']:.2f} | RemQty={p['remaining_quantity']:.4f} | "
+                      f"U-PnL={p['unrealized_pnl']:.4f} ({p['unrealized_pnl']/p['margin_used']*100:.2f}%)")
         print("=" * 65 + "\n")
 
 
@@ -1989,6 +2059,13 @@ class EnhancedFuturesWallet:
             encoded_state,
             max_snapshots=self.max_snapshots,
         )
+        # Cache to Redis for fast reads (degrades gracefully if Redis is down)
+        if self._redis_cache is not None:
+            self._redis_cache.put_snapshot(json_compatible_state)
+            self._redis_cache.put_positions([
+                p.to_dict() for p in self.positions.values() if getattr(p, "status", "") == "OPEN"
+            ])
+            self._redis_cache.publish_update(json_compatible_state)
 
     def _atomic_write_json(self, path: Path, state: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2854,8 +2931,43 @@ class EnhancedFuturesWallet:
                 p.unrealized_pnl for p in self.positions.values() if p.status == "OPEN"
             )
 
+    def _hydrate_from_state(self, state: dict):
+        """Populate wallet attributes from a deserialized state dict."""
+        self.wallet_balance = self._to_decimal(state.get("wallet_balance", self.wallet_balance))
+        self.realized_pnl_total = self._to_decimal(state.get("realized_pnl_total", Decimal("0")))
+        self.maker_fee_rate = self._to_decimal(state.get("maker_fee_rate", self.maker_fee_rate))
+        self.taker_fee_rate = self._to_decimal(state.get("taker_fee_rate", self.taker_fee_rate))
+        self.maintenance_margin_ratio = self._to_decimal(state.get("maintenance_margin_ratio", self.maintenance_margin_ratio))
+        self.positions = {
+            s: EnhancedPosition.from_dict(d)
+            for s, d in state.get("positions", {}).items()
+            if d.get("status") == "OPEN"
+        }
+        self.position_history = state.get("position_history", [])
+        self._runtime_reducer_state = self._deserialize_reducer_state(state)
+        self._sync_positions_from_reducer()
+        self._sync_orders_from_reducer()
+        self._sync_fills_from_reducer()
+        self._sync_unrealized_total()
+
     def _load_state(self):
         start_time = time.time()
+        # 1. Try Redis hot-cache first (sub-millisecond read)
+        if self._redis_cache is not None:
+            cached = self._redis_cache.get_snapshot()
+            if cached is not None:
+                try:
+                    self._hydrate_from_state(cached)
+                    logger.info("[Wallet] Loaded state from Redis cache")
+                    self.replay_duration_ms = 0.0
+                    self.delta_size = 0
+                    self.recovery_latency_ms = (time.time() - start_time) * 1000.0
+                    return
+                except Exception as exc:
+                    logger.warning("[Wallet] Redis cache corrupt — falling back to DB: %s", exc)
+                    self._redis_cache.invalidate()
+
+        # 2. Fall back to DB snapshot + replay
         if self._load_from_db_snapshot_and_replay():
             try:
                 self.assert_runtime_matches_replay()
@@ -2866,23 +2978,7 @@ class EnhancedFuturesWallet:
             return
         try:
             state = self._load_state_with_recovery()
-            self.wallet_balance = self._to_decimal(state.get("wallet_balance", self.wallet_balance))
-            self.realized_pnl_total = self._to_decimal(state.get("realized_pnl_total", Decimal("0")))
-            self.maker_fee_rate = self._to_decimal(state.get("maker_fee_rate", self.maker_fee_rate))
-            self.taker_fee_rate = self._to_decimal(state.get("taker_fee_rate", self.taker_fee_rate))
-            self.maintenance_margin_ratio = self._to_decimal(state.get("maintenance_margin_ratio", self.maintenance_margin_ratio))
-            self.positions = {
-                s: EnhancedPosition.from_dict(d)
-                for s, d in state.get("positions", {}).items()
-                if d.get("status") == "OPEN"
-            }
-            self.position_history = state.get("position_history", [])
-            
-            self._runtime_reducer_state = self._deserialize_reducer_state(state)
-            self._sync_positions_from_reducer()
-            self._sync_orders_from_reducer()
-            self._sync_fills_from_reducer()
-            self._sync_unrealized_total()
+            self._hydrate_from_state(state)
             logger.info(f"Loaded wallet state from {self.state_file}")
 
             self.replay_duration_ms = 0.0

@@ -305,6 +305,8 @@ def main():
         state_namespace=cfg.mode.value,
         database_url=cfg.database_url,
         event_bus=bus,
+        redis_url=cfg.redis_url,
+        margin_currency=cfg.coindcx_margin_currency,
     )
     
     event_store = None

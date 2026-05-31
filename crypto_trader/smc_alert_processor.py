@@ -109,6 +109,13 @@ class SMCAlertProcessor:
         prompt = _build_smc_prompt(event)
         logger.info("[SMC-ALERT] %s %s → querying LLM", event.symbol, event.alert_type)
 
+        if self.llm is None:
+            logger.warning("[SMC-ALERT] No LLM client available — skipping commentary")
+            return
+        if not hasattr(self.llm, "generate"):
+            logger.error("[SMC-ALERT] LLM client %s has no 'generate' method — skipping commentary", type(self.llm).__name__)
+            return
+
         try:
             commentary = self.llm.generate(prompt, temperature=0.3, system_prompt=SMC_COMMENTARY_SYSTEM)
         except Exception as e:

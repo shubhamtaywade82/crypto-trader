@@ -104,7 +104,11 @@ class OllamaLocalProvider:
             logger.info(f"[OllamaLocal] Attempting request using host index {idx} ({host})")
 
             try:
-                resp = self.session.post(f"{host}/api/chat", json=payload, timeout=timeout_s)
+                # Split timeout: fast connect fail (2s) + read timeout from caller.
+                # This prevents hanging for 30s when localhost Ollama is not running.
+                connect_timeout = min(2, timeout_s)
+                read_timeout = max(5, timeout_s - connect_timeout)
+                resp = self.session.post(f"{host}/api/chat", json=payload, timeout=(connect_timeout, read_timeout))
                 resp.raise_for_status()
                 # On success, clear cooldown and circuit breaker failure count
                 self.rotator.record_success(idx)

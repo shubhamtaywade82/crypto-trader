@@ -179,6 +179,8 @@ class WebSocketTradingEngine:
                 # Default to "paper" when no cfg — never write a live namespace
                 # without an explicit live config.
                 state_namespace=(cfg.mode.value if cfg else "paper"),
+                redis_url=(cfg.redis_url if cfg else ""),
+                margin_currency=(cfg.coindcx_margin_currency if cfg else "USDT"),
             )
 
         if cfg:

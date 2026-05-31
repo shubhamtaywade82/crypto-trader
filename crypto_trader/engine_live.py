@@ -82,6 +82,8 @@ class LiveTradingSystem:
             require_venue_sl=self.cfg.require_venue_sl,
             software_sl_backup_bps=self.cfg.software_sl_backup_bps,
             database_url=self.cfg.database_url,
+            redis_url=self.cfg.redis_url,
+            margin_currency=self.cfg.coindcx_margin_currency,
         )
 
     # ── construction ──────────────────────────────────────────────────────
