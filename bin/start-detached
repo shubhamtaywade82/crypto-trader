@@ -22,6 +22,7 @@ mkdir -p logs
 TS=$(date +%Y%m%d_%H%M%S)
 API_LOG="logs/api_${TS}.log"
 BOT_LOG="logs/bot_${TS}.log"
+export PYTHONUNBUFFERED=1
 
 echo "--- Infrastructure (Postgres, Redis) ---"
 docker compose up -d postgres redis >/dev/null 2>&1 || true

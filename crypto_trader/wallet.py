@@ -1864,14 +1864,17 @@ class EnhancedFuturesWallet:
             print(f"  Available         : {s['available']:.4f} USDT")
         print(f"  Open Positions    : {s['open_count']}")
         for p in s["open_positions"]:
+            util_pct = (float(p['margin_used']) / s['wallet_balance'] * 100) if s['wallet_balance'] > 0 else 0
             if "inr_rate" in s:
                 pnl_inr = round(float(p['unrealized_pnl']) * s['inr_rate'], 2)
                 print(f"    → {p['symbol']} {p['side']} | Playbook={p['playbook']} | "
                       f"Entry={p['entry_price']:.2f} | RemQty={p['remaining_quantity']:.4f} | "
+                      f"Margin={float(p['margin_used']):.2f} ({util_pct:.1f}%) | "
                       f"U-PnL={p['unrealized_pnl']:.4f} ({p['unrealized_pnl']/p['margin_used']*100:.2f}%)  ({pnl_inr:.2f} INR)")
             else:
                 print(f"    → {p['symbol']} {p['side']} | Playbook={p['playbook']} | "
                       f"Entry={p['entry_price']:.2f} | RemQty={p['remaining_quantity']:.4f} | "
+                      f"Margin={float(p['margin_used']):.2f} ({util_pct:.1f}%) | "
                       f"U-PnL={p['unrealized_pnl']:.4f} ({p['unrealized_pnl']/p['margin_used']*100:.2f}%)")
         print("=" * 65 + "\n")
 
