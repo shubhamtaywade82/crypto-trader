@@ -1763,8 +1763,8 @@ class WebSocketTradingEngine:
         if self.playbook_smc is None:
             return
 
-        df_smc = data.get("df_smc") or data.get("df_15m")
-        df_smc_htf = data.get("df_smc_htf") or data.get("df_4h")
+        df_smc = data.get("df_smc") if data.get("df_smc") is not None else data.get("df_15m")
+        df_smc_htf = data.get("df_smc_htf") if data.get("df_smc_htf") is not None else data.get("df_4h")
         if df_smc is None:
             logger.warning("[SMC ENTRY] %s — no entry-TF klines available", self.symbol)
             return
@@ -1844,8 +1844,8 @@ class WebSocketTradingEngine:
         """
         if self.playbook_lsw is None:
             return
-        df_lsw = data.get("df_lsw") or data.get("df_15m")
-        df_lsw_htf = data.get("df_lsw_htf") or data.get("df_4h")
+        df_lsw = data.get("df_lsw") if data.get("df_lsw") is not None else data.get("df_15m")
+        df_lsw_htf = data.get("df_lsw_htf") if data.get("df_lsw_htf") is not None else data.get("df_4h")
         if df_lsw is None:
             logger.warning("[LSW ENTRY] %s — no entry-TF klines available", self.symbol)
             return
@@ -1900,8 +1900,8 @@ class WebSocketTradingEngine:
         5m breakout → engulfing → wide-R TP. Exits via standard wallet SL/TP/time-stop."""
         if self.playbook_mta is None:
             return
-        df_mta = data.get("df_mta") or data.get("df_5m")
-        macro = data.get("df_mta_macro") or {"1h": data.get("df_1h"), "4h": data.get("df_4h")}
+        df_mta = data.get("df_mta") if data.get("df_mta") is not None else data.get("df_5m")
+        macro = data.get("df_mta_macro") if data.get("df_mta_macro") is not None else {"1h": data.get("df_1h"), "4h": data.get("df_4h")}
         if df_mta is None:
             logger.warning("[MTA ENTRY] %s — no entry-TF klines", self.symbol)
             return
@@ -2141,6 +2141,9 @@ class WebSocketTradingEngine:
                 # An exception mid-entry could leave an unmanaged live position.
                 # Fail safe: HALT and trip the kill switch.
                 logger.critical("[ENTRY FAILURE] %s — halting and reconciling: %s", self.symbol, e, exc_info=True)
+                import traceback
+                with open("/tmp/bot_error.txt", "w") as f:
+                    f.write(traceback.format_exc())
                 self._halted = True
                 if getattr(self, "risk_manager", None) is not None:
                     self.risk_manager.trigger_kill_switch(f"entry failure: {e}")

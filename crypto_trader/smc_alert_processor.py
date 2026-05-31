@@ -110,7 +110,7 @@ class SMCAlertProcessor:
         logger.info("[SMC-ALERT] %s %s → querying LLM", event.symbol, event.alert_type)
 
         try:
-            commentary = self.llm.generate(prompt, temperature=0.3)
+            commentary = self.llm.generate(prompt, temperature=0.3, system_prompt=SMC_COMMENTARY_SYSTEM)
         except Exception as e:
             logger.error("[SMC-ALERT] LLM call failed: %s", e)
             return

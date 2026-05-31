@@ -407,16 +407,16 @@ class OllamaClient:
         except Exception:
             return self.api_key != "" # Fallback for remote native Ollama with auth
 
-    def generate(self, prompt: str, temperature: float = 0.3) -> Optional[str]:
+    def generate(self, prompt: str, temperature: float = 0.3, system_prompt: Optional[str] = None) -> Optional[str]:
         if self.use_openai:
-            return self._generate_openai(prompt, temperature)
-        return self._generate_ollama(prompt, temperature)
+            return self._generate_openai(prompt, temperature, system_prompt)
+        return self._generate_ollama(prompt, temperature, system_prompt)
 
-    def _generate_ollama(self, prompt: str, temperature: float = 0.3) -> Optional[str]:
+    def _generate_ollama(self, prompt: str, temperature: float = 0.3, system_prompt: Optional[str] = None) -> Optional[str]:
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "system": SYSTEM_PROMPT,
+            "system": system_prompt if system_prompt is not None else SYSTEM_PROMPT,
             "stream": False,
             "think": False,
             "options": {"temperature": temperature, "num_predict": self.max_tokens},
@@ -437,11 +437,11 @@ class OllamaClient:
                 logger.warning(f"Ollama request failed: {e}")
                 return None
 
-    def _generate_openai(self, prompt: str, temperature: float = 0.3) -> Optional[str]:
+    def _generate_openai(self, prompt: str, temperature: float = 0.3, system_prompt: Optional[str] = None) -> Optional[str]:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt if system_prompt is not None else SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ],
             "temperature": temperature,
@@ -796,6 +796,22 @@ class OllamaAdvisor:
             advice.risk_level.value, latency_ms, advice.veto,
         )
         return advice
+
+    def generate(self, prompt: str, temperature: float = 0.3, system_prompt: Optional[str] = None) -> Optional[str]:
+        """Simple passthrough for unstructured tasks like SMC commentary."""
+        if not self.circuit_breaker.can_use():
+            logger.warning("[LLM] Circuit breaker active. LLM generate disabled.")
+            return None
+            
+        start = time.perf_counter()
+        raw = self.client.generate(prompt, temperature, system_prompt)
+        
+        if raw is None:
+            self.circuit_breaker.record_failure()
+            return None
+            
+        self.circuit_breaker.record_success()
+        return raw
 
     def get_advice_async(self, **kwargs) -> threading.Thread:
         def _worker():
