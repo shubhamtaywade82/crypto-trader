@@ -132,13 +132,19 @@ class LiveTradingSystem:
         checks: List[Check] = []
 
         # Safe-mode gate only applies to LIVE (real money), not SANDBOX.
+        # HALT = hard fail. PLACE_ORDER=false = read-only live (starts + syncs, no
+        # orders) → non-critical pass, mirroring run_venue_preflight.
         if self.cfg.is_live:
-            gate_open = safe_mode.is_live_enabled()
-            gate_detail = "open" if gate_open else (
-                f"need {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', "
-                f"{safe_mode.PLACE_ORDER_ENV}=true (or unset), no HALT file"
-            )
-            checks.append(Check("safe_mode_gate", gate_open, gate_detail))
+            if safe_mode.HALT_FILE.exists():
+                checks.append(Check("safe_mode_gate", False, f"HALT file present at {safe_mode.HALT_FILE}"))
+            elif not safe_mode.order_execution_enabled():
+                checks.append(Check(
+                    "safe_mode_gate", True,
+                    f"read-only live ({safe_mode.PLACE_ORDER_ENV}=false) — no orders will be sent",
+                    critical=False,
+                ))
+            else:
+                checks.append(Check("safe_mode_gate", True, "open", critical=False))
         else:
             checks.append(Check("safe_mode_gate", True, "sandbox — no real-money gate required", critical=False))
 
@@ -511,14 +517,23 @@ def run_venue_preflight(
 
     logger.info("Running venue preflight checks for %d symbol(s): %s", len(symbols), ", ".join(symbols))
 
-    # 1. Safe-mode gate
-    if not safe_mode.is_live_enabled():
+    # 1. Safe-mode gate. HALT is a HARD block. PLACE_ORDER=false is READ-ONLY live:
+    # the engine starts and syncs the venue (positions/balance/orders via WS + REST),
+    # but every order mutation is still blocked at execution time by
+    # assert_live_allowed — so no real orders are sent. Allow startup so live sync
+    # (and the AI position manager's WS realtime path) can be observed safely.
+    if safe_mode.HALT_FILE.exists():
         logger.critical(
-            "LIVE TRADING BLOCKED — Safe-mode gate is closed. "
-            "Ensure %s=true, %s='%s', and no active HALT file exists.",
-            safe_mode.LIVE_ENV_VAR, safe_mode.ACK_ENV_VAR, safe_mode.ACK_PHRASE,
+            "LIVE TRADING BLOCKED — HALT file present at %s. Remove it to start.",
+            safe_mode.HALT_FILE,
         )
         return False
+    if not safe_mode.order_execution_enabled():
+        logger.warning(
+            "[PREFLIGHT] READ-ONLY live mode (%s=false): engine starts and syncs the "
+            "venue, but NO orders will be sent. Set %s=true to enable real execution.",
+            safe_mode.PLACE_ORDER_ENV, safe_mode.PLACE_ORDER_ENV,
+        )
 
     # 2. CoinDCX auth + balance
     mc = cfg.coindcx_margin_currency

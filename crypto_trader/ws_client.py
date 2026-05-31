@@ -431,11 +431,19 @@ class WebSocketPositionManager:
         health_check = None,             # callable(): authoritative margin guard
         health_interval_s: float = 5.0,  # how often to run it (REST-bound)
         feed_stale_ms: int = 15000,      # max price age before exits are skipped
+        defer_exits: bool = False,       # cede discretionary SL/TP/trail to AI manager
     ):
         self.ws = ws_feed
         self.wallet = wallet
         self.event_bus = event_bus
         self.symbol = self.ws.symbol.upper()
+        # When True, this manager stops issuing discretionary software SL/TP/trailing
+        # exits — that ownership passes to the AI PositionManager (Stage D). PnL
+        # updates and the authoritative liquidation/margin health guard STILL run, so
+        # the hard-safety net is preserved. Toggled by the launcher via the
+        # WS_PM_DEFER_EXITS flag once the AI manager is actively managing (not
+        # audit-only), to guarantee a single owner of discretionary exits.
+        self.defer_exits = defer_exits
         self.check_interval_ms = check_interval_ms
         self.feed_stale_ms = feed_stale_ms
         self.wick_buffer = deque(maxlen=wick_buffer_size)
@@ -552,9 +560,16 @@ class WebSocketPositionManager:
         # Update PnL using real-time LTP for higher reactivity
         pos.update_pnl(price_for_trail)
         pnl = pos.unrealized_pnl
-        
+
         # Sync global wallet total on EACH tick
         self.wallet._sync_unrealized_total()
+
+        # Stage D: discretionary exit ownership ceded to the AI PositionManager.
+        # PnL + wallet sync above (and the authoritative health guard on the monitor
+        # loop) still run; only the software SL/TP/trailing decisions below are
+        # skipped, so exactly one path issues discretionary exits.
+        if self.defer_exits:
+            return
 
         # Log live PnL every 10 seconds
         now = time.time()

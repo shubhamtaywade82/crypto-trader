@@ -147,6 +147,58 @@ def run_preflight_checks(
         cfg = load_config()
     return run_venue_preflight(symbols, wallet, execution_engine, risk, bus, cfg)
 
+def _build_pm_user_stream(cfg, wallet, execution_engine, manager):
+    """Construct a CoinDCX WS user stream that feeds the AI position manager.
+
+    Realtime path: ``on_position`` → ``manager.on_ws_position_event`` (drives the
+    sync_service so manually-opened venue positions are discovered live), and
+    ``on_balance`` keeps ``wallet.wallet_balance`` current (USDT direct; other
+    margin currencies converted via the venue rate). The sync_service REST
+    bootstrap + 30s reconcile remain the fallback when the stream is down.
+
+    ``on_fill`` only nudges the manager to reassess — it does NOT re-book the fill
+    (the entry path already books venue fills synchronously via open_position), so
+    there is no double-counting.
+    """
+    from .exchanges.coindcx_user_stream import CoinDCXUserStream
+
+    margin_ccy = cfg.coindcx_margin_currency.upper()
+
+    def _on_balance(currency, balance):
+        try:
+            bal = float(balance)
+            if margin_ccy != "USDT":
+                conv_raw = execution_engine.get_usdt_conversion()
+                conv = float(conv_raw) if conv_raw else 0.0
+                if conv <= 0:
+                    logger.warning("[PM-WS] balance update skipped: USDT/%s rate unavailable", margin_ccy)
+                    return
+                bal = bal / conv
+            wallet.wallet_balance = wallet._to_decimal(bal)
+            logger.debug("[PM-WS] balance update → %.4f USDT", bal)
+        except Exception as e:
+            logger.debug("[PM-WS] on_balance failed: %s", e)
+
+    def _on_fill(fill):
+        try:
+            sym = (fill or {}).get("symbol") or (fill or {}).get("pair")
+            if sym:
+                manager.on_fill(str(sym).upper())
+        except Exception as e:
+            logger.debug("[PM-WS] on_fill failed: %s", e)
+
+    return CoinDCXUserStream(
+        api_key=cfg.coindcx_api_key,
+        api_secret=cfg.coindcx_api_secret,
+        bus=bus,
+        url=cfg.coindcx_stream_url,
+        channel=cfg.coindcx_stream_channel,
+        on_fill=_on_fill,
+        on_balance=_on_balance,
+        on_position=manager.on_ws_position_event,
+    )
+
+
 def run_engine(engine: WebSocketTradingEngine, tick: int = 300):
     try:
         engine.run_loop(signal_interval_seconds=tick)
@@ -227,6 +279,19 @@ def main():
     # Reuse the SAME cfg object loaded above (carries any CLI leverage override) so
     # the wallet, projections, and per-symbol engines all share one config.
     cfg = _early_cfg
+
+    # Fleet-wide warning: champions routing is ON but the offline-selected
+    # champions file is absent → every engine sets _champion_no_trade and SKIPS
+    # ALL new entries (silent no-trade). Warn once here instead of per-engine.
+    if cfg.use_strategy_champions:
+        from crypto_trader.selection.champions import CHAMPIONS_PATH
+        if not CHAMPIONS_PATH.exists():
+            logger.warning(
+                "USE_STRATEGY_CHAMPIONS=true but %s is MISSING — all symbols will "
+                "NO-TRADE until it is generated (run: python -m crypto_trader.selection.cli "
+                "--symbols %s, or bin/refresh-champions.sh).",
+                CHAMPIONS_PATH, ",".join(symbols),
+            )
 
     # Create one shared wallet for all engines
     global_wallet = EnhancedFuturesWallet(
@@ -331,6 +396,81 @@ def main():
     smc_processor = SMCAlertProcessor(event_bus=bus, telegram_service=tg_service)
     smc_processor.start()
 
+    # ── AI position-management system (3-layer) ───────────────────────────
+    # ONE manager over the shared global_wallet (it manages ALL positions across
+    # symbols). Each per-symbol engine forwards tick/candle/fill events into it
+    # (set via engine.position_manager below, mirroring engine.risk_manager).
+    #
+    # Rollout safety: starts in AUDIT-ONLY (dry_run) by default in BOTH modes —
+    # it scores/assesses/audits without mutating the wallet. Flip with
+    # POSITION_MANAGER_AUDIT_ONLY=false once the audit trail has been validated
+    # (Stage D also requires deferring the old WebSocketPositionManager exits via
+    # the WS_PM_DEFER_EXITS flag, so only ONE path issues discretionary exits).
+    manager = None
+    pm_enabled = os.getenv("POSITION_MANAGER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+    if pm_enabled:
+        try:
+            from crypto_trader.position_management import build_manager
+            from crypto_trader.data_feed import BinanceDataFeed
+
+            pm_audit_only = os.getenv("POSITION_MANAGER_AUDIT_ONLY", "true").strip().lower() not in {"0", "false", "no", "off"}
+            # dry_run when paper OR explicitly audit-only. In live + audit_only=false
+            # the manager actively manages positions on the venue.
+            manager_dry_run = (not cfg.is_live) or pm_audit_only
+
+            # LLM advisory router (Ollama local→cloud, env-driven). None disables the
+            # LLM and AIAssessor falls back to the deterministic ActionScorer.
+            pm_llm_router = None
+            if not args.no_llm:
+                try:
+                    from crypto_trader.ai.router import build_router
+                    pm_llm_router = build_router()
+                except Exception as e:
+                    logger.warning("[PM] LLM router unavailable, using deterministic scorer: %s", e)
+
+            try:
+                pm_max_risk = float(os.getenv("POSITION_MANAGER_MAX_RISK", "") or (float(total_balance) * 0.5))
+            except (TypeError, ValueError):
+                pm_max_risk = float(total_balance) * 0.5
+
+            # Optional realtime CoinDCX user stream (live only). Gives WS realtime
+            # position/balance/fill sync; sync_service's REST bootstrap + 30s
+            # reconcile (via rest_client) is the fallback. Constructed here but the
+            # on_position callback routes into the manager's sync_service.
+            pm_user_stream = None
+
+            manager = build_manager(
+                global_wallet,
+                data_feed=BinanceDataFeed(),
+                llm_router=pm_llm_router,
+                exchange_execution=execution_engine if cfg.is_live else None,
+                # rest_client must expose get_positions() — that lives on
+                # CoinDCXExecutionEngine, not the raw CoinDCXClient.
+                rest_client=execution_engine if cfg.is_live else None,
+                ws_user_stream=pm_user_stream,
+                database_url=cfg.database_url,
+                max_portfolio_risk=pm_max_risk,
+                dry_run=manager_dry_run,
+            )
+
+            if cfg.is_live and execution_engine is not None and cfg.coindcx_user_stream_enabled:
+                pm_user_stream = _build_pm_user_stream(cfg, global_wallet, execution_engine, manager)
+                manager.sync_service.ws = pm_user_stream
+
+            manager.start()
+            if pm_user_stream is not None:
+                pm_user_stream.start()
+            logger.info(
+                "[PM] AI position manager started (mode=%s, dry_run=%s, llm=%s, ws_realtime=%s, max_risk=%.2f)",
+                cfg.mode.value, manager_dry_run, pm_llm_router is not None,
+                pm_user_stream is not None, pm_max_risk,
+            )
+        except Exception as e:
+            logger.error("[PM] Failed to start AI position manager: %s", e, exc_info=True)
+            manager = None
+    else:
+        logger.info("[PM] AI position manager disabled (POSITION_MANAGER_ENABLED=false)")
+
     # Divide total balance equally among symbols to prevent overallocation
     per_symbol_balance = total_balance / len(symbols)
 
@@ -364,6 +504,7 @@ def main():
             risk_budget_fraction=risk_fraction,
         )
         engine.risk_manager = global_risk  # Share the global risk manager
+        engine.position_manager = manager  # Share the global AI position manager (may be None)
         engines.append(engine)
         
         # Stagger startup to avoid Binance rate limits (max 5 connections per second)
@@ -382,6 +523,11 @@ def main():
     except KeyboardInterrupt:
         logger.info("Multi-engine shutting down via KeyboardInterrupt...")
     finally:
+        if manager is not None:
+            try:
+                manager.stop()
+            except Exception as e:
+                logger.error("[PM] Failed to stop AI position manager cleanly: %s", e)
         for engine in engines:
             engine.stop()
         try:

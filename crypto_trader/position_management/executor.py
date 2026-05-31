@@ -19,7 +19,6 @@ Supported execution types:
 from __future__ import annotations
 
 import logging
-import time
 from typing import Optional
 
 from .schemas import (
@@ -143,31 +142,28 @@ class PositionExecutor:
     ) -> str:
         exit_pct = params.exit_qty_pct or 0.5
         exit_pct = max(0.01, min(0.99, exit_pct))  # never full-exit via partial path
-        total_qty = inp.position.qty
-        exit_qty = total_qty * exit_pct
         ltp = inp.position.ltp
 
         logger.info(
-            "[Executor] Partial exit %s: qty=%.4f (%.0f%%) at %.4f",
-            symbol, exit_qty, exit_pct * 100, ltp,
+            "[Executor] Partial exit %s: %.0f%% at %.4f", symbol, exit_pct * 100, ltp,
         )
 
-        if self._is_live(symbol) and self.execution:
-            return self._exchange_partial_exit(symbol, exit_qty, ltp, inp)
-
-        # Paper mode — emit wallet event
-        self._wallet_partial_close(symbol, exit_qty, ltp)
+        # Route through the canonical wallet path. ``partial_close`` handles BOTH
+        # paper and live (venue reduce-only fill, protective-order cancel+replace,
+        # fee/TDS/PnL booking, event emission) — so we do NOT place a separate venue
+        # order here, which would double-execute in live mode and bypass accounting.
+        self.wallet.partial_close(symbol, ltp, pct=exit_pct, reason="position_management")
         return "ok"
 
     def _full_exit(self, symbol: str, inp: PositionManagementInput) -> str:
         ltp = inp.position.ltp
-        qty = inp.position.qty
-        logger.info("[Executor] Full exit %s: qty=%.4f at %.4f", symbol, qty, ltp)
+        logger.info("[Executor] Full exit %s at %.4f", symbol, ltp)
 
-        if self._is_live(symbol) and self.execution:
-            return self._exchange_full_exit(symbol, qty, ltp, inp)
-
-        self._wallet_close(symbol, ltp)
+        # ``close_position`` is the single source of truth for exits: it performs the
+        # venue exit fill (live) or simulated fill (paper), cancels protective orders,
+        # books fees/TDS/realized PnL to the balance, and emits POSITION_CLOSED. This
+        # replaces the hand-rolled close that bypassed PnL-to-balance accounting.
+        self.wallet.close_position(symbol, ltp, reason="position_management")
         return "ok"
 
     def _scale_in(
@@ -201,57 +197,6 @@ class PositionExecutor:
                     "sl_price": str(new_sl),
                     "source": "position_management",
                 })
-
-    def _wallet_partial_close(self, symbol: str, qty: float, price: float):
-        from decimal import Decimal
-        with self.wallet.lock:
-            pos = self.wallet.positions.get(symbol)
-            if pos is None or pos.status != "OPEN":
-                return
-            entry = float(pos.entry_price)
-            if pos.side.value == "LONG":
-                pnl = (price - entry) * qty
-            else:
-                pnl = (entry - price) * qty
-            fee = qty * price * float(self.wallet.taker_fee_rate)
-            pos.remaining_quantity = max(
-                Decimal("0"),
-                pos.remaining_quantity - Decimal(str(qty)),
-            )
-            pos.partial_realized_pnl += Decimal(str(pnl - fee))
-            self.wallet._emit_event("POSITION_PARTIALLY_CLOSED", {
-                "symbol": symbol,
-                "closed_qty": str(qty),
-                "close_price": str(price),
-                "pnl": str(pnl - fee),
-                "fee": str(fee),
-                "source": "position_management",
-            })
-
-    def _wallet_close(self, symbol: str, price: float):
-        from decimal import Decimal
-        with self.wallet.lock:
-            pos = self.wallet.positions.get(symbol)
-            if pos is None or pos.status != "OPEN":
-                return
-            entry = float(pos.entry_price)
-            qty = float(pos.remaining_quantity)
-            if pos.side.value == "LONG":
-                pnl = (price - entry) * qty
-            else:
-                pnl = (entry - price) * qty
-            fee = qty * price * float(self.wallet.taker_fee_rate)
-            pos.status = "CLOSED"
-            pos.close_price = Decimal(str(price))
-            pos.close_time = int(time.time() * 1000)
-            pos.close_reason = "position_management"
-            self.wallet._emit_event("POSITION_CLOSED", {
-                "symbol": symbol,
-                "remaining_pnl": str(pnl - fee),
-                "fee": str(fee),
-                "close_price": str(price),
-                "close_reason": "position_management",
-            })
 
     # ── Exchange helpers (live mode) ──────────────────────────────────────
 
@@ -289,38 +234,6 @@ class PositionExecutor:
             return "ok"
         except Exception as exc:
             logger.error("[Executor] exchange_replace_sl failed for %s: %s", symbol, exc)
-            return f"error:{exc}"
-
-    def _exchange_partial_exit(
-        self, symbol: str, qty: float, price: float, inp: PositionManagementInput
-    ) -> str:
-        try:
-            side_str = "SELL" if inp.position.side == "LONG" else "BUY"
-            if hasattr(self.execution, "place_market_order"):
-                self.execution.place_market_order(
-                    symbol=symbol, side=side_str, quantity=qty, reduce_only=True
-                )
-                self._wallet_partial_close(symbol, qty, price)
-            return "ok"
-        except Exception as exc:
-            logger.error("[Executor] exchange_partial_exit failed for %s: %s", symbol, exc)
-            return f"error:{exc}"
-
-    def _exchange_full_exit(
-        self, symbol: str, qty: float, price: float, inp: PositionManagementInput
-    ) -> str:
-        try:
-            side_str = "SELL" if inp.position.side == "LONG" else "BUY"
-            if hasattr(self.execution, "close_position"):
-                self.execution.close_position(symbol=symbol, side=side_str, quantity=qty)
-            else:
-                self.execution.place_market_order(
-                    symbol=symbol, side=side_str, quantity=qty, reduce_only=True
-                )
-            self._wallet_close(symbol, price)
-            return "ok"
-        except Exception as exc:
-            logger.error("[Executor] exchange_full_exit failed for %s: %s", symbol, exc)
             return f"error:{exc}"
 
     def _exchange_scale_in(

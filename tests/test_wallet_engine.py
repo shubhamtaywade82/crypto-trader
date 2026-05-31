@@ -509,3 +509,26 @@ def test_ai_and_regime_reversal_exits(tmp_path, monkeypatch):
     assert w3.get_open_position("SOLUSDT") is None
     assert w3.position_history[0]["close_reason"] == "REGIME_REVERSAL_EXIT"
 
+
+def test_bot_open_marks_source_bot(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("BTCUSDT")
+    p = w.open_position("BTCUSDT", _setup(), mark_price=100)
+    assert p is not None
+    assert p.source == "bot"
+    assert p.opened_externally is False
+    # Round-trips through (de)serialization.
+    assert p.to_dict()["source"] == "bot"
+
+
+def test_adopt_marks_source_manual(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    w = _fresh_wallet("ETHUSDT")
+    p = w.adopt_venue_position(
+        "ETHUSDT", PositionSide.LONG, quantity=1.0, entry_price=100.0, mark_price=100.0
+    )
+    assert p is not None
+    assert p.source == "manual"
+    assert p.opened_externally is True
+    assert p.to_dict()["opened_externally"] is True
+

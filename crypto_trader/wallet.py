@@ -220,6 +220,8 @@ class PortfolioReducer:
                     "trailing_active": bool(payload.get("trailing_active", False)),
                     "protective_orders": {},
                     "mode": payload.get("mode", "live" if et == "POSITION_ADOPTED" else "paper"),
+                    "source": payload.get("source", "manual" if et == "POSITION_ADOPTED" else "bot"),
+                    "opened_externally": bool(payload.get("opened_externally", et == "POSITION_ADOPTED")),
                 }
             return
 
@@ -344,6 +346,13 @@ class EnhancedPosition:
     # Resting protective orders placed on the venue (F1): {"sl": id, "tp": id}.
     protective_orders: dict = field(default_factory=dict)
     mode: str = "paper"
+    # Origin of the position: "bot" (opened by a strategy signal) vs "manual"/"external"
+    # (discovered on the venue, not opened by this engine). Mirrors the
+    # ``positions_managed.source``/``opened_externally`` columns so the in-memory model
+    # can distinguish bot-managed from manually-opened positions (used by the AI
+    # position-management sync_service / protection_manager).
+    source: str = "bot"
+    opened_externally: bool = False
 
     def __post_init__(self):
         if self.highest_price is None:
@@ -419,6 +428,8 @@ class EnhancedPosition:
             "tds_paid": self.tds_paid,
             "protective_orders": self.protective_orders,
             "mode": self.mode,
+            "source": self.source,
+            "opened_externally": self.opened_externally,
         }
 
     @classmethod
@@ -1298,6 +1309,8 @@ class EnhancedFuturesWallet:
                 sl_price=sl_price,
                 tp_levels=[],
                 mode="live",
+                source="manual",
+                opened_externally=True,
             )
             if mark_price is not None and self._to_decimal(mark_price) > Decimal("0"):
                 pos.update_pnl(self._to_decimal(mark_price))
@@ -1325,6 +1338,8 @@ class EnhancedFuturesWallet:
                     "tp_levels": [],
                     "adopted": True,
                     "mode": "live",
+                    "source": "manual",
+                    "opened_externally": True,
                 },
             )
             # Rest a protective SL on the venue (live only) so the adopted

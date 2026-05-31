@@ -145,6 +145,12 @@ class WebSocketTradingEngine:
         # CoinDCX market data for the cross-venue basis guard (F3). Public, no
         # creds; built lazily so paper/tests without network stay light.
         self._coindcx_md = None
+        # Shared global AI position manager (set by the launcher, e.g.
+        # multi_engine, after construction — mirrors ``self.risk_manager``). When
+        # present, this engine forwards tick/candle/fill events into it so the
+        # 3-layer position-management system can reassess open positions. None →
+        # the old per-engine WebSocketPositionManager remains the sole manager.
+        self.position_manager = None
 
         rest_logged = log_responses or log_rest
         ws_logged = log_responses or log_ws
@@ -297,6 +303,10 @@ class WebSocketTradingEngine:
             health_check=self._check_authoritative_health,
             # A1: skip software exits on prices older than this.
             feed_stale_ms=(cfg.feed_stale_ms if cfg else 15000),
+            # Stage D: when WS_PM_DEFER_EXITS=true, cede discretionary SL/TP/trailing
+            # exits to the AI PositionManager (the liquidation/margin guard stays).
+            # Default false → unchanged behavior until the operator opts in.
+            defer_exits=os.getenv("WS_PM_DEFER_EXITS", "false").strip().lower() in {"1", "true", "yes", "on"},
         )
 
         # State
@@ -334,6 +344,13 @@ class WebSocketTradingEngine:
                 post_close_balance = None
             self.risk_manager.record_close(event.realized_pnl, current_balance=post_close_balance)
             self._persist_trade_outcome(event)
+            # Let the AI position manager drop the now-closed symbol from its
+            # active set promptly (rather than waiting for the next scheduled sweep).
+            if self.position_manager is not None:
+                try:
+                    self.position_manager.on_fill(self.symbol)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("[ENGINE] _on_trade_closed failed for %s: %s", self.symbol, e)
 
@@ -2788,6 +2805,14 @@ class WebSocketTradingEngine:
             self.risk_manager.record_open()
             self.adaptive_threshold.record_trade()
 
+            # Notify the AI position manager of the new fill so it can begin
+            # managing this position promptly (force-reassess on fill).
+            if self.position_manager is not None:
+                try:
+                    self.position_manager.on_fill(self.symbol)
+                except Exception as e:
+                    logger.debug("[ENGINE] position_manager.on_fill failed for %s: %s", self.symbol, e)
+
             if setup.get("strategy") == "mean_reversion":
                 self.mr_state.record_entry(
                     side=setup["side"].value,
@@ -2888,13 +2913,24 @@ class WebSocketTradingEngine:
 
     def _on_mark_price(self, mark_price: float, funding_rate: float):
         """Called every 1s when mark price updates."""
-        # Can be used for real-time PnL display or alerts
-        pass
+        # Feed the AI position manager an event-driven tick (price-change / shock
+        # triggers its debounced reassessment). Guarded + swallowed so a manager
+        # fault never disrupts the price stream.
+        if self.position_manager is not None and mark_price and mark_price > 0:
+            try:
+                self.position_manager.on_tick(self.symbol, float(mark_price))
+            except Exception as e:
+                logger.debug("[ENGINE] position_manager.on_tick failed for %s: %s", self.symbol, e)
 
     def _on_kline(self, interval: str, candle: dict):
         """Called when kline updates (every candle close)."""
         if candle.get("is_closed"):
             logger.debug(f"[WS] {interval} candle closed: {candle['close']:.2f}")
+            if self.position_manager is not None:
+                try:
+                    self.position_manager.on_candle_close(self.symbol)
+                except Exception as e:
+                    logger.debug("[ENGINE] position_manager.on_candle_close failed for %s: %s", self.symbol, e)
 
     def _on_book_ticker(self, bid: float, ask: float):
         """Called when best bid/ask changes."""

@@ -15,10 +15,12 @@ export MODE=${MODE:-"paper"}
 export PROJECTION_ENABLED=${PROJECTION_ENABLED:-"true"}
 export MAX_MARGIN_RATIO=${MAX_MARGIN_RATIO:-"0.80"}
 
-# Live mode is real money — require an explicit confirmation before launching.
-if [ "$MODE" = "live" ]; then
-  echo "⚠️  MODE=live — REAL ORDERS WILL BE PLACED ON COINDCX."
-  echo "    Gate must be open: PLACE_ORDER=true, no HALT file."
+# Live mode with PLACE_ORDER=true is real money — require explicit confirmation.
+# Read-only live mode (PLACE_ORDER=false) skips the prompt since no orders are sent.
+place_order_val="${PLACE_ORDER:-false}"
+if [ "$MODE" = "live" ] && [ "$place_order_val" = "true" ]; then
+  echo "⚠️  MODE=live | PLACE_ORDER=true — REAL ORDERS WILL BE PLACED ON COINDCX."
+  echo "    Ensure no HALT file is present."
   read -r -p "    Type 'live' to continue, anything else to abort: " confirm
   [ "$confirm" = "live" ] || { echo "Aborted."; exit 1; }
   # Automatically clear safety HALT file on explicit operator confirmation
@@ -31,6 +33,8 @@ if [ "$MODE" = "live" ]; then
     echo "ℹ️  Clearing active risk state file on operator confirmation..."
     rm -f "$HOME/.crypto_trader/risk_state.json"
   fi
+elif [ "$MODE" = "live" ]; then
+  echo "ℹ️  MODE=live | PLACE_ORDER=false — read-only mode (no orders sent)."
 fi
 
 echo "--- Infrastructure (Postgres, Redis) ---"
