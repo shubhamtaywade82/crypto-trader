@@ -1012,7 +1012,7 @@ class EnhancedFuturesWallet:
 
         try:
             resp = self.execution_engine.create_position_tpsl(
-                pid, stop_loss_price=sl_price, take_profit_price=tp_price,
+                pid, symbol=pos.symbol, stop_loss_price=sl_price, take_profit_price=tp_price,
             )
             # The endpoint returns per-leg dicts; a leg may carry success/error.
             sl_leg = resp.get("stop_loss") if isinstance(resp, dict) else None

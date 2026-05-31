@@ -202,6 +202,7 @@ class CoinDCXExecutionEngine:
         self,
         position_id: str,
         *,
+        symbol: str = "",
         stop_loss_price: Optional[Decimal] = None,
         take_profit_price: Optional[Decimal] = None,
     ) -> dict:
@@ -218,7 +219,7 @@ class CoinDCXExecutionEngine:
         Returns the raw response dict (may contain per-leg ``success``/``error``).
         """
         safe_mode.assert_live_allowed(
-            "TPSL", venue=self.VENUE, constructor_ack=self._ack, symbol=position_id
+            "TPSL", venue=self.VENUE, constructor_ack=self._ack, symbol=symbol or position_id
         )
         body: Dict[str, object] = {"id": position_id}
         if stop_loss_price is not None:

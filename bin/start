@@ -35,6 +35,16 @@ if [ "$MODE" = "live" ] && [ "$place_order_val" = "true" ]; then
   fi
 elif [ "$MODE" = "live" ]; then
   echo "ℹ️  MODE=live | PLACE_ORDER=false — read-only mode (no orders sent)."
+  # Clear stale HALT / risk state from previous runs so read-only observation
+  # isn't blocked by artifacts from an earlier failed live session.
+  if [ -f "$HOME/.crypto_trader/HALT" ]; then
+    echo "ℹ️  Clearing stale HALT file..."
+    rm -f "$HOME/.crypto_trader/HALT"
+  fi
+  if [ -f "$HOME/.crypto_trader/risk_state.json" ]; then
+    echo "ℹ️  Clearing stale risk state file..."
+    rm -f "$HOME/.crypto_trader/risk_state.json"
+  fi
 fi
 
 echo "--- Infrastructure (Postgres, Redis) ---"

@@ -69,6 +69,15 @@ class Reconciler:
                            m.kind, m.internal, m.exchange)
         unresolved = [m for m in mismatches if not m.repaired]
         if unresolved:
+            from .. import safe_mode
+            # In read-only mode mismatches are expected (we can't place/cancel
+            # orders on the venue).  Don't trip the kill switch.
+            if not safe_mode.order_execution_enabled():
+                logger.warning(
+                    "[RECONCILE] %d unresolved mismatch(es) in read-only mode — kill switch NOT tripped",
+                    len(unresolved),
+                )
+                return mismatches
             # G5: strict mode flattens the venue order book before halting, so a
             # corrupted local state can't leave working orders unsupervised.
             if self.strict_cancel:
@@ -240,7 +249,13 @@ class Reconciler:
         return out
 
     def _sync_protective_stops(self, venue: dict, open_ids: set, tracked_ids: set) -> List[ReconciliationMismatchEvent]:
+        from .. import safe_mode
         out: List[ReconciliationMismatchEvent] = []
+        # In read-only mode (PLACE_ORDER=false) we intentionally cannot place
+        # protective stops on the venue. Skip the sync to avoid a false
+        # reconciliation failure that would abort startup.
+        if not safe_mode.order_execution_enabled():
+            return out
         for sym, pos in self.wallet.positions.items():
             if getattr(pos, "status", "") != "OPEN" or getattr(pos, "mode", "paper") != "live":
                 continue
@@ -262,6 +277,7 @@ class Reconciler:
         return out
 
     def _cancel_orphan_orders(self, snap: AccountSnapshot, tracked_ids: set) -> List[ReconciliationMismatchEvent]:
+        from .. import safe_mode
         out: List[ReconciliationMismatchEvent] = []
         internal_syms = {s for s, p in self.wallet.positions.items() if getattr(p, "status", "") == "OPEN" and getattr(p, "mode", "paper") == "live"}
         for o in snap.open_orders:
@@ -270,6 +286,11 @@ class Reconciler:
             if not oid or oid in tracked_ids:
                 continue
             if osym and osym not in internal_syms:
+                # In read-only mode we cannot cancel orders; skip rather than
+                # report an unrepaired mismatch that would abort startup.
+                if not safe_mode.order_execution_enabled():
+                    logger.info("[RECONCILE] Orphan order %s on %s skipped (read-only mode)", oid, osym)
+                    continue
                 ok = False
                 try:
                     ok = self.account_sync.engine.cancel_order(oid)

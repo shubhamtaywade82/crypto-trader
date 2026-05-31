@@ -175,6 +175,10 @@ class WebSocketTradingEngine:
                 symbol=self.symbol,
                 initial_balance=initial_balance,
                 leverage=leverage,
+                # Mode-scoped state so PAPER/LIVE never share persisted state.
+                # Default to "paper" when no cfg — never write a live namespace
+                # without an explicit live config.
+                state_namespace=(cfg.mode.value if cfg else "paper"),
             )
 
         if cfg:
@@ -452,6 +456,7 @@ class WebSocketTradingEngine:
     def start(self):
         """Start WebSocket and position manager."""
         logger.info(f"[ENGINE] Starting WebSocket engine for {self.symbol}")
+        self._thread_start_time = time.time()
         self.ws_feed.start()
         self.ws_pm.start()
         # Wait for WebSocket to connect
@@ -586,6 +591,14 @@ class WebSocketTradingEngine:
         """
         if self.cfg is not None and not getattr(self.cfg, "thread_supervisor_enabled", True):
             return True
+
+        # Startup grace period: threads need a few seconds to actually begin
+        # executing after Thread.start() returns; don't flag them dead prematurely.
+        startup_grace_s = 5.0
+        since_start = time.time() - getattr(self, "_thread_start_time", 0)
+        if since_start < startup_grace_s:
+            return True
+
         dead = []
         if not self.ws_feed.is_alive():
             dead.append("ws_feed")

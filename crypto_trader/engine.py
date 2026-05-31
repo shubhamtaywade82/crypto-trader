@@ -70,6 +70,8 @@ class TradingEngine:
             leverage=leverage,
             equity_utilization=EQUITY_UTILIZATION,
             catastrophic_sl_pct=CATASTROPHIC_SL_PCT,
+            # REST/backtest engine — isolate its sim state from paper/live wallets.
+            state_namespace="backtest",
         )
         # Config-driven risk limits (was: bare RiskManager() using constructor
         # defaults, which silently ignored the configured/spec values).

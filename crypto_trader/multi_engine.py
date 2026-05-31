@@ -298,6 +298,11 @@ def main():
         symbol="GLOBAL",
         initial_balance=total_balance,
         leverage=resolved_leverage,
+        # Mode-scoped state namespace so PAPER and LIVE NEVER share persisted
+        # wallet state (balance, positions, event journal). Without this both
+        # modes used namespace "default" → a prior live run's positions/balance
+        # leaked into paper (and vice-versa).
+        state_namespace=cfg.mode.value,
         database_url=cfg.database_url,
         event_bus=bus,
     )

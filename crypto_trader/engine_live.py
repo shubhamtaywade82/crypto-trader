@@ -69,6 +69,8 @@ class LiveTradingSystem:
             symbol=self.cfg.symbol,
             initial_balance=self.cfg.initial_balance,
             leverage=self.cfg.max_leverage,
+            # Mode-scoped state so PAPER/LIVE never share persisted wallet state.
+            state_namespace=self.cfg.mode.value,
             tds_enabled=self.cfg.tds_enabled,
             tds_rate=self.cfg.tds_rate,
             # Paper degradation only applies to simulated fills.

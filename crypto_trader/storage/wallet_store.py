@@ -140,10 +140,15 @@ class WalletStore:
                     CREATE TABLE IF NOT EXISTS wallet_snapshots (
                         id BIGSERIAL PRIMARY KEY,
                         ts BIGINT NOT NULL,
+                        namespace TEXT,
                         wallet_balance TEXT NOT NULL,
                         realized_pnl_total TEXT NOT NULL,
                         state_json TEXT NOT NULL
                     )
+                """)
+                # Backwards-compat: add namespace column if table was created before this change
+                cur.execute("""
+                    ALTER TABLE wallet_snapshots ADD COLUMN IF NOT EXISTS namespace TEXT
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS arb_events (
@@ -209,6 +214,7 @@ class WalletStore:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS snapshots (
                         id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                        namespace TEXT,
                         wallet_balance TEXT NOT NULL, realized_pnl_total TEXT NOT NULL, state_json TEXT NOT NULL
                     )
                 """)
@@ -304,14 +310,15 @@ class WalletStore:
 
     def get_latest_snapshot(self) -> Optional[Tuple]:
         tbl = self._t("snapshots")
-        sql = f"SELECT ts, wallet_balance, realized_pnl_total, state_json FROM {tbl} ORDER BY ts DESC LIMIT 1"
+        # Strict namespace isolation: paper/live modes must never share snapshots.
+        sql = f"SELECT ts, wallet_balance, realized_pnl_total, state_json FROM {tbl} WHERE namespace = %s ORDER BY ts DESC LIMIT 1"
         with self._conn() as conn:
             if self._use_postgres:
                 cur = conn.cursor()
-                cur.execute(sql)
+                cur.execute(sql, (self.namespace,))
                 return cur.fetchone()
             else:
-                return conn.execute(sql).fetchone()
+                return conn.execute(sql.replace("%s", "?"), (self.namespace,)).fetchone()
 
     def iter_snapshots(self) -> List[Tuple]:
         """All retained snapshots oldest-first (ts, wallet_balance,
@@ -319,38 +326,40 @@ class WalletStore:
         a short tail — for a full equity curve prefer deriving from closed-trade
         outcomes (see analytics.metrics.equity_curve_from_records)."""
         tbl = self._t("snapshots")
-        sql = f"SELECT ts, wallet_balance, realized_pnl_total, state_json FROM {tbl} ORDER BY ts ASC"
+        sql = f"SELECT ts, wallet_balance, realized_pnl_total, state_json FROM {tbl} WHERE namespace = %s ORDER BY ts ASC"
         with self._conn() as conn:
             if self._use_postgres:
                 cur = conn.cursor()
-                cur.execute(sql)
+                cur.execute(sql, (self.namespace,))
                 return cur.fetchall()
             else:
-                return conn.execute(sql).fetchall()
+                return conn.execute(sql.replace("%s", "?"), (self.namespace,)).fetchall()
 
     def save_snapshot(self, ts: int, wallet_balance: str, realized_pnl_total: str, state_json: str,
                       max_snapshots: int = 10):
         tbl = self._t("snapshots")
-        sql = f"INSERT INTO {tbl} (ts, wallet_balance, realized_pnl_total, state_json) VALUES (%s, %s, %s, %s)"
+        sql = f"INSERT INTO {tbl} (ts, namespace, wallet_balance, realized_pnl_total, state_json) VALUES (%s, %s, %s, %s, %s)"
         with self._conn() as conn:
             if self._use_postgres:
                 cur = conn.cursor()
-                cur.execute(sql, (ts, wallet_balance, realized_pnl_total, state_json))
-                # Rotate old snapshots
+                cur.execute(sql, (ts, self.namespace, wallet_balance, realized_pnl_total, state_json))
+                # Rotate old snapshots for THIS namespace only
                 cur.execute(
-                    f"DELETE FROM {tbl} WHERE id NOT IN "
-                    f"(SELECT id FROM {tbl} ORDER BY ts DESC LIMIT %s)",
-                    (max_snapshots,)
+                    f"""DELETE FROM {tbl} WHERE namespace = %s AND id NOT IN (
+                        SELECT id FROM {tbl} WHERE namespace = %s ORDER BY ts DESC LIMIT %s
+                    )""",
+                    (self.namespace, self.namespace, max_snapshots),
                 )
             else:
-                conn.execute(sql.replace("%s", "?"), (ts, wallet_balance, realized_pnl_total, state_json))
+                conn.execute(sql.replace("%s", "?"), (ts, self.namespace, wallet_balance, realized_pnl_total, state_json))
                 rows = conn.execute(
-                    f"SELECT id FROM {tbl} ORDER BY ts DESC LIMIT ?", (max_snapshots,)
+                    f"SELECT id FROM {tbl} WHERE namespace = ? ORDER BY ts DESC LIMIT ?", (self.namespace, max_snapshots)
                 ).fetchall()
                 ids_to_keep = [r[0] for r in rows]
                 if ids_to_keep:
                     placeholders = ",".join(["?"] * len(ids_to_keep))
-                    conn.execute(f"DELETE FROM {tbl} WHERE id NOT IN ({placeholders})", ids_to_keep)
+                    conn.execute(f"DELETE FROM {tbl} WHERE namespace = ? AND id NOT IN ({placeholders})",
+                                 (self.namespace,) + tuple(ids_to_keep))
 
     def persist_domain_event(self, et: str, payload: dict, ts: int):
         """Persist ORDER/FILL/FUNDING/FEE domain events to dedicated tables."""
