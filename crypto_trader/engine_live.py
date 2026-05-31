@@ -27,6 +27,7 @@ from .config import TradingConfig, TradingMode, load_config
 from .events import EventBus, KillSwitchTriggeredEvent, bus as global_bus
 from .risk import RiskManager
 from .wallet import EnhancedFuturesWallet, PaperExecutionEngine
+from .execution.adapters.factory import build_executor
 
 logger = logging.getLogger("crypto_trader.engine_live")
 
@@ -83,20 +84,7 @@ class LiveTradingSystem:
 
     # ── construction ──────────────────────────────────────────────────────
     def _build_execution_engine(self):
-        if self.cfg.mode == TradingMode.PAPER:
-            return PaperExecutionEngine(self.wallet)
-        from .exchanges.coindcx_execution import CoinDCXExecutionEngine
-        from .exchanges.coindcx_client import CoinDCXClient
-        from .exchanges.instrument_mapper import InstrumentMapper
-        client = CoinDCXClient(api_key=self.cfg.coindcx_api_key, api_secret=self.cfg.coindcx_api_secret)
-        mapper = InstrumentMapper(client, margin_currency=self.cfg.coindcx_margin_currency)
-        return CoinDCXExecutionEngine(
-            client=client,
-            mapper=mapper,
-            leverage=self.cfg.max_leverage,
-            margin_currency=self.cfg.coindcx_margin_currency,
-            i_understand_real_money=True,
-        )
+        return build_executor(self.cfg, self.wallet)
 
     def _build_market_data(self):
         from .exchanges.market_data_router import MarketDataRouter
@@ -132,23 +120,27 @@ class LiveTradingSystem:
 
         self.execution_engine = self._build_execution_engine()
 
-        if self.cfg.is_live:
-            checks.extend(self._live_venue_checks())
+        if self.cfg.uses_exchange:
+            checks.extend(self._venue_checks())
         else:
-            checks.append(Check("mode", True, "paper (simulated fills)", critical=False))
+            checks.append(Check("mode", True, "paper (simulated fills, local DB is source of truth)", critical=False))
 
         return checks
 
-    def _live_venue_checks(self) -> List[Check]:
+    def _venue_checks(self) -> List[Check]:
         from . import safe_mode
         checks: List[Check] = []
 
-        # Safe-mode gate: PLACE_ORDER=true + no HALT file.
-        gate_open = safe_mode.is_live_enabled()
-        gate_detail = "open" if gate_open else (
-            f"need {safe_mode.PLACE_ORDER_ENV}=true (or unset), no HALT file"
-        )
-        checks.append(Check("safe_mode_gate", gate_open, gate_detail))
+        # Safe-mode gate only applies to LIVE (real money), not SANDBOX.
+        if self.cfg.is_live:
+            gate_open = safe_mode.is_live_enabled()
+            gate_detail = "open" if gate_open else (
+                f"need {safe_mode.LIVE_ENV_VAR}=true, {safe_mode.ACK_ENV_VAR}='{safe_mode.ACK_PHRASE}', "
+                f"{safe_mode.PLACE_ORDER_ENV}=true (or unset), no HALT file"
+            )
+            checks.append(Check("safe_mode_gate", gate_open, gate_detail))
+        else:
+            checks.append(Check("safe_mode_gate", True, "sandbox — no real-money gate required", critical=False))
 
         # G1: clock skew vs the venue. Advisory (Date-header resolution is ~1s),
         # so it warns rather than blocks unless drift is egregiously large.
@@ -233,12 +225,13 @@ class LiveTradingSystem:
             logger.info("[SELF-TEST] %-16s %s  %s", c.name, flag, c.detail)
         critical_failures = [c for c in checks if c.critical and not c.ok]
         passed = not critical_failures
-        if self.cfg.is_live and not passed:
+        if self.cfg.uses_exchange and not passed:
             names = ", ".join(c.name for c in critical_failures)
             self.bus.publish(KillSwitchTriggeredEvent(
                 reason=f"startup self-test failed: {names}", source="startup"))
+            mode_upper = self.cfg.mode.value.upper()
             raise LiveGateBlocked(
-                f"LIVE TRADING BLOCKED — failed checks: {names}. "
+                f"{mode_upper} TRADING BLOCKED — failed checks: {names}. "
                 f"Fix config/credentials/venue state and retry."
             )
         return passed, checks
@@ -389,7 +382,7 @@ class LiveTradingSystem:
         logger.info("Starting LiveTradingSystem | %s", self.cfg.redacted())
         self.startup_self_test()
 
-        if self.cfg.is_live:
+        if self.cfg.uses_exchange:
             self.wallet.attach_execution_engine(self.execution_engine, live=True)
             self.wallet.sync_fee_rates_from_spec(self.cfg.symbol)
             self._maybe_start_user_stream()
@@ -473,16 +466,18 @@ class LiveTradingSystem:
 
         mark_fn = engine.data_feed.get_mark_price
         funding_fn = engine.data_feed.get_funding_rate
-        if self.cfg.mode == TradingMode.PAPER:
+        if self.cfg.is_paper:
             spot_engine = PaperSpotExecutionEngine(mark_fn)
             perp_engine = PaperSpotExecutionEngine(mark_fn)  # paper perp leg: filled at mark
         else:
+            # sandbox: same as live but with testnet client (already embedded in executor)
+            real_money = self.cfg.is_live
             spot_engine = CoinDCXSpotExecutionEngine(
                 api_key=self.cfg.coindcx_api_key,
                 api_secret=self.cfg.coindcx_api_secret,
-                i_understand_real_money=True,
+                i_understand_real_money=real_money,
             )
-            perp_engine = self.execution_engine  # live CoinDCX futures adapter
+            perp_engine = self.execution_engine  # live/sandbox CoinDCX futures adapter
 
         book = ArbBook(namespace=self.cfg.symbol, database_url=self.cfg.database_url)
         logger.warning("[ARB] funding arbitrage ENABLED for %s (notional=%.2f USDT)",

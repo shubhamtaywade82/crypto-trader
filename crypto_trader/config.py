@@ -18,6 +18,7 @@ from typing import List, Optional
 
 class TradingMode(str, Enum):
     PAPER = "paper"
+    SANDBOX = "sandbox"   # exchange testnet — real API, fake money
     LIVE = "live"
 
 
@@ -204,6 +205,7 @@ class TradingConfig:
     coindcx_api_key: str = ""
     coindcx_api_secret: str = ""
     coindcx_base_url: str = "https://api.coindcx.com"
+    coindcx_sandbox_url: str = "https://public.coindcx.com"
     # Futures margin currency: "USDT" or "INR" (CoinDCX supports both; the
     # account's funded futures wallet determines which one to use).
     coindcx_margin_currency: str = "USDT"
@@ -476,6 +478,9 @@ class TradingConfig:
         try:
             mode_enum = TradingMode(mode)
         except ValueError:
+            logging.getLogger("crypto_trader.config").warning(
+                "[CONFIG] unknown MODE=%r — defaulting to paper", mode
+            )
             mode_enum = TradingMode.PAPER
 
         ds = _get("DATA_SOURCE", "auto").lower()
@@ -515,6 +520,7 @@ class TradingConfig:
             coindcx_api_key=_get("COINDCX_API_KEY"),
             coindcx_api_secret=_get("COINDCX_API_SECRET"),
             coindcx_base_url=_get("COINDCX_BASE_URL", "https://api.coindcx.com"),
+            coindcx_sandbox_url=_get("COINDCX_SANDBOX_URL", "https://public.coindcx.com"),
             coindcx_margin_currency=margin_currency,
             database_url=_get("DATABASE_URL"),
             feed_stale_ms=_get_int("FEED_STALE_MS", 15_000),
@@ -656,8 +662,21 @@ class TradingConfig:
         )
 
     @property
+    def is_paper(self) -> bool:
+        return self.mode == TradingMode.PAPER
+
+    @property
+    def is_sandbox(self) -> bool:
+        return self.mode == TradingMode.SANDBOX
+
+    @property
     def is_live(self) -> bool:
         return self.mode == TradingMode.LIVE
+
+    @property
+    def uses_exchange(self) -> bool:
+        """True when the executor talks to any exchange (sandbox or live)."""
+        return self.mode in (TradingMode.SANDBOX, TradingMode.LIVE)
 
     @property
     def has_coindcx_credentials(self) -> bool:
@@ -679,9 +698,9 @@ class TradingConfig:
             )
         if not self.symbol:
             errs.append("TRADE_SYMBOL is required")
-        if self.is_live and not self.has_coindcx_credentials:
+        if self.uses_exchange and not self.has_coindcx_credentials:
             errs.append(
-                "Live mode requires COINDCX_API_KEY and COINDCX_API_SECRET"
+                f"{self.mode.value} mode requires COINDCX_API_KEY and COINDCX_API_SECRET"
             )
         return errs
 
@@ -704,6 +723,8 @@ class TradingConfig:
             "initial_balance": self.initial_balance,
             "coindcx_api_key": mask(self.coindcx_api_key),
             "coindcx_api_secret": mask(self.coindcx_api_secret),
+            "coindcx_base_url": self.coindcx_base_url if self.is_live else "(unused)",
+            "coindcx_sandbox_url": self.coindcx_sandbox_url if self.is_sandbox else "(unused)",
             "database_url": "postgres" if self.database_url else "sqlite (dev)",
             "feed_stale_ms": self.feed_stale_ms,
             "venue_sl_enabled": self.venue_sl_enabled,
