@@ -981,12 +981,27 @@ class EnhancedFuturesWallet:
                 raise RuntimeError(f"Required venue Stop Loss placement failed: {msg}")
             return {}
 
+        # Round SL/TP to instrument tick size before sending to venue
+        # (CoinDCX rejects prices like 81.301654... when tick=0.01)
+        spec = None
+        try:
+            spec = self.execution_engine.mapper.get_spec(pos.symbol)
+        except Exception:
+            pass
+
+        sl_price = self._to_decimal(pos.sl_price)
+        if spec is not None:
+            sl_price = spec.round_price(sl_price)
+
         tp_price = None
         if self.venue_tp_enabled and pos.tp_levels:
             tp_price = self._to_decimal(pos.tp_levels[-1]["price"])
+            if spec is not None:
+                tp_price = spec.round_price(tp_price)
+
         try:
             resp = self.execution_engine.create_position_tpsl(
-                pid, stop_loss_price=self._to_decimal(pos.sl_price), take_profit_price=tp_price,
+                pid, stop_loss_price=sl_price, take_profit_price=tp_price,
             )
             # The endpoint returns per-leg dicts; a leg may carry success/error.
             sl_leg = resp.get("stop_loss") if isinstance(resp, dict) else None
@@ -998,8 +1013,14 @@ class EnhancedFuturesWallet:
             if tp_price is not None and isinstance(tp_leg, dict) and tp_leg.get("success") is not False:
                 placed["tp"] = tp_leg.get("id") or f"tpsl:{pid}"
         except Exception as e:
-            logger.critical("[PROTECTIVE SL] create_tpsl failed for %s: %s", pos.symbol, e)
-            if self.require_venue_sl:
+            # Read-only mode (PLACE_ORDER=false) is NOT a venue failure — don't
+            # kill-switch or emergency-close; just warn and return gracefully.
+            is_readonly = "PLACE_ORDER=false" in str(e) or "read-only" in str(e).lower()
+            if is_readonly:
+                logger.warning("[PROTECTIVE SL] %s: %s", pos.symbol, e)
+            else:
+                logger.critical("[PROTECTIVE SL] create_tpsl failed for %s: %s", pos.symbol, e)
+            if self.require_venue_sl and not is_readonly:
                 from . import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
                 try:

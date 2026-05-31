@@ -52,6 +52,8 @@ class StrategyMode(str, Enum):
     SUPERTREND2 = "supertrend2"
     MEAN_REVERSION = "mean_reversion"
     REGIME_SWITCH = "regime_switch"
+    LIQUIDITY_SWEEP = "liquidity_sweep"
+    MTF_ALIGNMENT = "mtf_alignment"
 
 
 @dataclass
@@ -158,6 +160,22 @@ _VALID_KLINE_INTERVALS = {
     "1h", "2h", "4h", "6h", "8h", "12h",
     "1d", "3d", "1w", "1M",
 }
+
+
+def _parse_symbol_float_map(raw: str) -> dict:
+    """Parse "ETHUSDT:2.5,BTCUSDT:3.0" → {"ETHUSDT": 2.5, "BTCUSDT": 3.0}.
+    Bad entries are skipped (with no crash)."""
+    out: dict = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        sym, val = part.split(":", 1)
+        try:
+            out[sym.strip().upper()] = float(val)
+        except ValueError:
+            continue
+    return out
 
 
 def _valid_interval(name: str, default: str) -> str:
@@ -405,6 +423,53 @@ class TradingConfig:
     smc_tp_rr: float = 2.0            # TP risk-reward ceiling / fallback
     smc_max_hold_hours: int = 24      # safety time-stop
 
+    # ── Liquidity-Sweep settings (active only when strategy_mode = "liquidity_sweep") ──
+    # The one net-positive OOS edge from research (ETH, 2.5R, stop at swept wick).
+    # SCOPE TO ETH via strategy_symbols — it loses on SOL, marginal on XRP.
+    lsw_timeframe: str = "15m"
+    lsw_htf_timeframe: str = "4h"
+    lsw_swing_window: int = 3
+    lsw_sweep_lookback: int = 3       # sweep must be ≤ this many candles old to act
+    lsw_tp_r: float = 2.5             # take-profit as multiple of risk (validated 2.5R)
+    lsw_atr_period: int = 14
+    lsw_sl_buffer_atr: float = 0.25   # padding beyond the swept wick
+    lsw_min_stop_frac: float = 0.002  # floor stop at 0.2% of price
+    lsw_use_htf_filter: bool = False  # optional HTF EMA bias agreement
+    lsw_max_hold_hours: int = 24
+    # Per-symbol TP override (research optima differ: ETH best @2.5R, BTC @3.0R).
+    # Parsed from LSW_TP_R_OVERRIDES="ETHUSDT:2.5,BTCUSDT:3.0"; falls back to lsw_tp_r.
+    lsw_tp_r_overrides: dict = field(default_factory=dict)
+
+    # ── MTF-Alignment settings (active only when strategy_mode = "mtf_alignment") ──
+    # Ported validated edge: EMA50 1h/4h/1d aligned → 5m breakout → engulfing →
+    # wide TP (3R optimum). Win ~40%; edge is the payoff, not hit-rate. THIN
+    # sample (~19 OOS trades) — paper-test. ETH & BTC both optimum at 3R.
+    mta_entry_timeframe: str = "5m"
+    mta_macro_tfs: List[str] = field(default_factory=lambda: ["1h", "4h", "1d"])
+    mta_ema_len: int = 50
+    mta_min_macro_frames: int = 2     # need ≥ this many macro frames to agree
+    mta_break_lookback: int = 5       # prior-N high/low breakout on entry TF
+    mta_swing_lookback: int = 6       # swing low/high for the stop
+    mta_tp_r: float = 3.0             # take-profit as multiple of risk (validated 3R)
+    mta_atr_period: int = 14
+    mta_min_stop_frac: float = 0.0055  # floor: 2R≥1% net; at 3R wider
+    mta_max_hold_hours: int = 24
+
+    # ── Automatic per-symbol champion routing ──
+    # When true, each symbol's engine reads ~/.crypto_trader/strategy_champions.json
+    # (written offline by `python -m crypto_trader.selection.cli`) and routes that
+    # symbol to its highest-expectancy validated strategy + params. Symbols with no
+    # champion ("none") are not traded. Selection is OFFLINE — the live loop never
+    # re-picks a strategy on noisy recent data.
+    use_strategy_champions: bool = False
+
+    # ── Per-symbol strategy scoping ──
+    # When set (csv of symbols), the active strategy opens NEW entries ONLY for
+    # these symbols; other watchlist symbols still manage open positions but take
+    # no new trades. Empty = all watchlist symbols. Use STRATEGY_SYMBOLS=ETHUSDT
+    # to run the liquidity-sweep edge ETH-only.
+    strategy_symbols: List[str] = field(default_factory=list)
+
     @classmethod
     def from_env(cls) -> "TradingConfig":
         mode = _get("MODE", "paper").lower()
@@ -565,6 +630,29 @@ class TradingConfig:
             smc_sl_atr_mult=_get_float("SMC_SL_ATR_MULT", 1.5),
             smc_tp_rr=_get_float("SMC_TP_RR", 2.0),
             smc_max_hold_hours=_get_int("SMC_MAX_HOLD_HOURS", 24),
+            lsw_timeframe=_valid_interval("LSW_TIMEFRAME", "15m"),
+            lsw_htf_timeframe=_valid_interval("LSW_HTF_TIMEFRAME", "4h"),
+            lsw_swing_window=_get_int("LSW_SWING_WINDOW", 3),
+            lsw_sweep_lookback=_get_int("LSW_SWEEP_LOOKBACK", 3),
+            lsw_tp_r=_get_float("LSW_TP_R", 2.5),
+            lsw_atr_period=_get_int("LSW_ATR_PERIOD", 14),
+            lsw_sl_buffer_atr=_get_float("LSW_SL_BUFFER_ATR", 0.25),
+            lsw_min_stop_frac=_get_float("LSW_MIN_STOP_FRAC", 0.002),
+            lsw_use_htf_filter=_get_bool("LSW_USE_HTF_FILTER", False),
+            lsw_max_hold_hours=_get_int("LSW_MAX_HOLD_HOURS", 24),
+            lsw_tp_r_overrides=_parse_symbol_float_map(_get("LSW_TP_R_OVERRIDES", "")),
+            mta_entry_timeframe=_valid_interval("MTA_ENTRY_TIMEFRAME", "5m"),
+            mta_macro_tfs=[s.strip() for s in _get("MTA_MACRO_TFS", "1h,4h,1d").split(",") if s.strip()],
+            mta_ema_len=_get_int("MTA_EMA_LEN", 50),
+            mta_min_macro_frames=_get_int("MTA_MIN_MACRO_FRAMES", 2),
+            mta_break_lookback=_get_int("MTA_BREAK_LOOKBACK", 5),
+            mta_swing_lookback=_get_int("MTA_SWING_LOOKBACK", 6),
+            mta_tp_r=_get_float("MTA_TP_R", 3.0),
+            mta_atr_period=_get_int("MTA_ATR_PERIOD", 14),
+            mta_min_stop_frac=_get_float("MTA_MIN_STOP_FRAC", 0.0055),
+            mta_max_hold_hours=_get_int("MTA_MAX_HOLD_HOURS", 24),
+            use_strategy_champions=_get_bool("USE_STRATEGY_CHAMPIONS", False),
+            strategy_symbols=[s.strip().upper() for s in _get("STRATEGY_SYMBOLS", "").split(",") if s.strip()],
         )
 
     @property

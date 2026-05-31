@@ -74,9 +74,8 @@ class CoinDCXExecutionEngine:
     """Live execution venue. Conforms to ``wallet.ExecutionEngine``.
 
     Real-money order ops (place/cancel/exit) are gated by ``safe_mode``: they
-    require the constructor flag ``i_understand_real_money=True`` AND the
-    environment gate (``LIVE_TRADING_ENABLED`` + ``LIVE_TRADING_ACK``) AND no
-    HALT file.
+    require the constructor flag ``i_understand_real_money=True`` AND
+    env ``PLACE_ORDER=true`` (or unset) AND no HALT file.
     """
 
     VENUE = "CoinDCX"
@@ -110,7 +109,7 @@ class CoinDCXExecutionEngine:
         if self._ack:
             logger.warning(
                 "CoinDCXExecutionEngine constructed with i_understand_real_money=True. "
-                "Orders still require LIVE_TRADING_ENABLED + LIVE_TRADING_ACK and no HALT file."
+                "Orders require PLACE_ORDER=true and no HALT file."
             )
 
     # ── ExecutionEngine Protocol ───────────────────────────────────────────
