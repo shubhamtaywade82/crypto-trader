@@ -212,7 +212,15 @@ class RiskManager:
         self.margin_engine = MarginEngine(max_margin_utilization=max_margin_utilization)
         self.leverage_engine = LeverageEngine()
         
-        self.state_file = DATA_DIR / "risk_state.json"
+        # Namespace state by trading mode so paper & live never cross-contaminate.
+        mode = os.getenv("MODE", "paper").lower()
+        self.state_file = DATA_DIR / f"risk_state_{mode}.json"
+        
+        # Emergency override: DISABLE_RISK_HALT=1 bypasses all risk gates.
+        self._disabled = os.getenv("DISABLE_RISK_HALT", "").strip().lower() in ("1", "true", "yes")
+        if self._disabled:
+            logger.warning("[RISK] DISABLE_RISK_HALT is set — all risk gates bypassed!")
+        
         self._load_state()
 
     def _today(self) -> date:
@@ -298,6 +306,8 @@ class RiskManager:
         Each check is a :class:`Specification` subclass defined at module level.
         To add a new rule, write a spec class and append it to ``_TRADE_GATE``.
         """
+        if self._disabled:
+            return True, "OK"
         self._reset_daily_stats_if_new_day()
         ctx = _RiskCtx(
             manager=self,

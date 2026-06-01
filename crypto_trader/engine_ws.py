@@ -17,8 +17,9 @@ import time
 import uuid
 import logging
 import argparse
+import threading
 from dataclasses import dataclass, field as dc_field
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_UP, InvalidOperation
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -31,6 +32,7 @@ from .wallet import EnhancedFuturesWallet, PositionSide
 from .risk import RiskManager, AdaptiveThresholdManager, MarginEngine, LeverageEngine
 from .playbooks import PlaybookA, PlaybookB, PlaybookAres, PlaybookVolExhaust, PlaybookSweepMSS
 from .strategies.supertrend2 import PlaybookSupertrend2
+from .strategies.smc_5c import PlaybookSMC5C
 from .strategies.mean_reversion import PlaybookMeanReversion
 from .strategies.smc_pipeline import PlaybookSMC
 from .strategies.regime_switch import PlaybookRegimeSwitch
@@ -477,7 +479,7 @@ class WebSocketTradingEngine:
 
     def _check_authoritative_health(self):
         """Monitor authoritative exchange metrics (margin ratio) and trigger kill switch if unsafe."""
-        if not self.cfg or not self.cfg.uses_exchange:
+        if not self.cfg or not getattr(self.cfg, "uses_exchange", False):
             return
 
         from .exchanges.coindcx_execution import CoinDCXExecutionEngine
@@ -773,6 +775,34 @@ class WebSocketTradingEngine:
                 self.playbook_smc.min_score, self.playbook_smc.swing_window, self.symbol,
             )
 
+        # SMC-5C playbook (ML-report 5-condition blueprint; both sides, fixed 2:1)
+        self.playbook_smc5c: Optional[PlaybookSMC5C] = None
+        if cfg and getattr(cfg, "strategy_mode", "legacy") == "smc_5c":
+            self.playbook_smc5c = PlaybookSMC5C(
+                entry_timeframe=getattr(cfg, "smc5c_entry_timeframe", "5m"),
+                ema_fast=getattr(cfg, "smc5c_ema_fast", 50),
+                ema_slow=getattr(cfg, "smc5c_ema_slow", 200),
+                bos_lookback=getattr(cfg, "smc5c_bos_lookback", 5),
+                fvg_window=getattr(cfg, "smc5c_fvg_window", 10),
+                atr_period=getattr(cfg, "smc5c_atr_period", 14),
+                vol_window=getattr(cfg, "smc5c_vol_window", 200),
+                atr_pctile=getattr(cfg, "smc5c_atr_pctile", 60.0),
+                vol_pctile=getattr(cfg, "smc5c_vol_pctile", 70.0),
+                tp_pct=getattr(cfg, "smc5c_tp_pct", 0.010),
+                sl_pct=getattr(cfg, "smc5c_sl_pct", 0.005),
+                max_hold_hours=getattr(cfg, "smc5c_max_hold_hours", 4),
+            )
+            _scope = getattr(cfg, "strategy_symbols", []) or ["(all)"]
+            logger.info(
+                "[SMC5C] 5-Condition mode active: entry_tf=%s ema=%d/%d tp=%.1f%% sl=%.1f%% scope=%s symbol=%s",
+                self.playbook_smc5c.entry_timeframe, self.playbook_smc5c.ema_fast,
+                self.playbook_smc5c.ema_slow, self.playbook_smc5c.tp_pct * 100,
+                self.playbook_smc5c.sl_pct * 100, ",".join(_scope), self.symbol,
+            )
+
+        if not hasattr(self, "_signal_eval_lock"):
+            self._signal_eval_lock = threading.Lock()
+
         # Regime Switch playbook (wraps ST2 with regime gating)
         self.playbook_regime_switch: Optional[PlaybookRegimeSwitch] = None
         if cfg and getattr(cfg, "strategy_mode", "legacy") == "regime_switch":
@@ -872,6 +902,8 @@ class WebSocketTradingEngine:
                         self.playbook_lsw.apply_overrides({k: v})
                     if k.startswith("mta_") and self.playbook_mta is not None:
                         self.playbook_mta.apply_overrides({k: v})
+                    if k.startswith("smc5c_") and self.playbook_smc5c is not None:
+                        self.playbook_smc5c.apply_overrides({k: v})
                 elif cls == "flat_only":
                     self._pending_flat_overrides[k] = v
                 elif cls == "restart":
@@ -900,6 +932,8 @@ class WebSocketTradingEngine:
                     self.playbook_lsw.apply_overrides({k: v})
                 if k.startswith("mta_") and self.playbook_mta is not None:
                     self.playbook_mta.apply_overrides({k: v})
+                if k.startswith("smc5c_") and self.playbook_smc5c is not None:
+                    self.playbook_smc5c.apply_overrides({k: v})
             self._pending_flat_overrides = {}
 
     def _signal_tick(self):
@@ -1134,6 +1168,19 @@ class WebSocketTradingEngine:
                     except Exception as e:
                         logger.warning("[MTA] macro TF %s fetch failed: %s — skipping frame", tf, e)
             data["df_mta_macro"] = macro
+
+        # ── SMC-5C entry timeframe (HTF frames 15m/1h/4h already fetched) ────
+        if self.playbook_smc5c is not None:
+            _baseline = {"15m": df_15m, "5m": df_5m, "1h": df_1h, "4h": df_4h}
+            etf = self.playbook_smc5c.entry_timeframe
+            data["df_smc5c"] = _baseline.get(etf)
+            if data["df_smc5c"] is None:
+                try:
+                    data["df_smc5c"] = self.data_feed.get_klines(
+                        self.symbol, etf, limit=self._kline_limit(etf))
+                except Exception as e:
+                    logger.warning("[SMC5C] entry TF %s fetch failed: %s — falling back to 5m", etf, e)
+                    data["df_smc5c"] = df_5m
 
         return data
 
@@ -1830,6 +1877,65 @@ class WebSocketTradingEngine:
             regime_ctx=regime_ctx,
         ))
 
+    def _evaluate_entry_smc_5c(
+        self,
+        data: dict,
+        mark_price: float,
+        funding_rate: float,
+        taker_ratio: float,
+        regime_ctx,
+    ) -> None:
+        """Entry evaluation path for SMC 5-Condition strategy. Exits via standard
+        wallet SL/TP/time-stop. EDGE UNVALIDATED — selector must confirm OOS."""
+        if self.playbook_smc5c is None:
+            return
+        df_entry = data.get("df_smc5c") if data.get("df_smc5c") is not None else data.get("df_5m")
+        htf = {"15m": data.get("df_15m"), "1h": data.get("df_1h"), "4h": data.get("df_4h")}
+        if df_entry is None:
+            logger.warning("[SMC5C ENTRY] %s — no entry-TF klines", self.symbol)
+            return
+
+        setup = self.playbook_smc5c.evaluate(df_entry, htf)
+        if not setup:
+            ev = getattr(self.playbook_smc5c, "last_eval", None)
+            stage = (ev or {}).get("stage", "no_signal")
+            logger.info("[SMC5C EVAL] %s no signal (%s)", self.symbol, stage)
+            if self.event_bus:
+                from .events import SignalRejectedEvent
+                self.event_bus.publish(SignalRejectedEvent(symbol=self.symbol, reason=f"smc5c_{stage}"))
+            return
+
+        logger.info("[SMC5C SIGNAL] %s | %s | %s", self.symbol, setup["side"].value, setup["reason"])
+
+        # Funding-rate extreme guard
+        _funding_extreme = self.cfg.funding_extreme_threshold if self.cfg else FUNDING_EXTREME
+        if (
+            (setup["side"] == PositionSide.LONG and funding_rate > _funding_extreme)
+            or (setup["side"] == PositionSide.SHORT and funding_rate < -_funding_extreme)
+        ):
+            logger.info("[SMC_5C BLOCKED] %s — funding extreme %+.4f%%", self.symbol, funding_rate * 100)
+            self._reject(f"funding_extreme {funding_rate*100:+.4f}%")
+            return
+
+        dynamic_threshold = self.adaptive_threshold.get_threshold()
+
+        self._execute_entry(EntryContext(
+            setup=setup,
+            final_score=setup["score"],
+            llm_weight=0.0,
+            explanation=f"SMC 5-Condition ({setup['reason']})",
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            oi_delta=0.0,
+            taker_ratio=taker_ratio,
+            tech_score=setup["score"],
+            regime=None,
+            regime_score=1.0,
+            advice=None,
+            dynamic_threshold=dynamic_threshold,
+            regime_ctx=regime_ctx,
+        ))
+
     def _evaluate_entry_lsw(
         self,
         data: dict,
@@ -2079,6 +2185,10 @@ class WebSocketTradingEngine:
                     # 10-stage structure+participation filter; the composite
                     # score gate (min_score) is applied inside the strategy.
                     self._evaluate_entry_smc(
+                        data, mark_price, funding_rate, taker_ratio, regime_ctx
+                    )
+                elif self.cfg and self.cfg.strategy_mode == "smc_5c":
+                    self._evaluate_entry_smc_5c(
                         data, mark_price, funding_rate, taker_ratio, regime_ctx
                     )
                 elif self.cfg and getattr(self.cfg, "strategy_mode", "legacy") == "regime_switch":
@@ -2392,7 +2502,7 @@ class WebSocketTradingEngine:
                 return False
 
             # Apply: venue first (sandbox/live), then per-symbol wallet so margin math agrees.
-            if self.cfg and self.cfg.uses_exchange and exec_eng is not None and hasattr(exec_eng, "set_leverage"):
+            if self.cfg and getattr(self.cfg, "uses_exchange", False) and exec_eng is not None and hasattr(exec_eng, "set_leverage"):
                 try:
                     exec_eng.set_leverage(self.symbol, lev)
                 except Exception as e:
@@ -2631,7 +2741,7 @@ class WebSocketTradingEngine:
                 # so sending the risk-based qty would just earn a rejection. Skip and
                 # retry on the next tick. In paper mode there's no venue floor — fall
                 # back to the risk-based qty as-is.
-                if self.cfg and self.cfg.uses_exchange:
+                if self.cfg and getattr(self.cfg, "uses_exchange", False):
                     logger.warning(
                         "[ENTRY SKIP] %s instrument spec unavailable in live mode "
                         "(%s); cannot verify min-notional, skipping tick", self.symbol, e,
@@ -2796,7 +2906,7 @@ class WebSocketTradingEngine:
         # via the setup flag. Market entries are unchanged.
         external_fill = None
         book_qty = quantity
-        if use_maker and self.cfg and self.cfg.uses_exchange:
+        if use_maker and self.cfg and getattr(self.cfg, "uses_exchange", False):
             external_fill = self.wallet.acquire_live_entry_fill(
                 self.symbol, setup["side"], quantity, Decimal(str(entry_price)),
                 timeout_s=self.cfg.maker_limit_timeout_s,
@@ -2808,7 +2918,15 @@ class WebSocketTradingEngine:
                 return
             fq = external_fill.get("filled_quantity")
             if fq is not None:
-                book_qty = Decimal(str(fq))
+                # Guard against a non-numeric / NaN filled_quantity (bad fill
+                # payload): keep the intended qty rather than crash the entry.
+                try:
+                    cand = Decimal(str(fq))
+                    if cand.is_finite() and cand > 0:
+                        book_qty = cand
+                except (InvalidOperation, ValueError, TypeError):
+                    logger.warning("[MAKER-LIMIT] %s bad filled_quantity %r — using intended qty %s",
+                                   self.symbol, fq, quantity)
 
         pos = self.wallet.open_position(
             self.symbol,

@@ -55,6 +55,7 @@ class StrategyMode(str, Enum):
     REGIME_SWITCH = "regime_switch"
     LIQUIDITY_SWEEP = "liquidity_sweep"
     MTF_ALIGNMENT = "mtf_alignment"
+    SMC_5C = "smc_5c"
 
 
 @dataclass
@@ -457,6 +458,22 @@ class TradingConfig:
     mta_min_stop_frac: float = 0.0055  # floor: 2R≥1% net; at 3R wider
     mta_max_hold_hours: int = 24
 
+    # ── SMC-5C settings (active only when strategy_mode = "smc_5c") ──
+    # ML-report 5-condition blueprint (both sides), fixed 2:1. FAILED OOS
+    # validation — wired only so the champion selector can confirm/deny it.
+    smc5c_entry_timeframe: str = "5m"
+    smc5c_ema_fast: int = 50
+    smc5c_ema_slow: int = 200
+    smc5c_bos_lookback: int = 5
+    smc5c_fvg_window: int = 10
+    smc5c_atr_period: int = 14
+    smc5c_vol_window: int = 200
+    smc5c_atr_pctile: float = 60.0
+    smc5c_vol_pctile: float = 70.0
+    smc5c_tp_pct: float = 0.010
+    smc5c_sl_pct: float = 0.005
+    smc5c_max_hold_hours: int = 4
+
     # ── Automatic per-symbol champion routing ──
     # When true, each symbol's engine reads ~/.crypto_trader/strategy_champions.json
     # (written offline by `python -m crypto_trader.selection.cli`) and routes that
@@ -471,6 +488,31 @@ class TradingConfig:
     # no new trades. Empty = all watchlist symbols. Use STRATEGY_SYMBOLS=ETHUSDT
     # to run the liquidity-sweep edge ETH-only.
     strategy_symbols: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        """Coerce enum-typed fields that were passed as plain strings.
+
+        ``from_env`` always builds proper enums, but direct construction (tests,
+        callers) commonly passes ``mode="live"`` / ``data_source="binance"`` as
+        strings. Dataclasses do not coerce, so ``cfg.mode.value`` would then
+        raise AttributeError. Normalise here so both call styles behave identically.
+        """
+        if isinstance(self.mode, str):
+            try:
+                self.mode = TradingMode(self.mode.lower())
+            except ValueError:
+                self.mode = TradingMode.PAPER
+        if isinstance(self.data_source, str):
+            try:
+                self.data_source = DataSource(self.data_source.lower())
+            except ValueError:
+                self.data_source = DataSource.AUTO
+        # strategy_mode is a plain str by design (compared by value) — accept an
+        # enum too, storing its value, so StrategyMode.SMC_5C and "smc_5c" both work.
+        if isinstance(self.strategy_mode, StrategyMode):
+            self.strategy_mode = self.strategy_mode.value
+        elif isinstance(self.strategy_mode, str):
+            self.strategy_mode = self.strategy_mode.lower()
 
     @classmethod
     def from_env(cls) -> "TradingConfig":
@@ -657,6 +699,18 @@ class TradingConfig:
             mta_atr_period=_get_int("MTA_ATR_PERIOD", 14),
             mta_min_stop_frac=_get_float("MTA_MIN_STOP_FRAC", 0.0055),
             mta_max_hold_hours=_get_int("MTA_MAX_HOLD_HOURS", 24),
+            smc5c_entry_timeframe=_valid_interval("SMC5C_ENTRY_TIMEFRAME", "5m"),
+            smc5c_ema_fast=_get_int("SMC5C_EMA_FAST", 50),
+            smc5c_ema_slow=_get_int("SMC5C_EMA_SLOW", 200),
+            smc5c_bos_lookback=_get_int("SMC5C_BOS_LOOKBACK", 5),
+            smc5c_fvg_window=_get_int("SMC5C_FVG_WINDOW", 10),
+            smc5c_atr_period=_get_int("SMC5C_ATR_PERIOD", 14),
+            smc5c_vol_window=_get_int("SMC5C_VOL_WINDOW", 200),
+            smc5c_atr_pctile=_get_float("SMC5C_ATR_PCTILE", 60.0),
+            smc5c_vol_pctile=_get_float("SMC5C_VOL_PCTILE", 70.0),
+            smc5c_tp_pct=_get_float("SMC5C_TP_PCT", 0.010),
+            smc5c_sl_pct=_get_float("SMC5C_SL_PCT", 0.005),
+            smc5c_max_hold_hours=_get_int("SMC5C_MAX_HOLD_HOURS", 4),
             use_strategy_champions=_get_bool("USE_STRATEGY_CHAMPIONS", False),
             strategy_symbols=[s.strip().upper() for s in _get("STRATEGY_SYMBOLS", "").split(",") if s.strip()],
         )

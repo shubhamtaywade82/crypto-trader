@@ -5,4 +5,37 @@ set -e
 cd "$(dirname "$0")/.."
 
 echo "--- Resetting Safety Gates ---"
-python3 -c "from crypto_trader.risk import RiskManager; rm = RiskManager(); rm.clear_kill_switch(); rm.reset_consecutive_losses(); print('✅ Kill switch cleared and loss streak reset.')"
+python3 -c "
+from crypto_trader.risk import RiskManager
+from pathlib import Path
+import os
+
+data_dir = Path.home() / '.crypto_trader'
+
+# Clear current mode
+rm = RiskManager()
+rm.clear_kill_switch()
+rm.reset_consecutive_losses()
+rm.last_loss_time = None
+rm._save_state()
+print(f'✅ Kill switch cleared, loss streak reset, cooldown cleared ({rm.state_file.name})')
+
+# Also clear the other mode's state file so paper/live never cross-contaminate
+other_mode = 'live' if os.getenv('MODE', 'paper').lower() == 'paper' else 'paper'
+other_file = data_dir / f'risk_state_{other_mode}.json'
+if other_file.exists():
+    rm2 = RiskManager()
+    rm2.state_file = other_file
+    rm2._load_state()
+    rm2.clear_kill_switch()
+    rm2.reset_consecutive_losses()
+    rm2.last_loss_time = None
+    rm2._save_state()
+    print(f'✅ Also cleared {other_file.name}')
+
+# Clean up legacy un-namespaced file for hygiene
+legacy = data_dir / 'risk_state.json'
+if legacy.exists():
+    legacy.unlink()
+    print(f'✅ Removed legacy {legacy.name}')
+"

@@ -49,6 +49,8 @@ SAFE_KEYS = frozenset({
     "lsw_sweep_lookback", "lsw_tp_r", "lsw_min_stop_frac", "lsw_use_htf_filter",
     # MTF-alignment entry/target knobs
     "mta_tp_r", "mta_break_lookback", "mta_min_macro_frames",
+    # SMC-5C entry/filter knobs
+    "smc5c_bos_lookback", "smc5c_fvg_window", "smc5c_atr_pctile", "smc5c_vol_pctile",
     # regime sizing / volatility gates
     "rvol_dead_threshold", "rvol_weak_threshold", "rvol_strong_threshold",
     "regime_size_multiplier_high", "regime_size_multiplier_low",
@@ -68,6 +70,8 @@ FLAT_ONLY_KEYS = frozenset({
     "lsw_sl_buffer_atr", "lsw_atr_period", "lsw_max_hold_hours",
     # MTF-alignment stop/hold definition (flat-only)
     "mta_swing_lookback", "mta_min_stop_frac", "mta_atr_period", "mta_max_hold_hours",
+    # SMC-5C stop/hold definition (flat-only)
+    "smc5c_tp_pct", "smc5c_sl_pct", "smc5c_atr_period", "smc5c_vol_window", "smc5c_max_hold_hours",
 })
 
 RESTART_KEYS = frozenset({
@@ -80,6 +84,8 @@ RESTART_KEYS = frozenset({
     "lsw_timeframe", "lsw_htf_timeframe", "lsw_swing_window", "strategy_symbols",
     # MTF-alignment topology (changes kline shape / EMA identity)
     "mta_entry_timeframe", "mta_macro_tfs", "mta_ema_len",
+    # SMC-5C topology
+    "smc5c_entry_timeframe", "smc5c_ema_fast", "smc5c_ema_slow",
 })
 
 _KNOWN = SAFE_KEYS | FLAT_ONLY_KEYS | RESTART_KEYS

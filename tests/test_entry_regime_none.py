@@ -134,6 +134,7 @@ def _make_shim(tmp_path):
         mr_state=SimpleNamespace(record_entry=lambda **_k: None),
         event_bus=None,
         advisor=None,
+        position_manager=None,    # AI position manager (engine attr; None = not wired)
         risk_budget_fraction=1.0,
         _open_features={},
         # cross-venue basis guard bypassed (cfg.basis_guard_enabled=False would

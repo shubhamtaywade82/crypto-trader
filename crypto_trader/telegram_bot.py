@@ -118,6 +118,15 @@ class TelegramService:
         message = self._format_event(event)
         if not message:
             return
+        # Deduplicate RiskHaltEvent by reason within 5 minutes
+        if isinstance(event, RiskHaltEvent):
+            now = asyncio.get_event_loop().time()
+            if getattr(self, "_last_halt_reason", None) == event.reason and \
+               (now - getattr(self, "_last_halt_ts", 0)) < 300:
+                logger.debug("[Telegram] Skipping duplicate RiskHaltEvent: %s", event.reason)
+                return
+            self._last_halt_reason = event.reason
+            self._last_halt_ts = now
         try:
             await self.app.bot.send_message(
                 chat_id=self.chat_id,

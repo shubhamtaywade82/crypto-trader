@@ -87,9 +87,9 @@ class _TpslEngine:
         return [{"symbol": "SOLUSDT", "position_id": self._pid,
                  "quantity": 3.02, "side": "LONG", "leverage": 10}]
 
-    def create_position_tpsl(self, position_id, *, stop_loss_price=None, take_profit_price=None):
+    def create_position_tpsl(self, position_id, *, symbol="", stop_loss_price=None, take_profit_price=None):
         self.tpsl_calls.append({
-            "position_id": position_id,
+            "position_id": position_id, "symbol": symbol,
             "sl": stop_loss_price, "tp": take_profit_price,
         })
         return {"stop_loss": {"id": "sl-1", "status": "untriggered"}}

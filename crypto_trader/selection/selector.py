@@ -27,6 +27,7 @@ from ..backtest.st2_engine import run_backtest_st2
 from ..backtest.smc_engine import run_backtest_smc
 from ..backtest.lsw_engine import run_backtest_lsw
 from ..backtest.mta_engine import run_backtest_mta
+from ..backtest.smc5c_engine import run_backtest_smc5c
 from .champions import CHAMPIONS_PATH
 
 logger = logging.getLogger("crypto_trader.selection.selector")
@@ -93,6 +94,15 @@ def _candidates(df15, df1h, df4h, df5m, df1d, symbol, taker_fee, leverage):
                 out.append(("mtf_alignment", {"mta_tp_r": tp_r}, _metrics(r)))
             except Exception as e:
                 logger.warning("[selector] %s mtf_alignment tp=%s failed: %s", symbol, tp_r, e)
+    # smc_5c (5m exec + 15m/1h/4h HTF), fixed 2:1 from the ML report
+    if df5m is not None:
+        htf5c = {"15m": df15, "1h": df1h, "4h": df4h}
+        try:
+            r = run_backtest_smc5c(df5m, htf5c, symbol=symbol, timeframe="5m",
+                                   taker_fee=taker_fee, leverage=leverage)
+            out.append(("smc_5c", {}, _metrics(r)))
+        except Exception as e:
+            logger.warning("[selector] %s smc_5c failed: %s", symbol, e)
     return out
 
 
