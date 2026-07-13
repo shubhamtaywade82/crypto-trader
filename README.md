@@ -1,6 +1,6 @@
 # Antigravity — Production-Grade Crypto Trading System (v4)
 
-A modular, high-fidelity algorithmic trading suite designed for the Indian market. Antigravity features a hybrid architecture using **Binance** for high-frequency market data and **CoinDCX** for execution. It includes an event-sourced wallet, decoupled Redis/Postgres pipeline, and a real-time SolidJS dashboard.
+A modular, high-fidelity algorithmic trading suite designed for the Indian market. Antigravity features a hybrid architecture using **Binance** for high-frequency market data and **CoinDCX** for execution. It includes an event-sourced wallet, decoupled Redis/Postgres pipeline, and a real-time React + shadcn/ui dashboard.
 
 ---
 
@@ -21,7 +21,7 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
                         ▼
                    [ Signal Bus ] ──▶ [ Redis Streams ]
                                            │
-[ SolidJS UI ] ◀── [ FastAPI Dashboard ] ◀── [ Execution Consumer ]
+[ React UI ] ◀── [ FastAPI Dashboard ] ◀── [ Execution Consumer ]
                     (bearer token auth)         (CoinDCX Execution)
                                                │
                                    [ ExchangeStateReconciler ]
@@ -56,8 +56,8 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 | `crypto_trader/execution/` | Redis consumer, reconciler, signal bus, account sync. |
 | `crypto_trader/infra/` | Shared infrastructure: `event_routing.py` (wallet event sink factory). |
 | `crypto_trader/storage/` | Persistence adapters: Postgres event store, wallet store, projection. |
-| `ui/`                | SolidJS + Vite + TypeScript frontend dashboard.          |
-| `bin/`               | Unified orchestrator scripts (`dev`, `bot`, `start`, `test_ui`). |
+| `ui/`                | React 19 + Vite + TypeScript + shadcn/ui frontend dashboard. |
+| `scripts/`           | Unified orchestrator scripts (`dev`, `bot`, `start`, `test_ui`). `bin/` is a symlink for backward compatibility. |
 | `docker-compose.yml` | Infrastructure definition (Postgres 5435, Redis 6382).   |
 | `docs/`              | Detailed architectural deep-dives, including the [SMC Futures Guide](file:///home/nemesis/project/trading-workspace/coindcx/crypto-trader/docs/smc_crypto_futures_guide_refined/smc_crypto_futures_guide_refined.md). |
 

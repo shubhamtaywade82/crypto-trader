@@ -1,4 +1,4 @@
-# ── Stage 1: build the SolidJS dashboard ───────────────────────────────────
+# ── Stage 1: build the React dashboard ──────────────────────────────────────
 FROM node:22-alpine AS ui
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json* ./

@@ -538,7 +538,7 @@ class EnhancedFuturesWallet:
         self.events_file = DATA_DIR / f"wallet_events_{safe_ns}_{safe_symbol}.jsonl"
         self.db_file = DATA_DIR / f"wallet_{safe_ns}_{safe_symbol}.db"
 
-        from .storage.wallet_store import WalletStore
+        from ..storage.wallet_store import WalletStore
         self._wallet_store = WalletStore(
             database_url=database_url,
             sqlite_path=str(self.db_file),
@@ -550,7 +550,7 @@ class EnhancedFuturesWallet:
         self._redis_cache = None
         if redis_url:
             try:
-                from .wallet_cache import WalletRedisCache
+                from ..wallet_cache import WalletRedisCache
                 self._redis_cache = WalletRedisCache(
                     redis_url=redis_url,
                     mode="paper" if not getattr(self, "live_execution", False) else "live",
@@ -789,7 +789,7 @@ class EnhancedFuturesWallet:
         did not supply an ``external_fill`` — turning the wallet into the single
         live order-submission site without changing the orchestrator.
         """
-        from .execution.client_order_id import make_client_order_id  # lazy: avoid import cycle
+        from ..execution.client_order_id import make_client_order_id  # lazy: avoid import cycle
         coid = make_client_order_id(symbol, intent, nonce=str(self._now_ms()))
         import inspect
         sig = inspect.signature(self.execution_engine.place_order)
@@ -839,7 +839,7 @@ class EnhancedFuturesWallet:
         for up to ``timeout_s`` and the lock is shared across symbols.
         """
         import time as _t
-        from .execution.client_order_id import make_client_order_id
+        from ..execution.client_order_id import make_client_order_id
 
         if not (self.live_execution and self.execution_engine is not None):
             return None
@@ -950,7 +950,7 @@ class EnhancedFuturesWallet:
         except Exception as e:
             logger.critical("[PROTECTIVE SL] venue stop placement failed for %s: %s", pos.symbol, e)
             if self.require_venue_sl:
-                from . import safe_mode
+                from .. import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
                 try:
                     logger.critical("[PROTECTIVE SL] require_venue_sl=True: emergency flattening position for %s to protect capital", pos.symbol)
@@ -998,7 +998,7 @@ class EnhancedFuturesWallet:
             msg = "venue position id not found (cannot attach SL via create_tpsl)"
             logger.critical("[PROTECTIVE SL] %s for %s", msg, pos.symbol)
             if self.require_venue_sl:
-                from . import safe_mode
+                from .. import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {msg}")
                 try:
                     _emergency_price = (
@@ -1052,7 +1052,7 @@ class EnhancedFuturesWallet:
             else:
                 logger.critical("[PROTECTIVE SL] create_tpsl failed for %s: %s", pos.symbol, e)
             if self.require_venue_sl and not is_readonly:
-                from . import safe_mode
+                from .. import safe_mode
                 safe_mode.trip_halt(f"venue SL placement failed for {pos.symbol}: {e}")
                 try:
                     _emergency_price = (
@@ -1456,7 +1456,7 @@ class EnhancedFuturesWallet:
                 if (self.live_execution and self.execution_engine is not None
                         and self.venue_sl_enabled and self.require_venue_sl
                         and not pos.protective_orders.get("sl")):
-                    from . import safe_mode
+                    from .. import safe_mode
                     safe_mode.trip_halt(
                         f"venue SL re-placement after partial close yielded no stop for {symbol}")
 
@@ -1556,7 +1556,9 @@ class EnhancedFuturesWallet:
             self._save_state()
             if hasattr(self, "event_bus") and self.event_bus is not None:
                 try:
-                    from .events import TradeClosedEvent
+                    from ..events import TradeClosedEvent
+
+                    
                     pnl_pct = (float(pos.partial_realized_pnl) / float(pos.margin_used) * 100) if float(pos.margin_used) > 0 else 0
                     duration = (time.time() - pos.open_time / 1000) / 60 if getattr(pos, 'open_time', 0) > 0 else 0
                     self.event_bus.publish(TradeClosedEvent(
@@ -1606,7 +1608,9 @@ class EnhancedFuturesWallet:
         self._save_state()
         if hasattr(self, "event_bus") and self.event_bus is not None:
             try:
-                from .events import TradeClosedEvent
+                from ..events import TradeClosedEvent
+
+                
                 pnl_pct = (float(pos.partial_realized_pnl) / float(pos.margin_used) * 100) if float(pos.margin_used) > 0 else 0
                 duration = (time.time() - pos.open_time / 1000) / 60 if getattr(pos, 'open_time', 0) > 0 else 0
                 self.event_bus.publish(TradeClosedEvent(
@@ -3157,7 +3161,7 @@ class PaperExecutionEngine:
     crypto_trader.execution.adapters.paper instead."""
 
     def __init__(self, wallet: EnhancedFuturesWallet):
-        from .execution.adapters.paper import PaperExecutor
+        from ..execution.adapters.paper import PaperExecutor
         self._impl = PaperExecutor(wallet)
         self.wallet = wallet
         self.mapper = self._impl.mapper

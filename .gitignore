@@ -1,7 +1,5 @@
 # Logs
 *.log
-consumer.log
-api.log
 
 # UI
 ui/node_modules/
@@ -18,7 +16,6 @@ ledger_dev.db
 
 # General
 .antigravitycli/**
-
 llm_cache/**
 
 # ── Environment files ──
@@ -29,10 +26,12 @@ llm_cache/**
 !.env.example
 !.env.secrets.example
 
+# Python caches
 **/__pycache__/
 .pytest_cache/
-__pycache__/**
-crypto_trader/__pycache__/**
-tests/__pycache__/**
-./wallet_**.json
-tests/__pycache__/**
+
+# Scratch / legacy files (not part of ship)
+scratch/
+
+# Symlinks (bin -> scripts)
+bin
