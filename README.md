@@ -49,8 +49,9 @@ A modular, high-fidelity algorithmic trading suite designed for the Indian marke
 | :------------------- | :------------------------------------------------------- |
 | `crypto_trader/`     | Core Python package (Engines, Exchanges, Risk, Storage). |
 | `crypto_trader/ai/`  | AI advisory subsystem: router, providers (cloud/local), cache, telemetry, validators, prompts. |
+| `crypto_trader/config/` | Typed runtime config (`TradingConfig`) + hot-reload overrides (`ConfigStore`). |
 | `crypto_trader/risk.py` | RiskManager, MarginEngine, LeverageEngine — all pre-execution safety gates. |
-| `crypto_trader/wallet.py` | Event-sourced wallet with OrderStateMachine for deterministic order lifecycle. |
+| `crypto_trader/wallet/`   | Event-sourced wallet package (Position, OrderStateMachine, Reconciliation). |
 | `crypto_trader/reconciliation.py` | Exchange State Consistency Layer — detects desyncs, phantom positions, orphan orders. |
 | `crypto_trader/strategies/` | Mean-Reversion strategy, MR state persistence, and playbook implementations. |
 | `crypto_trader/execution/` | Redis consumer, reconciler, signal bus, account sync. |
@@ -83,14 +84,14 @@ pip install -r crypto_trader/requirements.txt
 ### 3. Run (one command, paper-safe)
 
 ```bash
-./bin/start                 # infra + API + multi-symbol bot (MODE defaults to paper)
-./bin/start --tick 60       # extra args forwarded to the bot
+./scripts/start                 # infra + API + multi-symbol bot (MODE defaults to paper)
+./scripts/start --tick 60       # extra args forwarded to the bot
 ```
 
 Alternatively, to run the backend and trading bot in the background (survives SSH/terminal disconnection):
 ```bash
-./bin/start-detached        # starts infra, API, and bot in background, logs to logs/
-./bin/stop                  # stops background bot and API processes
+./scripts/start-detached        # starts infra, API, and bot in background, logs to logs/
+./scripts/stop                  # stops background bot and API processes
 ```
 
 ### 4. Launch Dashboard UI (separate terminal)
@@ -103,12 +104,12 @@ npm run dev -- --port 3030
 
 Access the dashboard at **<http://localhost:3030>**.
 
-### Manual / split processes (alternative to `./bin/start`)
+### Manual / split processes (alternative to `./scripts/start`)
 
 ```bash
-./bin/dev                   # backend only: infra + execution consumer + API (:8088)
-./bin/bot                   # multi-symbol trading bot (uses WATCHLIST), e.g. ./bin/bot --tick 60
-python3 bin/test_ui         # fire tiny paper signals to verify the UI/API pipeline
+./scripts/dev                   # backend only: infra + execution consumer + API (:8088)
+./scripts/bot                   # multi-symbol trading bot (uses WATCHLIST), e.g. ./scripts/bot --tick 60
+python3 scripts/test_ui         # fire tiny paper signals to verify the UI/API pipeline
 ```
 
 ---
@@ -141,7 +142,7 @@ Orders are blocked unless ALL hold: `LIVE_TRADING_ENABLED=true` **and** the exac
 | :--------------------------------------------- | :--------------------------------------- |
 | Halt all live orders instantly                 | `touch ~/.crypto_trader/HALT`            |
 | Resume                                         | `rm ~/.crypto_trader/HALT`               |
-| Clear kill-switch + loss streak (after review) | `./bin/clear_risk`                       |
+| Clear kill-switch + loss streak (after review) | `./scripts/clear_risk`                       |
 | Telegram (if configured)                       | `/kill` · `/resume` · `/status` · `/pnl` |
 
 > **Dashboard Security:** Set `API_DASHBOARD_TOKEN=your_secret` in `.env` to enable
@@ -211,20 +212,20 @@ No engine code changes required beyond these three lines.
 
 | Script             | Purpose                                                                     |
 | :----------------- | :-------------------------------------------------------------------------- |
-| `./bin/start`      | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
-| `./bin/start-detached` | Runs the start sequence in background processes (survives terminal close).  |
-| `./bin/stop`       | Kills all running instances of the bot and API processes.                    |
-| `./bin/dev`        | Launches the backend stack (Infra + Consumer + API).                        |
-| `./bin/bot`        | Launches **only** the multi-symbol trading bot.                             |
-| `./bin/test_ui`    | Fires a burst of tiny test signals to verify the UI/API pipeline.           |
-| `./bin/clear_risk` | Clears the kill-switch and resets the consecutive-loss counter.             |
+| `./scripts/start`      | One command: infra + Dashboard API + multi-symbol bot (paper-safe default). |
+| `./scripts/start-detached` | Runs the start sequence in background processes (survives terminal close).  |
+| `./scripts/stop`       | Kills all running instances of the bot and API processes.                    |
+| `./scripts/dev`        | Launches the backend stack (Infra + Consumer + API).                        |
+| `./scripts/bot`        | Launches **only** the multi-symbol trading bot.                             |
+| `./scripts/test_ui`    | Fires a burst of tiny test signals to verify the UI/API pipeline.           |
+| `./scripts/clear_risk` | Clears the kill-switch and resets the consecutive-loss counter.             |
 
 ### Sending Test Signals
 
 While `./bin/dev` and the UI are running, run this in a new terminal:
 
 ```bash
-python3 bin/test_ui
+python3 scripts/test_ui
 ```
 
 This will open positions in your paper wallet and you will see them appear instantly on the dashboard.
