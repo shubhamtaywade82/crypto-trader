@@ -318,7 +318,7 @@ def test_ws_engine_health_consecutive_failures_trigger_kill_switch(monkeypatch, 
 
 
 def test_wallet_sl_placement_failure_flattens_when_sl_required(monkeypatch, tmp_path):
-    monkeypatch.setattr("crypto_trader.wallet.DATA_DIR", tmp_path)
+    monkeypatch.setattr("crypto_trader.wallet._wallet.DATA_DIR", tmp_path)
     from crypto_trader.wallet import EnhancedFuturesWallet, Order, OrderType, OrderStatus, PositionSide, Playbook
     import pytest
     from decimal import Decimal

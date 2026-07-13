@@ -33,7 +33,7 @@ def _setup_swing(side=PositionSide.LONG):
 
 def test_websocket_position_manager_exits_intraday(tmp_path, monkeypatch):
     # Set DATA_DIR to tmp_path
-    monkeypatch.setattr(crypto_trader.wallet, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(crypto_trader.wallet._wallet, "DATA_DIR", tmp_path)
     
     # Create wallet with clean isolation
     ns = f"test_{uuid.uuid4().hex}"
@@ -57,7 +57,7 @@ def test_websocket_position_manager_exits_intraday(tmp_path, monkeypatch):
 
 def test_websocket_position_manager_exits_swing(tmp_path, monkeypatch):
     # Set DATA_DIR to tmp_path
-    monkeypatch.setattr(crypto_trader.wallet, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(crypto_trader.wallet._wallet, "DATA_DIR", tmp_path)
 
     # Create wallet with clean isolation
     ns = f"test_{uuid.uuid4().hex}"

@@ -97,7 +97,7 @@ def _setup(side=PositionSide.LONG):
 
 
 def test_wallet_live_open_uses_venue_fill(tmp_path, monkeypatch):
-    monkeypatch.setattr("crypto_trader.wallet.DATA_DIR", tmp_path)
+    monkeypatch.setattr("crypto_trader.wallet._wallet.DATA_DIR", tmp_path)
     w = EnhancedFuturesWallet(symbol="SOLUSDT", initial_balance=1000, leverage=2,
                               state_namespace="livetest")
     w.attach_execution_engine(_FakeExec(), live=True)
@@ -108,7 +108,7 @@ def test_wallet_live_open_uses_venue_fill(tmp_path, monkeypatch):
 
 
 def test_wallet_paper_open_unchanged(tmp_path, monkeypatch):
-    monkeypatch.setattr("crypto_trader.wallet.DATA_DIR", tmp_path)
+    monkeypatch.setattr("crypto_trader.wallet._wallet.DATA_DIR", tmp_path)
     w = EnhancedFuturesWallet(symbol="SOLUSDT", initial_balance=1000, leverage=2,
                               state_namespace="papertest")
     pos = w.open_position("SOLUSDT", _setup(), mark_price=120.0)
