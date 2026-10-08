@@ -609,7 +609,13 @@ class OllamaAdvisor:
                 cloud_api_key=os.getenv("CLOUD_OLLAMA_API_KEY", ""),
                 local_host=local_h,
                 local_model=local_m,
-                local_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "1536")),
+                # Malformed OLLAMA_NUM_PREDICT must not disable the whole router
+                # (a bare int() here silently fell back to the legacy client).
+                local_num_predict=(
+                    int(os.getenv("OLLAMA_NUM_PREDICT"))
+                    if os.getenv("OLLAMA_NUM_PREDICT", "").strip().lstrip("+-").isdigit()
+                    else None
+                ),
             )
             logger.info("[LLM] AI subsystem router initialized (cloud+local)")
         except Exception as e:
@@ -617,13 +623,25 @@ class OllamaAdvisor:
 
         # Pre-flight health check: warn immediately if local Ollama is unreachable
         # so the operator knows why requests are falling back to cloud.
-        if not use_cloud and not self.client.is_ready():
-            logger.warning(
-                "[LLM] Local Ollama at %s is NOT reachable (/%s). "
-                "All LLM calls will fall back to cloud or timeout. "
-                "Start Ollama locally or set USE_CLOUD_LLM=true to avoid delays.",
-                host, "api/tags",
-            )
+        # NOTE: OllamaClient exposes is_available() (is_ready() never existed on
+        # it) — the old call raised AttributeError and crashed OllamaAdvisor
+        # construction in LOCAL mode, taking engine.py / engine_ws.py startup
+        # (which call build_advisor() unprotected) down with it. use_cloud is
+        # also re-resolved here: in the router-build try block above it is
+        # scoped locally, so a router-build failure would otherwise NameError.
+        _use_cloud = os.getenv("USE_CLOUD_LLM", "false").lower() in ("true", "1", "yes")
+        if not _use_cloud:
+            try:
+                reachable = self.client.is_available()
+            except Exception:
+                reachable = False
+            if not reachable:
+                logger.warning(
+                    "[LLM] Local Ollama at %s is NOT reachable (/%s). "
+                    "All LLM calls will fall back to cloud or timeout. "
+                    "Start Ollama locally or set USE_CLOUD_LLM=true to avoid delays.",
+                    host, "api/tags",
+                )
 
     def is_ready(self) -> bool:
         if self._router is not None:
