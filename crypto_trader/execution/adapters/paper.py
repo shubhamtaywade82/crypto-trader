@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 from ...wallet import EnhancedFuturesWallet, Order, OrderType, PositionSide
 from ...exchanges.adapter_protocol import NormalisedBalance
 from ...exchanges.instrument_mapper import InstrumentSpec
+from ...config._settings import SYSTEM_MAX_LEVERAGE
 
 logger = logging.getLogger("crypto_trader.execution.adapters.paper")
 
@@ -117,7 +118,10 @@ class _MockMapper:
             quantity_increment=Decimal("0.001"),
             min_quantity=Decimal("0.001"),
             min_notional=Decimal("6.0"),
-            max_leverage=20,
+            # ADR-001: the paper venue must advertise the same cap as the real
+            # one. The previous 20x let paper mode trade leverage live CoinDCX
+            # would clamp to 10 — poisoning shadow-mode validation results.
+            max_leverage=SYSTEM_MAX_LEVERAGE,
             maker_fee_rate=0.0002,
             taker_fee_rate=0.0005,
             status="active",

@@ -15,6 +15,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+# ADR-001 (2026-10): canonical system-wide leverage ceiling. Single source of
+# truth referenced by LeverageEngine (RISK_HARD_MAX_LEVERAGE fallback),
+# DynamicLeverageManager (band ceiling clamp), instrument_mapper
+# (_MAX_USABLE_LEVERAGE, the non-env-overridable venue clamp) and the paper
+# adapter's mock venue spec. Environment variables may lower the effective
+# leverage but can never raise it above this value. Changing it requires a
+# written risk decision and a code change (by design).
+SYSTEM_MAX_LEVERAGE: int = 10
+
 
 class TradingMode(str, Enum):
     PAPER = "paper"
@@ -111,7 +120,11 @@ _TRADING_PROFILES: dict = {
         max_daily_trades=10,
         max_consecutive_losses=3,
         max_drawdown_pct=0.25,
-        max_leverage=20,
+        # ADR-001: aggressive keeps the loosest *risk appetite* (drawdown, trade
+        # count, sizing) but no longer permits leverage above the system cap —
+        # the previous 20x here is exactly how a 20x paper position could slip
+        # past the venue clamp (paper mode has no live venue to re-clamp it).
+        max_leverage=SYSTEM_MAX_LEVERAGE,
         risk_per_trade_pct=0.04,
         funding_extreme_threshold=0.001,
         require_kill_zone=False,
@@ -551,7 +564,12 @@ class TradingConfig:
             mode=mode_enum,
             symbol=_get("TRADE_SYMBOL", "SOLUSDT").upper(),
             data_source=ds_enum,
-            max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
+            # ADR-001: env may lower the operating leverage, never raise it above
+            # the system cap (defence in depth on top of the profile caps).
+            max_leverage=min(
+                _get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
+                SYSTEM_MAX_LEVERAGE,
+            ),
             use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", True),
             dynamic_leverage_min=_get_int("DYNAMIC_LEVERAGE_MIN", 5),
             dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 10),

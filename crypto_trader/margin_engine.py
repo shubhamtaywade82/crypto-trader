@@ -10,6 +10,8 @@ import logging
 import os
 from typing import Tuple, Optional, Dict
 
+from crypto_trader.config._settings import SYSTEM_MAX_LEVERAGE
+
 logger = logging.getLogger("crypto_trader.margin_engine")
 
 class MarginEngine:
@@ -94,9 +96,9 @@ class LeverageEngine:
         # tier-validation backstop behind the dynamic band and the venue clamp.
         if hard_max_leverage is None:
             try:
-                hard_max_leverage = int(os.getenv("RISK_HARD_MAX_LEVERAGE", "10"))
+                hard_max_leverage = int(os.getenv("RISK_HARD_MAX_LEVERAGE", str(SYSTEM_MAX_LEVERAGE)))
             except (TypeError, ValueError):
-                hard_max_leverage = 10
+                hard_max_leverage = SYSTEM_MAX_LEVERAGE
         self.default_leverage = default_leverage
         self.hard_max_leverage = hard_max_leverage
 
@@ -163,9 +165,14 @@ class DynamicLeverageManager:
     def __init__(self, cfg=None):
         self.cfg = cfg
         # Defaults when no cfg is provided (tests / standalone usage).
-        # ADR-001 (2026-10): the band ceiling follows the 10x system cap.
+        # ADR-001 (2026-10): the band ceiling follows the 10x system cap and is
+        # CLAMPED to it — a hand-edited config store or DYNAMIC_LEVERAGE_MAX env
+        # cannot push the dynamic band above SYSTEM_MAX_LEVERAGE.
         self.min_leverage = getattr(cfg, "dynamic_leverage_min", 5) if cfg else 5
-        self.max_leverage = getattr(cfg, "dynamic_leverage_max", 10) if cfg else 10
+        self.max_leverage = min(
+            getattr(cfg, "dynamic_leverage_max", SYSTEM_MAX_LEVERAGE) if cfg else SYSTEM_MAX_LEVERAGE,
+            SYSTEM_MAX_LEVERAGE,
+        )
         self.vol_atr_period = getattr(cfg, "dynamic_leverage_vol_atr_period", 14) if cfg else 14
         self.high_vol_threshold = getattr(cfg, "dynamic_leverage_high_vol_threshold", 0.05) if cfg else 0.05
         self.extreme_vol_threshold = getattr(cfg, "dynamic_leverage_extreme_vol_threshold", 0.10) if cfg else 0.10
