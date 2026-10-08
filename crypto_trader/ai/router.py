@@ -144,8 +144,25 @@ class LLMRouter:
 
     def _launch_shadow(self, state, system_prompt, user_prompt, timeout_s,
                        primary: LLMDecision) -> None:
-        """Run the shadow evaluator on a daemon thread; exceptions are swallowed
-        and counted. Thread refs are kept (bounded) only so tests can join."""
+        """Hand the sample to the shadow evaluator without ever blocking or
+        failing the trading path.
+
+        Preferred path: ShadowEvaluator.try_submit — bounded concurrency, drop
+        on saturation (counted), thread registered for test joins. Legacy
+        evaluators (duck-typed, only .evaluate) fall back to an unbounded
+        thread; explosions are swallowed either way.
+        """
+        try_submit = getattr(self.shadow, "try_submit", None)
+        if callable(try_submit):
+            try:
+                try_submit(state, system_prompt, user_prompt, timeout_s,
+                           primary, registry=self._shadow_threads)
+            except Exception as e:  # submit itself must never break trading
+                logger.debug("[Router] shadow submit error: %s", e)
+            del self._shadow_threads[:-32]
+            return
+
+        # Legacy fallback: evaluator without try_submit.
         def _run():
             try:
                 self.shadow.evaluate(state, system_prompt, user_prompt,
@@ -201,7 +218,17 @@ def build_router(
     cloud_host = cloud_host or os.getenv("CLOUD_OLLAMA_HOST", "https://ollama.com")
     cloud_model = cloud_model or os.getenv("CLOUD_OLLAMA_MODEL", "gpt-oss:20b")
     cloud_api_key = cloud_api_key if cloud_api_key is not None else os.getenv("CLOUD_OLLAMA_API_KEY", "")
-    local_host = local_host or "http://localhost:11434"
+    # Bare build_router() calls (multi_engine's position-management router) must
+    # honour the deployment's host env, not a hardcoded localhost:11434 —
+    # otherwise a non-default Ollama port/remote host silently degrades the PM
+    # router to the deterministic scorer.
+    local_host = (
+        local_host
+        or os.getenv("LOCAL_OLLAMA_HOST")
+        or os.getenv("OLLAMA_BASE_URL")
+        or os.getenv("OLLAMA_HOST")
+        or "http://localhost:11434"
+    )
     local_model = local_model or os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
     if local_num_predict is None:
         try:
@@ -229,6 +256,10 @@ def build_router(
     shadow_model = os.getenv("SHADOW_OLLAMA_MODEL", "").strip()
     if shadow_model:
         shadow_hosts = os.getenv("SHADOW_OLLAMA_HOSTS", "").strip() or local_hosts
+        try:
+            shadow_max_concurrent = max(1, int(os.getenv("SHADOW_MAX_CONCURRENT", "2")))
+        except (TypeError, ValueError):
+            shadow_max_concurrent = 2
         shadow_evaluator = ShadowEvaluator(
             provider=OllamaLocalProvider(
                 host=shadow_hosts, model=shadow_model,
@@ -236,8 +267,10 @@ def build_router(
             ),
             validator=DecisionValidator(),
             model=shadow_model,
+            max_concurrent=shadow_max_concurrent,
         )
-        logger.info("[Router] Shadow evaluation enabled (model=%s)", shadow_model)
+        logger.info("[Router] Shadow evaluation enabled (model=%s, max_concurrent=%d)",
+                    shadow_model, shadow_max_concurrent)
 
     return LLMRouter(
         cloud_provider=OllamaCloudProvider(host=cloud_host, model=cloud_model, api_key=cloud_api_key),

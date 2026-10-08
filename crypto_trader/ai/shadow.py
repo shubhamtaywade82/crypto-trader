@@ -63,6 +63,7 @@ class ShadowMetrics:
         self.call_failures = 0
         self.valid_decisions = 0
         self.action_agreements = 0
+        self.dropped = 0                      # samples dropped: shadow concurrency saturated
         self._latencies: List[float] = []
         self._conf_deltas: List[float] = []
 
@@ -84,6 +85,17 @@ class ShadowMetrics:
                 if len(self._conf_deltas) < self._max_samples:
                     self._conf_deltas.append(result.confidence)
 
+    def record_dropped(self) -> None:
+        """Count a sample dropped because the shadow worker capacity was full.
+
+        Dropped samples keep the trading path unaffected (the whole point of the
+        cap), but they must be visible: an agreement rate computed over the
+        subset that made it through is otherwise silently biased toward periods
+        when the candidate box was idle.
+        """
+        with self._lock:
+            self.dropped += 1
+
     def snapshot(self) -> dict:
         with self._lock:
             valid = self.valid_decisions
@@ -96,6 +108,7 @@ class ShadowMetrics:
                 "valid_decisions": valid,
                 "action_agreements": self.action_agreements,
                 "agreement_rate": round(self.action_agreements / valid, 4) if valid else 0.0,
+                "dropped": self.dropped,
                 "latency_p50_ms": _pct(self._latencies, 0.50),
                 "latency_p95_ms": _pct(self._latencies, 0.95),
                 "confidence_p50": _pct(self._conf_deltas, 0.50),
@@ -146,12 +159,20 @@ class ShadowEvaluator:
 
     def __init__(self, provider, validator, model: str,
                  metrics: Optional[ShadowMetrics] = None,
-                 log_dir: Optional[Path] = None):
+                 log_dir: Optional[Path] = None,
+                 max_concurrent: int = 2):
         self.provider = provider
         self.validator = validator
         self.model = model
         self.metrics = metrics or ShadowMetrics(model)
         self.log_dir = Path(log_dir) if log_dir else DATA_DIR / "llm_telemetry"
+        # ADR-001 isolation guarantee: shadow inference must never contend with
+        # the primary model. A 2B candidate typically shares the GPU/CPU with the
+        # triage model, so concurrent shadow inferences are capped — a submit
+        # beyond capacity is DROPPED (counted in metrics.dropped), never queued,
+        # never blocking the trading thread.
+        self._sem = threading.Semaphore(max(1, int(max_concurrent)))
+        self.max_concurrent = max(1, int(max_concurrent))
 
     def evaluate(
         self,
@@ -185,7 +206,14 @@ class ShadowEvaluator:
             return result
 
         try:
-            decision, err = self.validator.validate(raw, state)
+            # strict_truncation=True: candidate metrics must be measured under
+            # the exact promotion gate regardless of the operator's live
+            # LLM_STRICT_TRUNCATION toggle, so agreement stays comparable over
+            # time. Duck-typed validators (test fakes) predate the kwarg.
+            try:
+                decision, err = self.validator.validate(raw, state, strict_truncation=True)
+            except TypeError:
+                decision, err = self.validator.validate(raw, state)
         except Exception as e:  # validator itself must not crash the harness
             decision, err = None, f"validator_exception: {e}"
         if err or decision is None:
@@ -200,6 +228,41 @@ class ShadowEvaluator:
         result.agreed_action = (decision.action == primary.action)
         self._finalize(result, state, primary)
         return result
+
+    def try_submit(self, state: MarketStatePayload, system_prompt: str,
+                   user_prompt: str, timeout_s: int, primary: LLMDecision,
+                   registry: Optional[List] = None) -> bool:
+        """Run one evaluation on a short-lived daemon thread, bounded by
+        ``max_concurrent``. Non-blocking: returns False immediately (and counts
+        a dropped sample) when the shadow is already at capacity, so the router
+        never accumulates threads during a candidate-model stall.
+
+        ``registry`` optionally receives the Thread handle so callers (the
+        router) can join in tests.
+        """
+        if not self._sem.acquire(blocking=False):
+            self.metrics.record_dropped()
+            return False
+
+        def _run():
+            try:
+                self.evaluate(state, system_prompt, user_prompt, timeout_s, primary)
+            except Exception as e:  # shadow must never break trading
+                logger.debug("[Shadow] submitted evaluation error: %s", e)
+            finally:
+                self._sem.release()
+
+        try:
+            t = threading.Thread(target=_run, daemon=True,
+                                 name=f"shadow-{state.symbol}")
+            t.start()
+        except Exception:
+            self._sem.release()
+            self.metrics.record_dropped()
+            return False
+        if registry is not None:
+            registry.append(t)
+        return True
 
     def _finalize(self, result: ShadowResult, state: MarketStatePayload,
                   primary: LLMDecision) -> None:

@@ -9,7 +9,15 @@ from crypto_trader.ai.schemas import MarketStatePayload, LLMDecision, EntryZone
 
 class DecisionValidator:
     @staticmethod
-    def validate(raw_json: str, state: MarketStatePayload) -> Tuple[LLMDecision, Optional[str]]:
+    def validate(raw_json: str, state: MarketStatePayload,
+                 strict_truncation: Optional[bool] = None) -> Tuple[LLMDecision, Optional[str]]:
+        """Validate one raw model output.
+
+        ``strict_truncation``: None → resolve from LLM_STRICT_TRUNCATION env
+        (production behaviour). True/False → force the gate regardless of env;
+        the shadow harness passes True so candidate metrics are measured under
+        the exact promotion gate independent of the operator's live toggle.
+        """
         # 1. Parse JSON (with salvage for truncated / fenced output)
         try:
             parsed, repaired = DecisionValidator._parse_json(raw_json)
@@ -31,7 +39,10 @@ class DecisionValidator:
         # NO_TRADE is the safe direction and still passes. Set
         # LLM_STRICT_TRUNCATION=false to restore pre-gate salvaging behaviour.
         if repaired and decision.action != "NO_TRADE":
-            strict = os.getenv("LLM_STRICT_TRUNCATION", "true").strip().lower() in ("1", "true", "yes")
+            if strict_truncation is not None:
+                strict = bool(strict_truncation)
+            else:
+                strict = os.getenv("LLM_STRICT_TRUNCATION", "true").strip().lower() in ("1", "true", "yes")
             if strict:
                 return DecisionValidator.fallback_no_trade(), (
                     "RiskGate: actionable decision required JSON repair "
