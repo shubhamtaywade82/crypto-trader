@@ -1,6 +1,7 @@
 """crypto_trader.ai.validators.decision_schema — Output validator and post-LLM rule checks."""
 
 import json
+import os
 from typing import Tuple, Optional
 
 from crypto_trader.ai.schemas import MarketStatePayload, LLMDecision, EntryZone
@@ -11,7 +12,7 @@ class DecisionValidator:
     def validate(raw_json: str, state: MarketStatePayload) -> Tuple[LLMDecision, Optional[str]]:
         # 1. Parse JSON (with salvage for truncated / fenced output)
         try:
-            parsed = DecisionValidator._parse_json(raw_json)
+            parsed, repaired = DecisionValidator._parse_json(raw_json)
         except Exception as e:
             return DecisionValidator.fallback_no_trade(), f"JSONDecodeError: {e}"
 
@@ -20,6 +21,22 @@ class DecisionValidator:
             decision = LLMDecision(**parsed)
         except Exception as e:
             return DecisionValidator.fallback_no_trade(), f"ValidationError: {e}"
+
+        # 2.5 Fail-closed truncation gate (LLM_STRICT_TRUNCATION, default on).
+        # A repaired payload means the model ran out of tokens mid-object: every
+        # surviving field came out of a salvage heuristic, not from the model.
+        # An actionable decision built on salvaged numbers must not trade —
+        # missing required fields would already fail pydantic above, but a
+        # truncated float or a silently dropped target can survive repair.
+        # NO_TRADE is the safe direction and still passes. Set
+        # LLM_STRICT_TRUNCATION=false to restore pre-gate salvaging behaviour.
+        if repaired and decision.action != "NO_TRADE":
+            strict = os.getenv("LLM_STRICT_TRUNCATION", "true").strip().lower() in ("1", "true", "yes")
+            if strict:
+                return DecisionValidator.fallback_no_trade(), (
+                    "RiskGate: actionable decision required JSON repair "
+                    "(truncated model output) — rejected fail-closed"
+                )
 
         # 3. Hard Safety Gate Boundaries
         if decision.action != "NO_TRADE":
@@ -44,12 +61,17 @@ class DecisionValidator:
         return decision, None
 
     @staticmethod
-    def _parse_json(raw_json: str) -> dict:
+    def _parse_json(raw_json: str) -> Tuple[dict, bool]:
         """Parse model JSON, tolerating markdown fences and truncated output.
 
         The local model can stop mid-object when it hits num_predict, leaving
         an unterminated string or unclosed brackets. We first try a clean parse,
         then fall back to extracting the outer object and repairing it.
+
+        Returns ``(parsed, repaired)`` where ``repaired`` is True only when the
+        clean parse failed and the truncation-repair heuristic was used. A
+        complete object wrapped in code fences is NOT repaired — fence
+        stripping is a formatting courtesy, not salvage.
         """
         text = raw_json.strip()
 
@@ -68,9 +90,9 @@ class DecisionValidator:
             text = text[start:]
 
         try:
-            return json.loads(text)
+            return json.loads(text), False
         except json.JSONDecodeError:
-            return json.loads(DecisionValidator._repair_truncated(text))
+            return json.loads(DecisionValidator._repair_truncated(text)), True
 
     @staticmethod
     def _repair_truncated(text: str) -> str:
