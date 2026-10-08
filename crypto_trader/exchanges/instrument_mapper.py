@@ -34,7 +34,10 @@ _INSTRUMENT_ENDPOINT = "exchange/v1/derivatives/futures/data/instrument"
 # to 100x for tiny positions, but we never operate above this — keep in sync with
 # risk.LeverageEngine.hard_max_leverage. Per-symbol specs are clamped to it so a
 # venue's top tier never becomes the bot's default/operating leverage.
-_MAX_USABLE_LEVERAGE = 20
+# ADR-001 (2026-10): hard ceiling lowered to 10x — this clamp is the last line
+# of defence, so DYNAMIC_LEVERAGE_MAX / RISK_HARD_MAX_LEVERAGE cannot lift the
+# effective per-symbol leverage above it.
+_MAX_USABLE_LEVERAGE = 10
 
 
 def internal_to_coindcx(symbol: str) -> str:

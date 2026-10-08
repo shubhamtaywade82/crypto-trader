@@ -272,9 +272,9 @@ class _TierClient:
 
 def test_spec_max_leverage_from_dynamic_tiers_clamped_to_system_cap():
     spec = InstrumentMapper(_TierClient()).get_spec("SOLUSDT")
-    # tier table allows up to 100x, clamped to system cap 20x — and crucially
-    # NOT the bogus 5x max_leverage_long 'ignore this' field.
-    assert spec.max_leverage == 20
+    # tier table allows up to 100x, clamped to system cap 10x (ADR-001) — and
+    # crucially NOT the bogus 5x max_leverage_long 'ignore this' field.
+    assert spec.max_leverage == 10
     assert spec.max_leverage != 5
 
 
@@ -299,4 +299,4 @@ def test_spec_legacy_above_cap_is_clamped():
                 "maker_fee": 0.0236, "taker_fee": 0.059, "status": "active",
             }}
     spec = InstrumentMapper(_BigLegacy()).get_spec("BTCUSDT")
-    assert spec.max_leverage == 20  # clamped to system cap
+    assert spec.max_leverage == 10  # clamped to system cap (ADR-001)

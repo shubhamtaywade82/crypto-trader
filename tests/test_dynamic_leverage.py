@@ -1,9 +1,13 @@
 """
-Dynamic per-trade leverage (5x–20x band).
+Dynamic per-trade leverage (5x–10x band).
 
 Covers: config defaults + env, DynamicLeverageManager band math, and the engine
 wiring (_apply_dynamic_leverage) — applies per-symbol leverage, halts on extreme
 vol, and is a no-op when the feature flag is off.
+
+ADR-001 (2026-10): system-wide hard ceiling lowered 20x → 10x. The band tests
+below pin the 10x ceiling; the venue-spec clamp (_MAX_USABLE_LEVERAGE) is the
+last line of defence and cannot be exceeded by env vars.
 """
 from types import SimpleNamespace
 
@@ -16,68 +20,100 @@ from crypto_trader.engine_ws import WebSocketTradingEngine
 
 # ── caps / config ────────────────────────────────────────────────────────────
 
-def test_hard_cap_raised_to_20():
-    assert LeverageEngine().hard_max_leverage == 20
+def test_hard_cap_defaults_to_10(monkeypatch):
+    monkeypatch.delenv("RISK_HARD_MAX_LEVERAGE", raising=False)
+    assert LeverageEngine().hard_max_leverage == 10
 
 
-def test_config_dynamic_leverage_defaults():
-    cfg = TradingConfig()
-    assert cfg.use_dynamic_leverage is True          # on by default (5x–20x range)
+def test_hard_cap_env_override(monkeypatch):
+    monkeypatch.setenv("RISK_HARD_MAX_LEVERAGE", "15")
+    assert LeverageEngine().hard_max_leverage == 15
+
+
+def test_instrument_clamp_is_10():
+    # Last line of defence on the per-symbol spec — must equal the 10x decision.
+    from crypto_trader.exchanges.instrument_mapper import _MAX_USABLE_LEVERAGE
+    assert _MAX_USABLE_LEVERAGE == 10
+
+
+def test_venue_clamp_blocks_env_raised_band(monkeypatch):
+    """Raising DYNAMIC_LEVERAGE_MAX via env cannot lift the effective per-symbol
+    leverage past the instrument-spec clamp (defence in depth)."""
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_MAX", "20")
+    monkeypatch.delenv("TRADING_PROFILE", raising=False)
+    cfg = TradingConfig.from_env()
+    assert cfg.dynamic_leverage_max == 20      # band ceiling raised...
+    from crypto_trader.exchanges.instrument_mapper import _MAX_USABLE_LEVERAGE
+    m = DynamicLeverageManager(cfg)
+    lev = m.compute("S", base_leverage=cfg.max_leverage or 20,
+                    venue_max_leverage=_MAX_USABLE_LEVERAGE,   # ...but venue clamp holds
+                    atr_pct=0.0, drawdown=0.0, margin_ratio=0.0,
+                    regime="TREND_EXPANSION")
+    assert lev <= 10
+
+
+def test_config_dynamic_leverage_defaults(monkeypatch):
+    monkeypatch.delenv("DYNAMIC_LEVERAGE_MAX", raising=False)
+    monkeypatch.delenv("DYNAMIC_LEVERAGE_MIN", raising=False)
+    monkeypatch.delenv("USE_DYNAMIC_LEVERAGE", raising=False)
+    monkeypatch.delenv("TRADING_PROFILE", raising=False)
+    cfg = TradingConfig.from_env()
+    assert cfg.use_dynamic_leverage is True          # on by default (5x–10x range)
     assert cfg.dynamic_leverage_min == 5
-    assert cfg.dynamic_leverage_max == 20
+    assert cfg.dynamic_leverage_max == 10
 
 
 def test_config_env_enables_dynamic(monkeypatch):
     monkeypatch.setenv("USE_DYNAMIC_LEVERAGE", "true")
     monkeypatch.setenv("DYNAMIC_LEVERAGE_MIN", "5")
-    monkeypatch.setenv("DYNAMIC_LEVERAGE_MAX", "20")
+    monkeypatch.setenv("DYNAMIC_LEVERAGE_MAX", "12")
     monkeypatch.delenv("TRADING_PROFILE", raising=False)
     cfg = TradingConfig.from_env()
     assert cfg.use_dynamic_leverage is True
-    assert (cfg.dynamic_leverage_min, cfg.dynamic_leverage_max) == (5, 20)
+    assert (cfg.dynamic_leverage_min, cfg.dynamic_leverage_max) == (5, 12)
 
 
 # ── band math ────────────────────────────────────────────────────────────────
 
 def test_band_floor_and_ceiling():
     m = DynamicLeverageManager()
-    assert m.min_leverage == 5 and m.max_leverage == 20
-    # all conditions favourable (low vol, strong trend, healthy) → climbs to ceiling 20
+    assert m.min_leverage == 5 and m.max_leverage == 10
+    # all conditions favourable (low vol, strong trend, healthy) → climbs to ceiling 10
     top = m.compute("S", base_leverage=20, venue_max_leverage=20,
                     atr_pct=0.0, drawdown=0.0, margin_ratio=0.0, regime="TREND_EXPANSION")
-    assert top == 20
+    assert top == 10
     # everything in band
-    assert 5 <= m.compute("S", base_leverage=20, venue_max_leverage=20, regime="ACCUMULATION") <= 20
+    assert 5 <= m.compute("S", base_leverage=20, venue_max_leverage=20, regime="ACCUMULATION") <= 10
 
 
 def test_strong_setup_climbs_high():
     m = DynamicLeverageManager()
     lev = m.compute("S", base_leverage=20, venue_max_leverage=20,
                     atr_pct=0.0, drawdown=0.0, margin_ratio=0.0, regime="TREND_EXPANSION")
-    assert lev == 20
+    assert lev == 10
 
 
 def test_weak_regime_stays_low():
     m = DynamicLeverageManager()
     # mean-reversion (factor 0.25), calm → low end of band
     lev = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="MEAN_REVERSION")
-    # floor 5 + 0.25*15 ≈ 8.75 → 9
+    # floor 5 + 0.25*5 ≈ 6.25 → 6
     assert lev <= 10 and lev >= 5
 
 
 def test_default_mid_band():
     m = DynamicLeverageManager()
-    # neutral regime, calm, healthy → mid-ish (not pinned at 20)
+    # neutral regime, calm, healthy → mid-ish (not pinned at ceiling)
     lev = m.compute("S", base_leverage=20, venue_max_leverage=20, regime="ACCUMULATION")
-    assert 5 <= lev < 20    # NOT the ceiling by default
+    assert 5 <= lev < 10    # NOT the ceiling by default
 
 
 def test_high_vol_pulls_toward_floor():
     m = DynamicLeverageManager()
-    # atr between high(0.05) and extreme(0.10) with strong regime → reduced, not 20
+    # atr between high(0.05) and extreme(0.10) with strong regime → reduced, not ceiling
     lev = m.compute("S", base_leverage=20, venue_max_leverage=20,
                     atr_pct=0.075, regime="TREND_EXPANSION")
-    assert 5 <= lev < 20
+    assert 5 <= lev < 10
 
 
 def test_extreme_vol_halts():
@@ -153,7 +189,7 @@ def test_engine_applies_per_symbol_leverage():
     ok = WebSocketTradingEngine._apply_dynamic_leverage(sh, {}, 100.0, _regime_ctx())
     assert ok is True
     assert calls and calls[0][0] == "SOLUSDT"
-    assert 5 <= calls[0][1] <= 20
+    assert 5 <= calls[0][1] <= 10
 
 
 def test_engine_skips_entry_on_extreme_vol():

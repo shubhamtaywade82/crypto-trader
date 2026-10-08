@@ -236,13 +236,18 @@ class TradingConfig:
     max_cross_venue_basis: float = 0.005    # reject entry when |basis| exceeds this
     entry_basis_buffer: float = 0.0005      # nudge entry trigger toward the fill venue
 
-    # ── Dynamic per-trade leverage (5x–20x band) ──
+    # ── Dynamic per-trade leverage (5x–10x band) ──
     # When enabled, each entry's leverage is scaled within [dynamic_leverage_min,
     # dynamic_leverage_max] by volatility (ATR%), account drawdown, margin ratio,
     # and regime — down in high vol / drawdown, up in strong trends.
+    # decision 2026-10: system-wide hard ceiling is 10x (see ADR-001) — the
+    # ceiling here, LeverageEngine.hard_max_leverage and
+    # instrument_mapper._MAX_USABLE_LEVERAGE all default to it. Raising
+    # DYNAMIC_LEVERAGE_MAX above 10 cannot lift the effective per-symbol
+    # leverage past the instrument-spec clamp.
     use_dynamic_leverage: bool = True
     dynamic_leverage_min: int = 5
-    dynamic_leverage_max: int = 20
+    dynamic_leverage_max: int = 10
     # Scaling-sensitivity thresholds (when leverage is pulled toward the floor).
     # ATR% is fraction-of-price; drawdown / margin_ratio are fractions (0–1).
     dynamic_leverage_vol_atr_period: int = 14
@@ -549,7 +554,7 @@ class TradingConfig:
             max_leverage=_get_int("MAX_LEVERAGE", _get_int("LEVERAGE", profile.max_leverage)),
             use_dynamic_leverage=_get_bool("USE_DYNAMIC_LEVERAGE", True),
             dynamic_leverage_min=_get_int("DYNAMIC_LEVERAGE_MIN", 5),
-            dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 20),
+            dynamic_leverage_max=_get_int("DYNAMIC_LEVERAGE_MAX", 10),
             dynamic_leverage_vol_atr_period=_get_int("DYNAMIC_LEVERAGE_VOL_ATR_PERIOD", 14),
             dynamic_leverage_high_vol_threshold=_get_float("DYNAMIC_LEVERAGE_HIGH_VOL_THRESHOLD", 0.05),
             dynamic_leverage_extreme_vol_threshold=_get_float("DYNAMIC_LEVERAGE_EXTREME_VOL_THRESHOLD", 0.10),
